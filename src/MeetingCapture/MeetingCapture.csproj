@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
+    <AssemblyName>MeetingCapture</AssemblyName>
+    <RootNamespace>MeetingCapture</RootNamespace>
+    <!-- ApplicationIcon: Bishop to add Resources\tray.ico before first ship -->
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+    <Version>0.1.0</Version>
+    <Description>Meeting capture tray app with transcription and AI notes</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Audio capture via WASAPI (loopback + microphone) -->
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <!-- Azure Speech SDK for transcription (cloud path) -->
+    <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.41.1" />
+    <!-- OpenAI SDK — used for GitHub Models / Copilot endpoint -->
+    <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+    <!-- DI + configuration -->
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="8.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+    <!-- Markdown rendering for note output -->
+    <PackageReference Include="Markdig" Version="0.38.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>
