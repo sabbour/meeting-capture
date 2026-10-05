@@ -1,0 +1,114 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <!-- Background gradient: deep blue → teal → soft purple -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#1A3A6E"/>
+      <stop offset="50%"  stop-color="#0F6B8E"/>
+      <stop offset="100%" stop-color="#4B3A8C"/>
+    </linearGradient>
+
+    <!-- Microphone body gradient: lighter teal to white-teal -->
+    <linearGradient id="micGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%"   stop-color="#7FF0E8"/>
+      <stop offset="100%" stop-color="#38C4D4"/>
+    </linearGradient>
+
+    <!-- Speech bubble gradient: white with slight blue tint -->
+    <linearGradient id="bubbleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#9ED8F0" stop-opacity="0.14"/>
+    </linearGradient>
+
+    <!-- Inner glow filter for the microphone -->
+    <filter id="micGlow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Soft drop shadow for depth -->
+    <filter id="shadow" x="-20%" y="-10%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+
+    <!-- Subtle inner highlight on background -->
+    <radialGradient id="bgHighlight" cx="35%" cy="30%" r="55%">
+      <stop offset="0%"   stop-color="#FFFFFF" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- ── Background: rounded rectangle ── -->
+  <rect x="0" y="0" width="256" height="256" rx="52" ry="52" fill="url(#bgGrad)"/>
+  <!-- Subtle top-left highlight for Fluent depth -->
+  <rect x="0" y="0" width="256" height="256" rx="52" ry="52" fill="url(#bgHighlight)"/>
+
+  <!-- ── Speech bubble (behind mic, suggests "conversation capture") ── -->
+  <!-- Main bubble body -->
+  <rect x="56" y="62" width="144" height="90" rx="20" ry="20"
+        fill="url(#bubbleGrad)" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"/>
+  <!-- Bubble tail pointing down-left -->
+  <path d="M 88,152 L 72,178 L 108,152 Z"
+        fill="url(#bubbleGrad)" stroke="#FFFFFF" stroke-opacity="0.18" stroke-width="1.5"
+        stroke-linejoin="round"/>
+
+  <!-- ── Waveform lines inside the speech bubble ── -->
+  <!-- Five bars of an audio waveform, centered in the bubble -->
+  <g stroke="#FFFFFF" stroke-opacity="0.75" stroke-linecap="round" stroke-width="4.5">
+    <!-- bar 1 (short) -->
+    <line x1="88"  y1="113" x2="88"  y2="103"/>
+    <!-- bar 2 (taller) -->
+    <line x1="103" y1="118" x2="103" y2="96"/>
+    <!-- bar 3 (tallest — center) -->
+    <line x1="118" y1="122" x2="118" y2="90"/>
+    <!-- bar 4 (taller) -->
+    <line x1="133" y1="118" x2="133" y2="96"/>
+    <!-- bar 5 (short) -->
+    <line x1="148" y1="113" x2="148" y2="103"/>
+    <!-- bar 6 (short-medium) -->
+    <line x1="163" y1="116" x2="163" y2="100"/>
+  </g>
+
+  <!-- ── Microphone (foreground, bottom-right region) ── -->
+  <g filter="url(#shadow)">
+    <!-- Mic capsule body -->
+    <rect x="110" y="148" width="36" height="52" rx="18" ry="18"
+          fill="url(#micGrad)" filter="url(#micGlow)"/>
+
+    <!-- Mic stand arc -->
+    <path d="M 96,184 Q 96,214 128,214 Q 160,214 160,184"
+          fill="none" stroke="url(#micGrad)" stroke-width="5.5" stroke-linecap="round"/>
+
+    <!-- Mic stand vertical post -->
+    <line x1="128" y1="214" x2="128" y2="228"
+          stroke="url(#micGrad)" stroke-width="5.5" stroke-linecap="round"/>
+
+    <!-- Mic stand base -->
+    <line x1="112" y1="228" x2="144" y2="228"
+          stroke="url(#micGrad)" stroke-width="5.5" stroke-linecap="round"/>
+
+    <!-- Mic highlight stripe (gives it a 3D pill look) -->
+    <rect x="118" y="154" width="8" height="18" rx="4" ry="4"
+          fill="#FFFFFF" fill-opacity="0.45"/>
+  </g>
+
+  <!-- ── AI sparkle accents (top-right corner) ── -->
+  <!-- Large star sparkle -->
+  <g fill="#A8EDFF" fill-opacity="0.90">
+    <!-- 4-point star, large -->
+    <path d="M 196,52 L 199,60 L 207,63 L 199,66 L 196,74 L 193,66 L 185,63 L 193,60 Z"/>
+  </g>
+  <!-- Small companion dots -->
+  <circle cx="214" cy="50" r="3.5" fill="#C8F0FF" fill-opacity="0.80"/>
+  <circle cx="210" cy="78" r="2.5" fill="#A8EDFF" fill-opacity="0.65"/>
+
+  <!-- Small secondary sparkle (lower-left accent) -->
+  <path d="M 52,195 L 54,200 L 59,202 L 54,204 L 52,209 L 50,204 L 45,202 L 50,200 Z"
+        fill="#7FF0E8" fill-opacity="0.55"/>
+
+  <!-- ── Outer border ring (subtle Fluent glass edge) ── -->
+  <rect x="1.5" y="1.5" width="253" height="253" rx="51" ry="51"
+        fill="none" stroke="#FFFFFF" stroke-opacity="0.10" stroke-width="3"/>
+</svg>

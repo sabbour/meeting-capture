@@ -1,0 +1,80 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <RestoreSources></RestoreSources>
+    <NuGetAudit>false</NuGetAudit>
+  </PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.xaml" Link="MainWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.xaml.cs" Link="MainWindow.xaml.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.Settings.cs" Link="MainWindow.Settings.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\Program.cs" Link="Program.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\FlyoutViewModels.cs" Link="FlyoutViewModels.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\App.xaml.cs" Link="App.xaml.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\AudioCapture\MicrophoneCapture.cs" Link="MicrophoneCapture.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\AudioCapture\LoopbackCapture.cs" Link="LoopbackCapture.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\app.manifest" Link="app.manifest" CopyToOutputDirectory="PreserveNewest" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.85.1" />
+    <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.3" ExcludeAssets="build;buildTransitive" />
+    <PackageReference Include="NAudio" Version="2.2.1" />
+    <Compile Include="..\..\src\MeetingCapture\WorkIq\*.cs" Link="Production\WorkIq\%(Filename)%(Extension)" />
+    <Compile Include="..\WorkIq\*.cs" Link="WorkIq\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\IAudioCapture.cs" Link="Production\IAudioCapture.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\AudioBuffer.cs" Link="Production\AudioBuffer.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\AudioNormalizer.cs" Link="Production\AudioNormalizer.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\AudioHealthTracker.cs" Link="Production\AudioHealthTracker.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\ClockAlignedPcmMixer.cs" Link="Production\ClockAlignedPcmMixer.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\WasapiCaptureWorker.cs" Link="Production\WasapiCaptureWorker.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\MicrophoneCapture.cs" Link="Production\MicrophoneCapture.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\LoopbackCapture.cs" Link="Production\LoopbackCapture.cs" />
+    <Compile Include="..\..\src\MeetingCapture\AudioCapture\DualSourceCapture.cs" Link="Production\DualSourceCapture.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Transcription\ITranscriptionService.cs" Link="Production\ITranscriptionService.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Transcription\TranscriptionResult.cs" Link="Production\TranscriptionResult.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Transcription\SpeechCancellationDiagnostics.cs" Link="Production\SpeechCancellationDiagnostics.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Transcription\TranscriptionStartFailure.cs" Link="Production\TranscriptionStartFailure.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Pipeline\*.cs" Link="Production\Pipeline\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\MeetingDetection\*.cs" Link="Production\MeetingDetection\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\Configuration\*.cs" Link="Production\Configuration\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\Graph\SpeakerResolver.cs" Link="Production\SpeakerResolver.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Graph\BoundedSignIn.cs" Link="Production\BoundedSignIn.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\PanelRefreshState.cs" Link="Production\PanelRefreshState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\WorkIqConnectionStatus.cs" Link="Production\WorkIqConnectionStatus.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\CalendarMeetingList.cs" Link="Production\CalendarMeetingList.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\RecordingViewState.cs" Link="Production\RecordingViewState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\TranscriptViewport.cs" Link="Production\TranscriptViewport.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\TranscriptCollectionState.cs" Link="Production\TranscriptCollectionState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\VisualizationCollectionState.cs" Link="Production\VisualizationCollectionState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\CopilotModelPresentation.cs" Link="Production\CopilotModelPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\WindowPlacement.cs" Link="Production\WindowPlacement.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\ChecklistItemViewModel.cs" Link="Production\ChecklistItemViewModel.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\SaveReviewPresentation.cs" Link="Production\SaveReviewPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerAvatarPresentation.cs" Link="Production\SpeakerAvatarPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicMapState.cs" Link="Production\TopicMapState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\RelatedContextPresentation.cs" Link="Production\RelatedContextPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\ParticipantPresentation.cs" Link="Production\ParticipantPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\CatchUpPresentation.cs" Link="Production\CatchUpPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\AiUsagePresentation.cs" Link="Production\AiUsagePresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\AiDiagnosticsPresentation.cs" Link="Production\AiDiagnosticsPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\INotesIntelligence.cs" Link="Production\INotesIntelligence.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\AiUsageObservability.cs" Link="Production\AiUsageObservability.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\AiDiagnostics.cs" Link="Production\AiDiagnostics.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\MeetingNotes.cs" Link="Production\MeetingNotes.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\RelatedItem.cs" Link="Production\RelatedItem.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\RelatedContext.cs" Link="Production\RelatedContext.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\RelatedContextCoordinator.cs" Link="Production\RelatedContextCoordinator.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\MeetingVisualizationDocument.cs" Link="Production\MeetingVisualizationDocument.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\MeetingVisualizationSession.cs" Link="Production\MeetingVisualizationSession.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\IMeetingVisualizationIntelligence.cs" Link="Production\IMeetingVisualizationIntelligence.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\IntelligenceErrors.cs" Link="Production\IntelligenceErrors.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\IntelligenceResponseParser.cs" Link="Production\IntelligenceResponseParser.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\CopilotNotesService.cs" Link="Production\CopilotNotesService.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Intelligence\CopilotModelCatalog.cs" Link="Production\CopilotModelCatalog.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Storage\*.cs" Link="Production\Storage\%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

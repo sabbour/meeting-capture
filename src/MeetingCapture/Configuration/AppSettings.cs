@@ -12,33 +12,72 @@ public sealed class AppSettings
 public sealed class TranscriptionSettings
 {
     /// <summary>
-    /// "azure" for Azure Speech SDK (cloud), "npu" for local Windows ML / Whisper NPU path.
+    /// "azure" for Azure Speech SDK via Foundry, "npu" for local Windows ML / Whisper NPU path.
     /// </summary>
     public string Provider { get; init; } = "azure";
 
-    public string AzureSpeechKey { get; init; } = string.Empty;
-    public string AzureSpeechRegion { get; init; } = "eastus";
+    /// <summary>
+    /// Azure AI Foundry / Cognitive Services endpoint.
+    /// Region is extracted automatically from the URL; falls back to endpoint-based config.
+    /// E.g. https://my-resource.cognitiveservices.azure.com/
+    /// </summary>
+    public string Endpoint { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Foundry API key. Read from AZURE_SPEECH_KEY env var if empty.
+    /// Store via `dotnet user-secrets` — do not commit to appsettings.json.
+    /// </summary>
+    public string ApiKey { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Azure region for SpeechConfig.FromSubscription (e.g. "swedencentral").
+    /// When set, takes precedence over URL-based region extraction.
+    /// </summary>
+    public string Region { get; init; } = string.Empty;
+
     public string Language { get; init; } = "en-US";
 }
 
 public sealed class IntelligenceSettings
 {
     /// <summary>
-    /// GitHub Models endpoint or Azure OpenAI endpoint.
-    /// Default targets GitHub Models (https://models.inference.ai.azure.com).
+    /// Inference provider. "github" = GitHub Copilot API (gh CLI auth, no extra credentials).
+    /// "azure" = BYOC via Azure AI Foundry (requires Endpoint + ApiKey below).
     /// </summary>
-    public string Endpoint { get; init; } = "https://models.inference.ai.azure.com";
+    public string Provider { get; init; } = "azure";
 
-    /// <summary>
-    /// PAT with models:read scope for GitHub Models, or Azure OpenAI key.
-    /// Read from environment variable GITHUB_TOKEN if empty.
-    /// </summary>
+    // ── Azure BYOC — shared across both uses ─────────────────────────────────────────
+
+    /// <summary>Azure AI Foundry / OpenAI endpoint. E.g. https://my-resource.openai.azure.com/</summary>
+    public string Endpoint { get; init; } = string.Empty;
+
+    /// <summary>Foundry API key. Read from AZURE_FOUNDRY_KEY env var if empty.</summary>
     public string ApiKey { get; init; } = string.Empty;
 
-    public string Model { get; init; } = "gpt-4o";
+    /// <summary>Azure OpenAI API version for the versioned deployment route.</summary>
+    public string ApiVersion { get; init; } = "2025-04-01-preview";
 
-    /// <summary>Maximum tokens for the notes synthesis response.</summary>
-    public int MaxTokens { get; init; } = 2000;
+    // ── Synthesis model — transcript → structured notes (runs once per meeting) ──────
+
+    /// <summary>
+    /// Azure deployment name for final note synthesis.
+    /// This is the name you gave the deployment in Azure AI Studio (e.g. "gpt-4o").
+    /// </summary>
+    public string SynthesisDeployment { get; init; } = string.Empty;
+
+    /// <summary>GitHub Copilot model for synthesis (e.g. "gpt-4o", "claude-sonnet-4.5").</summary>
+    public string SynthesisModel { get; init; } = string.Empty;
+
+    // ── Intelligence model — real-time topic / questions / actions (runs periodically) ─
+
+    /// <summary>
+    /// Azure deployment name for real-time intelligence.
+    /// This is the name you gave the deployment in Azure AI Studio (e.g. "gpt-4o-mini").
+    /// </summary>
+    public string IntelligenceDeployment { get; init; } = string.Empty;
+
+    /// <summary>GitHub Copilot model for real-time intelligence (e.g. "gpt-4o-mini", "claude-haiku-4.5").</summary>
+    public string IntelligenceModel { get; init; } = string.Empty;
 }
 
 public sealed class StorageSettings
@@ -59,6 +98,15 @@ public sealed class AudioSettings
     public bool CaptureLoopback { get; init; } = true;
 
     /// <summary>
+    /// Capture loopback AND microphone simultaneously via <c>DualSourceCapture</c>.
+    /// This is what lets the user's own voice be transcribed during Teams/Zoom calls — the
+    /// loopback stream is echo-cancelled to exclude the local talker, so the mic supplies it.
+    /// When true (and both sources are enabled) the pipeline uses the dual source; otherwise it
+    /// falls back to whichever single source is available.
+    /// </summary>
+    public bool DualCapture { get; init; } = true;
+
+    /// <summary>
     /// PCM sample rate used for all capture paths. Azure Speech SDK requires 16000 Hz.
     /// </summary>
     public int SampleRate { get; init; } = 16000;
@@ -70,7 +118,7 @@ public sealed class AudioSettings
 public sealed class MeetingDetectionSettings
 {
     /// <summary>
-    /// Known meeting application process names (without .exe) to trigger automatic session start.
+    /// Known app process names eligible for sustained microphone-activity suggestions. Never auto-records.
     /// </summary>
     public string[] KnownMeetingProcesses { get; init; } =
     [
@@ -79,12 +127,10 @@ public sealed class MeetingDetectionSettings
         "Zoom",
         "WebexMeetings",
         "WebexTeams",
-        "Slack",
         "lync",
-        "OUTLOOK",
         "msteams"
     ];
 
-    /// <summary>Polling interval in seconds when process detection is used.</summary>
+    /// <summary>Polling interval for process identity and microphone-session evidence.</summary>
     public int PollIntervalSeconds { get; init; } = 10;
 }

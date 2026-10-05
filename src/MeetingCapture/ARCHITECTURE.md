@@ -18,7 +18,7 @@ MeetingPipeline (orchestrator)
     │
     └─ on MeetingEnded → StopCaptureAndProcessAsync()
             ├─ ITranscriptionService.StopAsync() → TranscriptionResult
-            ├─ INotesIntelligence.SynthesizeAsync() → MeetingNotes (GitHub Models / GPT-4o)
+            ├─ INotesIntelligence.SynthesizeAsync() → MeetingNotes (Microsoft Foundry / GPT-4o)
             └─ INotesStorage.SaveAsync() → Markdown file in OneDrive
 
 TrayApplicationContext (WinForms NotifyIcon)
@@ -45,8 +45,8 @@ All settings read from `appsettings.json` + environment variable overrides:
 |---------|-------------|---------|
 | `Transcription:AzureSpeechKey` | `AZURE_SPEECH_KEY` | Azure Speech SDK key |
 | `Transcription:AzureSpeechRegion` | — | Azure region (default: eastus) |
-| `Intelligence:ApiKey` | `GITHUB_TOKEN` | GitHub Models PAT or Azure OpenAI key |
-| `Intelligence:Endpoint` | — | Default: GitHub Models endpoint |
+| `Intelligence:ApiKey` | `AZURE_OPENAI_API_KEY`, `AZURE_AI_FOUNDRY_API_KEY` | Microsoft Foundry / Azure OpenAI key |
+| `Intelligence:Endpoint` | — | Foundry-compatible endpoint |
 | `Intelligence:Model` | — | Default: gpt-4o |
 | `Storage:NotesPath` | — | OneDrive notes output folder |
 
@@ -58,7 +58,7 @@ All settings read from `appsettings.json` + environment variable overrides:
 - [x] Microphone capture (NAudio)
 - [x] WASAPI loopback capture (system audio)
 - [x] Azure Speech SDK transcription (streaming push)
-- [x] GitHub Models / GPT-4o note synthesis
+- [x] Microsoft Foundry / GPT-4o note synthesis
 - [x] Markdown note persistence to OneDrive
 
 ### Phase 2 (next — Bishop + Vasquez)

@@ -2,41 +2,75 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net8.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>MeetingCapture</RootNamespace>
+    <AssemblyName>MeetingCapture</AssemblyName>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AllowUnsafeBlocks>false</AllowUnsafeBlocks>
-    <AssemblyName>MeetingCapture</AssemblyName>
-    <RootNamespace>MeetingCapture</RootNamespace>
-    <!-- ApplicationIcon: Bishop to add Resources\tray.ico before first ship -->
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>false</SelfContained>
+    <RuntimeIdentifier>win-arm64</RuntimeIdentifier>
+    <SelfContained>true</SelfContained>
+    <UseWinUI>true</UseWinUI>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <WindowsPackageType>None</WindowsPackageType>
+    <EnableMsixTooling>true</EnableMsixTooling>
     <Version>0.1.0</Version>
     <Description>Meeting capture tray app with transcription and AI notes</Description>
+    <ApplicationIcon>Resources\tray.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <UserSecretsId>f70ecf32-5e86-4ad8-8b9f-e3cfdb911c09</UserSecretsId>
+    <!-- Disable the SDK-auto-generated Main so we can provide our own for single-instance handling -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
+    <FrameworkReference Include="Microsoft.WindowsDesktop.App" />
+    <!-- WinUI 3 / Windows App SDK -->
+    <PackageReference Include="Microsoft.Identity.Client.Broker" Version="4.85.1" />
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.2.0" />
+    <!-- System tray icon for WinUI 3 -->
+    <PackageReference Include="H.NotifyIcon.WinUI" Version="2.4.1" />
     <!-- Audio capture via WASAPI (loopback + microphone) -->
+    <PackageReference Include="Microsoft.Extensions.Configuration.UserSecrets" Version="10.0.0" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <!-- Azure Speech SDK for transcription (cloud path) -->
     <PackageReference Include="Microsoft.CognitiveServices.Speech" Version="1.41.1" />
-    <!-- OpenAI SDK — used for GitHub Models / Copilot endpoint -->
-    <PackageReference Include="Azure.AI.OpenAI" Version="2.1.0" />
+    <!-- GitHub Copilot SDK — notes intelligence -->
+    <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.3" />
+    <!-- Microsoft Graph + MSAL — speaker name resolution (signed-in user + meeting participants) -->
+    <PackageReference Include="Microsoft.Identity.Client" Version="4.85.1" />
+    <PackageReference Include="Microsoft.Graph" Version="5.105.0" />
+    <!-- Pin Kiota (transitive via Microsoft.Graph) to a patched version: 1.21.1 ships a
+         RedirectHandler that leaks sensitive headers on cross-host redirects (GHSA-7j59-v9qr-6fq9). -->
+    <PackageReference Include="Microsoft.Kiota.Abstractions" Version="1.22.2" />
+    <PackageReference Include="Microsoft.Kiota.Http.HttpClientLibrary" Version="1.22.2" />
     <!-- DI + configuration -->
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Configuration" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="8.0.0" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging" Version="8.0.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.1" />
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Configuration.EnvironmentVariables" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.0" />
     <!-- Markdown rendering for note output -->
     <PackageReference Include="Markdig" Version="0.38.0" />
+    <!-- CommunityToolkit.WinUI 8.2+ is multi-platform (MAUI) and its XAML assemblies lack .winmd
+         metadata required by the Windows App SDK XAML compiler. Use built-in WinUI 3 controls instead. -->
   </ItemGroup>
 
   <ItemGroup>
-    <None Update="appsettings.json">
+    <None Update="appsettings.json" Condition="Exists('appsettings.json')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="appsettings.template.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copy Resources directory (icons, assets) to output -->
+    <None Include="Resources/**/*">
+      <Link>Resources/%(Filename)%(Extension)</Link>
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>

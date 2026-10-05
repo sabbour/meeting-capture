@@ -1,4 +1,7 @@
 using System.Text;
+using System.Security.Cryptography;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 using MeetingCapture.Configuration;
 using MeetingCapture.Intelligence;
 using Microsoft.Extensions.Logging;
@@ -7,16 +10,11 @@ using Microsoft.Extensions.Options;
 namespace MeetingCapture.Storage;
 
 /// <summary>
-/// Persists meeting notes as Markdown files under the configured OneDrive path.
-/// File naming: YYYY-MM-DD_HH-mm_&lt;sanitized-title&gt;.md
-///
-/// Folder structure:
-///   {NotesPath}/
-///     YYYY-MM/
-///       YYYY-MM-DD_HH-mm_MeetingTitle.md
+/// Persists full session records atomically with a readable name and stable session identity.
 /// </summary>
 public sealed class MarkdownNotesStorage : INotesStorage
 {
+    private const int MaxFilenameLabelLength = 72;
     private readonly StorageSettings _settings;
     private readonly ILogger<MarkdownNotesStorage> _logger;
 
@@ -30,93 +28,224 @@ public sealed class MarkdownNotesStorage : INotesStorage
 
     public async Task<string> SaveAsync(MeetingNotes notes, CancellationToken cancellationToken)
     {
-        var folder = Path.Combine(
-            _settings.NotesPath,
-            notes.CreatedAt.LocalDateTime.ToString("yyyy-MM"));
-
+        ArgumentNullException.ThrowIfNull(notes);
+        if (string.IsNullOrWhiteSpace(notes.SessionId))
+            throw new ArgumentException("A session ID is required to save notes.", nameof(notes));
+        cancellationToken.ThrowIfCancellationRequested();
+        var folder = _settings.NotesPath;
         Directory.CreateDirectory(folder);
-
-        var safeTitle = SanitizeFilename(notes.MeetingTitle);
-        var filename = $"{notes.CreatedAt.LocalDateTime:yyyy-MM-dd_HH-mm}_{safeTitle}.md";
-        var fullPath = Path.Combine(folder, filename);
-
+        var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(notes.SessionId)));
+        var fullPath = ResolvePath(folder, notes, identity);
+        var temporary = fullPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         var markdown = BuildMarkdown(notes);
-        await File.WriteAllTextAsync(fullPath, markdown, Encoding.UTF8, cancellationToken)
-            .ConfigureAwait(false);
-
-        _logger.LogInformation("Notes saved: {Path}", fullPath);
+        try
+        {
+            await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                4096, FileOptions.Asynchronous))
+            {
+                await using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true);
+                await writer.WriteAsync(markdown.AsMemory(), cancellationToken).ConfigureAwait(false);
+                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                stream.Flush(flushToDisk: true);
+            }
+            cancellationToken.ThrowIfCancellationRequested();
+            if (File.Exists(fullPath))
+                File.Replace(temporary, fullPath, null);
+            else
+                File.Move(temporary, fullPath);
+        }
+        finally
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+        }
+        _logger.LogInformation("Session notes and transcript saved.");
         return fullPath;
+    }
+
+    private static string ResolvePath(string folder, MeetingNotes notes, string identity)
+    {
+        var existing = Directory.EnumerateFiles(folder, $"*_{identity}.md", SearchOption.TopDirectoryOnly)
+            .Take(2).ToArray();
+        if (existing.Length > 1)
+            throw new IOException("Multiple note files exist for the same session.");
+        if (existing.Length == 1)
+            return existing[0];
+
+        var label = RepresentativeLabel(notes);
+        return Path.Combine(folder, $"{notes.CreatedAt.LocalDateTime:yyyy-MM-dd_HH-mm}_{label}_{identity}.md");
+    }
+
+    private static string RepresentativeLabel(MeetingNotes notes)
+    {
+        var title = notes.MeetingTitle.Trim();
+        if (!IsGenericTitle(title))
+            return SanitizeFilename(title);
+
+        var grounded = notes.Topics.FirstOrDefault(topic => !string.IsNullOrWhiteSpace(topic))
+            ?? notes.RawTranscript;
+        return SanitizeFilename(grounded);
+    }
+
+    private static bool IsGenericTitle(string title)
+        => string.IsNullOrWhiteSpace(title) ||
+           title.Equals("Meeting", StringComparison.OrdinalIgnoreCase) ||
+           title.StartsWith("Manual Recording", StringComparison.OrdinalIgnoreCase);
+
+    private static string SanitizeFilename(string value)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var safe = new string(value
+            .Select(character => invalid.Contains(character) || char.IsControl(character) ? ' ' : character)
+            .ToArray());
+        safe = Regex.Replace(safe, @"\s+", " ").Trim(' ', '.');
+        if (safe.Length > MaxFilenameLabelLength)
+        {
+            safe = safe[..MaxFilenameLabelLength].TrimEnd();
+            var wordBoundary = safe.LastIndexOf(' ');
+            if (wordBoundary >= MaxFilenameLabelLength / 2)
+                safe = safe[..wordBoundary];
+        }
+        return string.IsNullOrWhiteSpace(safe) ? "Recording" : safe;
     }
 
     private static string BuildMarkdown(MeetingNotes notes)
     {
         var sb = new StringBuilder();
-        sb.AppendLine($"# {notes.MeetingTitle}");
+
+        // YAML frontmatter for machine-queryability.
+        sb.AppendLine("---");
+        sb.AppendLine($"session_id: {YamlString(notes.SessionId)}");
+        sb.AppendLine($"title: {YamlString(notes.MeetingTitle)}");
+        sb.AppendLine($"date: {notes.CreatedAt.LocalDateTime:yyyy-MM-dd}");
+        sb.AppendLine($"duration_minutes: {notes.EstimatedDurationMinutes}");
+        sb.AppendLine($"meeting_type: {YamlString(notes.MeetingType)}");
+        sb.AppendLine($"sentiment: {YamlString(notes.Sentiment)}");
+        var outcome = notes.IntelligenceFailure is not null ? "failed"
+            : string.IsNullOrWhiteSpace(notes.Summary) ? "not_generated" : "succeeded";
+        sb.AppendLine($"intelligence_outcome: {outcome}");
+
+        if (notes.Participants.Count > 0)
+        {
+            sb.AppendLine("participants:");
+            foreach (var p in notes.Participants)
+            {
+                sb.AppendLine($"  - name: {YamlString(p.Name)}");
+                sb.AppendLine($"    role: {(p.Role is null ? "null" : YamlString(p.Role))}");
+            }
+        }
+        else
+        {
+            sb.AppendLine("participants: []");
+        }
+
+        sb.AppendLine($"topics: [{string.Join(", ", notes.Topics.Select(YamlString))}]");
+        sb.AppendLine($"has_open_actions: {(notes.ActionItems.Count > 0 ? "true" : "false")}");
+        sb.AppendLine($"has_decisions: {(notes.Decisions.Count > 0 ? "true" : "false")}");
+        sb.AppendLine("---");
         sb.AppendLine();
-        sb.AppendLine($"> Created: {notes.CreatedAt.LocalDateTime:yyyy-MM-dd HH:mm}");
+        sb.AppendLine($"# {notes.MeetingTitle.Replace("\r", " ").Replace("\n", " ")}");
+        sb.AppendLine();
+        sb.AppendLine("## Intelligence Status");
+        sb.AppendLine();
+        if (notes.IntelligenceFailure is { } failure)
+        {
+            sb.AppendLine($"AI generation failed ({failure.Kind}). {IntelligenceErrors.Message(failure.Kind)}");
+            sb.AppendLine("The captured transcript is preserved below. Retry AI in the app while this completed session remains available.");
+        }
+        else
+            sb.AppendLine(outcome == "succeeded" ? "AI notes generated." : "AI notes have not been generated. The captured transcript is preserved below.");
         sb.AppendLine();
 
         sb.AppendLine("## Summary");
         sb.AppendLine();
-        sb.AppendLine(notes.Summary);
+        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Summary) ? "_No summary._" : notes.Summary);
         sb.AppendLine();
 
+        sb.AppendLine("## Nuances and Context");
+        sb.AppendLine();
+        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Nuances) ? "_None noted._" : notes.Nuances);
+        sb.AppendLine();
+
+        sb.AppendLine("## Topic-by-Topic Narrative");
+        sb.AppendLine();
+        if (notes.KeyDiscussionPoints.Count > 0)
+            foreach (var point in notes.KeyDiscussionPoints)
+            {
+                var separator = point.IndexOf(" — ", StringComparison.Ordinal);
+                if (separator > 0 && separator + 3 < point.Length)
+                {
+                    sb.AppendLine($"### {point[..separator]}");
+                    sb.AppendLine();
+                    sb.AppendLine(point[(separator + 3)..]);
+                    sb.AppendLine();
+                }
+                else
+                    sb.AppendLine($"- {point}");
+            }
+        else
+            sb.AppendLine("_None recorded._");
+        sb.AppendLine();
+
+        sb.AppendLine("## Decisions Made");
+        sb.AppendLine();
         if (notes.Decisions.Count > 0)
-        {
-            sb.AppendLine("## Decisions");
-            sb.AppendLine();
             foreach (var decision in notes.Decisions)
                 sb.AppendLine($"- {decision}");
-            sb.AppendLine();
-        }
+        else
+            sb.AppendLine("_No decisions recorded._");
+        sb.AppendLine();
 
+        sb.AppendLine("## Action Items");
+        sb.AppendLine();
         if (notes.ActionItems.Count > 0)
-        {
-            sb.AppendLine("## Action Items");
-            sb.AppendLine();
             foreach (var item in notes.ActionItems)
             {
-                var owner = item.Owner is not null ? $" **({item.Owner})**" : string.Empty;
-                var due = item.DueDate is not null ? $" — due {item.DueDate}" : string.Empty;
-                sb.AppendLine($"- [ ] {item.Description}{owner}{due}");
+                var owner = string.IsNullOrWhiteSpace(item.Owner) ? "unspecified" : item.Owner;
+                var due = string.IsNullOrWhiteSpace(item.DueDate) ? "unspecified" : item.DueDate;
+                sb.AppendLine($"- [ ] {item.Description} — **Owner:** {owner} — **Due:** {due}");
             }
-            sb.AppendLine();
-        }
+        else
+            sb.AppendLine("_None._");
+        sb.AppendLine();
 
-        if (notes.Topics.Count > 0)
-        {
-            sb.AppendLine("## Topics");
-            sb.AppendLine();
-            sb.AppendLine(string.Join(", ", notes.Topics.Select(t => $"`{t}`")));
-            sb.AppendLine();
-        }
+        sb.AppendLine("## Open Questions");
+        sb.AppendLine();
+        if (notes.OpenQuestions.Count > 0)
+            foreach (var q in notes.OpenQuestions)
+                sb.AppendLine($"- {q}");
+        else
+            sb.AppendLine("_None._");
+        sb.AppendLine();
 
-        if (!string.IsNullOrWhiteSpace(notes.Nuances))
-        {
-            sb.AppendLine("## Nuances & Context");
-            sb.AppendLine();
-            sb.AppendLine(notes.Nuances);
-            sb.AppendLine();
-        }
+        sb.AppendLine("## Notable Quotes");
+        sb.AppendLine();
+        if (notes.NotableQuotes.Count > 0)
+            foreach (var quote in notes.NotableQuotes)
+                sb.AppendLine($"> {quote}");
+        else
+            sb.AppendLine("_None._");
+        sb.AppendLine();
 
+        sb.AppendLine("## Follow-up Meetings");
+        sb.AppendLine();
+        if (notes.FollowUpMeetings.Count > 0)
+            foreach (var f in notes.FollowUpMeetings)
+                sb.AppendLine($"- {f}");
+        else
+            sb.AppendLine("_None mentioned._");
+
+        sb.AppendLine();
+        sb.AppendLine();
         sb.AppendLine("## Raw Transcript");
         sb.AppendLine();
-        sb.AppendLine("<details>");
-        sb.AppendLine("<summary>Expand transcript</summary>");
-        sb.AppendLine();
+        var longestFence = Regex.Matches(notes.RawTranscript, "`+").Select(match => match.Length).DefaultIfEmpty(0).Max();
+        var fence = new string('`', Math.Max(3, longestFence + 1));
+        sb.AppendLine(fence + "text");
         sb.AppendLine(notes.RawTranscript);
-        sb.AppendLine();
-        sb.AppendLine("</details>");
-
+        sb.AppendLine(fence);
         return sb.ToString();
     }
 
-    private static string SanitizeFilename(string title)
-    {
-        var invalid = Path.GetInvalidFileNameChars();
-        var safe = new string(title
-            .Select(c => invalid.Contains(c) ? '_' : c)
-            .ToArray());
-        return safe.Length > 60 ? safe[..60] : safe;
-    }
+    private static string YamlString(string value)
+        => JsonSerializer.Serialize(value);
 }

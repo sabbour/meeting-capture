@@ -5,19 +5,60 @@ public sealed class MeetingSession
 {
     public string Id { get; } = Guid.NewGuid().ToString("N");
 
-    /// <summary>Display-friendly title, typically the detected app name + timestamp.</summary>
-    public string Title { get; init; } = "Meeting";
+    private string _title = "Meeting";
+    private readonly object _titleGate = new();
+    private bool _titleFrozen;
+    private MeetingTitleCandidate? _calendarMeeting;
+    /// <summary>Resolved calendar subject, or an honest detected-app fallback.</summary>
+    public string Title { get => _title; init => _title = value; }
+    public string TitleSource { get; private set; } = "Calendar confirmation is not available.";
+    public MeetingTitleCandidate? CalendarMeeting { get { lock (_titleGate) return _calendarMeeting; } }
+    public IReadOnlyList<MeetingInvitee> InviteParticipants
+    {
+        get { lock (_titleGate) return MeetingTitleResolver.InviteParticipants(_calendarMeeting); }
+    }
+
+    public bool TrySetPendingTitle(string? pendingSessionId, string title,
+        string source = "One calendar event matches the time and meeting platform.")
+    {
+        lock (_titleGate)
+        {
+            if (_titleFrozen || pendingSessionId != Id || !IsActive || string.IsNullOrWhiteSpace(title))
+                return false;
+            _title = title;
+            TitleSource = source;
+            return true;
+        }
+    }
+
+    public bool TryAttachCalendarMeeting(string? pendingSessionId, MeetingTitleCandidate meeting)
+    {
+        lock (_titleGate)
+        {
+            if (_titleFrozen || pendingSessionId != Id || !IsActive ||
+                !MeetingTitleResolver.IsEligibleOnlineMeeting(meeting))
+                return false;
+            _calendarMeeting = meeting;
+            return true;
+        }
+    }
+
+    internal void FreezeTitle() { lock (_titleGate) _titleFrozen = true; }
 
     /// <summary>Name of the process that triggered detection (e.g., "Teams").</summary>
     public string SourceProcess { get; init; } = string.Empty;
 
     public DateTimeOffset StartedAt { get; init; } = DateTimeOffset.UtcNow;
 
+    public DateTimeOffset SignalStartedAt { get; init; } = DateTimeOffset.UtcNow;
+
     public DateTimeOffset? EndedAt { get; private set; }
 
     public bool IsActive => EndedAt is null;
 
-    public void End() => EndedAt = DateTimeOffset.UtcNow;
+    public void End() => End(DateTimeOffset.UtcNow);
+
+    internal void End(DateTimeOffset endedAt) { lock (_titleGate) EndedAt ??= endedAt; }
 
     public TimeSpan Duration =>
         (EndedAt ?? DateTimeOffset.UtcNow) - StartedAt;

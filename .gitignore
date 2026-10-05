@@ -22,9 +22,9 @@ packages/
 *.exe
 !src/**/*.ico
 
-# User secrets
+# App settings — contain endpoints and keys; copy appsettings.template.json to appsettings.json locally
+appsettings.json
 appsettings.*.json
-!appsettings.json
 
 # OS
 Thumbs.db

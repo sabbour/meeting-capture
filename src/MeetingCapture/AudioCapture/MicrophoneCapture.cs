@@ -1,88 +1,64 @@
 using MeetingCapture.Configuration;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using NAudio.Wave;
+using NAudio.CoreAudioApi;
 
 namespace MeetingCapture.AudioCapture;
 
-/// <summary>
-/// Captures microphone (default input device) using NAudio WaveInEvent.
-/// Resamples to the configured sample rate + mono for Speech SDK compatibility.
-/// </summary>
-public sealed class MicrophoneCapture : IAudioCapture
+public sealed class MicrophoneCapture : IAudioCapture, IMicActivitySource
 {
-    private readonly AudioSettings _settings;
-    private readonly ILogger<MicrophoneCapture> _logger;
-    private WaveInEvent? _waveIn;
-    private bool _capturing;
+    private readonly WasapiCaptureWorker _worker;
+    private RollingRms _rms;
+    private long _micActivityTicks;
     private bool _disposed;
-
     public string Name => "Microphone";
-    public bool IsCapturing => _capturing;
+    public bool IsCapturing => _worker.IsCapturing;
     public int SampleRate { get; }
     public int Channels { get; }
-
+    public IReadOnlyList<AudioSourceHealth> Health => Array.AsReadOnly(new[] { _worker.Health });
     public event EventHandler<AudioDataEventArgs>? DataAvailable;
 
-    public MicrophoneCapture(
-        IOptions<AppSettings> settings,
-        ILogger<MicrophoneCapture> logger)
+    public DateTime? MicActivityTimestamp
     {
-        _settings = settings.Value.Audio;
-        _logger = logger;
-        SampleRate = _settings.SampleRate;
-        Channels = _settings.Channels;
+        get
+        {
+            var ticks = Interlocked.Read(ref _micActivityTicks);
+            return ticks == 0 ? null : new DateTime(ticks, DateTimeKind.Utc);
+        }
+    }
+    public MicrophoneCapture(IOptions<AppSettings> settings, ILogger<MicrophoneCapture> logger)
+    {
+        SampleRate = settings.Value.Audio.SampleRate;
+        Channels = settings.Value.Audio.Channels;
+        _rms = new RollingRms(SampleRate, 500);
+        _worker = new("microphone",
+            () => new WasapiCapture(WasapiCapture.GetDefaultCaptureDevice(), true, 100),
+            OnPcm, logger);
     }
 
-    public Task StartAsync(CancellationToken cancellationToken)
+    private void OnPcm(byte[] bytes, int count)
+    {
+        _rms.Add(bytes, count);
+        if (_rms.Rms >= 500)
+            Interlocked.Exchange(ref _micActivityTicks, DateTime.UtcNow.Ticks);
+        DataAvailable?.Invoke(this, new(bytes, count));
+    }
+
+    public Task StartAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (_capturing)
-            return Task.CompletedTask;
-
-        _waveIn = new WaveInEvent
-        {
-            WaveFormat = new WaveFormat(SampleRate, 16, Channels),
-            BufferMilliseconds = 100
-        };
-        _waveIn.DataAvailable += OnDataAvailable;
-        _waveIn.RecordingStopped += OnRecordingStopped;
-
-        _logger.LogInformation("Starting microphone capture at {Rate}Hz/{Channels}ch",
-            SampleRate, Channels);
-        _waveIn.StartRecording();
-        _capturing = true;
-        return Task.CompletedTask;
+        if (IsCapturing) throw new InvalidOperationException("The microphone is already owned.");
+        if (SampleRate != 16000 || Channels != 1)
+            throw new InvalidOperationException("Microphone capture supports 16000 Hz mono PCM.");
+        _rms = new RollingRms(SampleRate, 500);
+        Interlocked.Exchange(ref _micActivityTicks, 0);
+        return _worker.StartAsync(ct);
     }
-
-    public Task StopAsync(CancellationToken cancellationToken)
-    {
-        if (!_capturing || _waveIn is null)
-            return Task.CompletedTask;
-
-        _logger.LogInformation("Stopping microphone capture");
-        _waveIn.StopRecording();
-        _capturing = false;
-        return Task.CompletedTask;
-    }
-
-    private void OnDataAvailable(object? sender, WaveInEventArgs e)
-    {
-        if (e.BytesRecorded > 0)
-            DataAvailable?.Invoke(this, new AudioDataEventArgs(e.Buffer, e.BytesRecorded));
-    }
-
-    private void OnRecordingStopped(object? sender, StoppedEventArgs e)
-    {
-        if (e.Exception is not null)
-            _logger.LogError(e.Exception, "Microphone recording stopped unexpectedly");
-    }
-
+    public Task StopAsync(CancellationToken ct) => _worker.StopAsync(ct);
     public void Dispose()
     {
         if (_disposed) return;
         _disposed = true;
-        _waveIn?.Dispose();
-        _waveIn = null;
+        _worker.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 }

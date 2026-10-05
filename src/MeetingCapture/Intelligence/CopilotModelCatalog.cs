@@ -1,0 +1,111 @@
+using GitHub.Copilot;
+
+namespace MeetingCapture.Intelligence;
+
+public sealed record CopilotModelOption(string Id, string Name);
+
+public sealed record CopilotModelCatalogSnapshot(
+    IReadOnlyList<CopilotModelOption> Models,
+    DateTimeOffset RetrievedAt);
+
+public enum CopilotModelCatalogFailure { Timeout, Unavailable, Empty }
+
+public sealed class CopilotModelCatalogException(
+    CopilotModelCatalogFailure kind,
+    Exception? innerException = null) : Exception(kind switch
+{
+    CopilotModelCatalogFailure.Timeout => "GitHub Copilot model discovery timed out.",
+    CopilotModelCatalogFailure.Empty => "GitHub Copilot returned no available models.",
+    _ => "GitHub Copilot models could not be loaded."
+}, innerException)
+{
+    public CopilotModelCatalogFailure Kind { get; } = kind;
+}
+
+public sealed class CopilotModelCatalog
+{
+    private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(15);
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly Func<CancellationToken, Task<IReadOnlyList<CopilotModelOption>>> _fetch;
+    private readonly TimeSpan _requestTimeout;
+    private readonly TimeSpan _cacheLifetime;
+    private CopilotModelCatalogSnapshot? _cached;
+
+    public CopilotModelCatalog() : this(FetchAsync, RequestTimeout, CacheLifetime) { }
+
+    internal CopilotModelCatalog(
+        Func<CancellationToken, Task<IReadOnlyList<CopilotModelOption>>> fetch,
+        TimeSpan? requestTimeout = null,
+        TimeSpan? cacheLifetime = null)
+    {
+        _fetch = fetch ?? throw new ArgumentNullException(nameof(fetch));
+        _requestTimeout = requestTimeout ?? RequestTimeout;
+        _cacheLifetime = cacheLifetime ?? CacheLifetime;
+        if (_requestTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(requestTimeout));
+        if (_cacheLifetime < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(cacheLifetime));
+    }
+
+    public async Task<CopilotModelCatalogSnapshot> GetModelsAsync(
+        bool forceRefresh,
+        CancellationToken cancellationToken)
+    {
+        if (!forceRefresh && IsFresh(_cached))
+            return _cached!;
+
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            if (!forceRefresh && IsFresh(_cached))
+                return _cached!;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(_requestTimeout);
+            try
+            {
+                var models = (await _fetch(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false))
+                    .Where(model => !string.IsNullOrWhiteSpace(model.Id))
+                    .Select(model => new CopilotModelOption(
+                        model.Id.Trim(),
+                        string.IsNullOrWhiteSpace(model.Name) ? model.Id.Trim() : model.Name.Trim()))
+                    .DistinctBy(model => model.Id, StringComparer.OrdinalIgnoreCase)
+                    .OrderBy(model => model.Name, StringComparer.OrdinalIgnoreCase)
+                    .ThenBy(model => model.Id, StringComparer.OrdinalIgnoreCase)
+                    .ToArray();
+                if (models.Length == 0)
+                    throw new CopilotModelCatalogException(CopilotModelCatalogFailure.Empty);
+                return _cached = new CopilotModelCatalogSnapshot(models, DateTimeOffset.UtcNow);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+            catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
+            {
+                throw new CopilotModelCatalogException(CopilotModelCatalogFailure.Timeout, ex);
+            }
+            catch (CopilotModelCatalogException) { throw; }
+            catch (Exception ex)
+            {
+                throw new CopilotModelCatalogException(CopilotModelCatalogFailure.Unavailable, ex);
+            }
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private bool IsFresh(CopilotModelCatalogSnapshot? snapshot)
+        => snapshot is not null && DateTimeOffset.UtcNow - snapshot.RetrievedAt < _cacheLifetime;
+
+    private static async Task<IReadOnlyList<CopilotModelOption>> FetchAsync(
+        CancellationToken cancellationToken)
+    {
+        await using var client = new CopilotClient(new CopilotClientOptions
+        {
+            Mode = CopilotClientMode.CopilotCli
+        });
+        await client.StartAsync(cancellationToken).ConfigureAwait(false);
+        var models = await client.ListModelsAsync(cancellationToken).ConfigureAwait(false);
+        return models.Select(model => new CopilotModelOption(model.Id, model.Name)).ToArray();
+    }
+}

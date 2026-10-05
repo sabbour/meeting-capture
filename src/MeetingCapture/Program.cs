@@ -1,100 +1,75 @@
-using MeetingCapture.AudioCapture;
-using MeetingCapture.Configuration;
-using MeetingCapture.Intelligence;
-using MeetingCapture.MeetingDetection;
-using MeetingCapture.Pipeline;
-using MeetingCapture.Storage;
-using MeetingCapture.Transcription;
-using MeetingCapture.TrayApp;
-using Microsoft.Extensions.Configuration;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Options;
+using Microsoft.UI.Dispatching;
+using Microsoft.UI.Xaml;
+using Microsoft.Windows.AppLifecycle;
 
-// Tray apps must run on the UI thread with STA
-[assembly: System.Runtime.Versioning.SupportedOSPlatform("windows")]
+namespace MeetingCapture;
 
-ApplicationConfiguration.Initialize();
-
-var config = new ConfigurationBuilder()
-    .SetBasePath(AppContext.BaseDirectory)
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: false)
-    .AddEnvironmentVariables()
-    .Build();
-
-var services = new ServiceCollection();
-
-// Configuration
-services.Configure<AppSettings>(config);
-
-// Logging
-services.AddLogging(builder =>
+/// <summary>
+/// Custom entry point that enables single-instance behaviour: when the user clicks the
+/// pinned taskbar icon while the app is already running, Windows launches a second process.
+/// That second process detects the existing instance via <see cref="AppInstance"/>, sends a
+/// redirect signal (so the main instance shows its flyout), and exits immediately — leaving
+/// the user with one running copy of the app.
+/// </summary>
+internal static class Program
 {
-    builder.AddConsole();
-    builder.SetMinimumLevel(LogLevel.Information);
-});
+    private static readonly TimeSpan ActivationRedirectTimeout = TimeSpan.FromSeconds(3);
 
-// Meeting detection
-services.AddSingleton<IMeetingDetector, ProcessMeetingDetector>();
-
-// Audio capture — conditionally register based on settings
-var audioSettings = config.GetSection("Audio").Get<AudioSettings>() ?? new AudioSettings();
-if (audioSettings.CaptureMicrophone)
-    services.AddSingleton<IAudioCapture, MicrophoneCapture>();
-if (audioSettings.CaptureLoopback)
-    services.AddSingleton<IAudioCapture, LoopbackCapture>();
-
-// Transcription — extensible: swap provider here when NPU path is ready
-services.AddSingleton<ITranscriptionService, AzureSpeechTranscriptionService>();
-
-// Intelligence
-services.AddSingleton<INotesIntelligence, CopilotNotesService>();
-
-// Storage
-services.AddSingleton<INotesStorage, MarkdownNotesStorage>();
-
-// Pipeline + tray
-services.AddSingleton<MeetingPipeline>();
-services.AddSingleton<TrayApplicationContext>();
-
-var sp = services.BuildServiceProvider();
-
-// Validate critical config on startup and log warnings rather than crashing silently
-var logger = sp.GetRequiredService<ILogger<Program>>();
-var settings = sp.GetRequiredService<IOptions<AppSettings>>().Value;
-ValidateAndWarnSettings(settings, logger);
-
-var trayContext = sp.GetRequiredService<TrayApplicationContext>();
-Application.Run(trayContext);
-
-static void ValidateAndWarnSettings(AppSettings settings, ILogger logger)
-{
-    if (string.IsNullOrWhiteSpace(settings.Transcription.AzureSpeechKey)
-        && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_SPEECH_KEY")))
+    [STAThread]
+    static void Main(string[] args)
     {
-        logger.LogWarning(
-            "No Azure Speech key found. Set Transcription:AzureSpeechKey or AZURE_SPEECH_KEY env var. " +
-            "Transcription will fail at runtime.");
+        if (args.Length == 1 && args[0] == "--teams-roster-helper")
+        {
+            Console.Out.Write(WorkIq.TeamsUiAutomationRosterHelper.Inspect());
+            return;
+        }
+
+        WinRT.ComWrappersSupport.InitializeComWrappers();
+
+        var mainInstance = AppInstance.FindOrRegisterForKey("meeting-capture-main");
+
+        if (!mainInstance.IsCurrent)
+        {
+            // A second instance was started (e.g. taskbar pinned icon clicked while running).
+            // Redirect the activation to the main instance so it shows its flyout, then exit.
+            // A crashed instance can leave an AppInstance registration behind briefly. Never
+            // wait indefinitely for that stale activation target: start a recovery UI instead.
+            var activationArgs = AppInstance.GetCurrent().GetActivatedEventArgs();
+            var redirect = mainInstance.RedirectActivationToAsync(activationArgs).AsTask();
+            if (Task.WhenAny(redirect, Task.Delay(ActivationRedirectTimeout))
+                    .GetAwaiter().GetResult() == redirect)
+            {
+                redirect.GetAwaiter().GetResult();
+                return;
+            }
+
+            System.Diagnostics.Trace.TraceWarning(
+                "Meeting Capture activation redirect timed out; starting a recovery window.");
+        }
+
+        // We are the main instance. Listen for re-activation by subsequent instances.
+        mainInstance.Activated += OnReactivated;
+
+        Application.Start(p =>
+        {
+            var ctx = new DispatcherQueueSynchronizationContext(
+                DispatcherQueue.GetForCurrentThread());
+            SynchronizationContext.SetSynchronizationContext(ctx);
+            _ = new App();
+        });
     }
 
-    if (string.IsNullOrWhiteSpace(settings.Intelligence.ApiKey)
-        && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("GITHUB_TOKEN")))
+    /// <summary>
+    /// Called on a background thread when a second instance redirects its activation here.
+    /// Marshals to the UI thread and shows the flyout.
+    /// </summary>
+    private static void OnReactivated(object? sender, AppActivationArguments e)
     {
-        logger.LogWarning(
-            "No LLM API key found. Set Intelligence:ApiKey or GITHUB_TOKEN env var. " +
-            "Note synthesis will fail at runtime.");
-    }
+        if (Application.Current is not App app)
+            return;
 
-    if (!Directory.Exists(settings.Storage.NotesPath))
-    {
-        try
-        {
-            Directory.CreateDirectory(settings.Storage.NotesPath);
-            logger.LogInformation("Created notes directory: {Path}", settings.Storage.NotesPath);
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Cannot create notes directory {Path}", settings.Storage.NotesPath);
-        }
+        app.AppDispatcherQueue.TryEnqueue(
+            DispatcherQueuePriority.Normal,
+            () => app.ShowMainWindow());
     }
 }
