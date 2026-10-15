@@ -59,6 +59,7 @@
     <None Include="..\..\src\MeetingCapture\TrayApp\TrayContextMenuHost.cs" Link="TrayContextMenuHost.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\ChecklistItemViewModel.cs" Link="Production\ChecklistItemViewModel.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SaveReviewPresentation.cs" Link="Production\SaveReviewPresentation.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\StopCountdown.cs" Link="Production\StopCountdown.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerAvatarPresentation.cs" Link="Production\SpeakerAvatarPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicMapState.cs" Link="Production\TopicMapState.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicPaneSplit.cs" Link="Production\TopicPaneSplit.cs" />

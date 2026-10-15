@@ -60,6 +60,11 @@ internal static class UiStateChecks
         yield return ("recording layout reserves transcript space without an in-body settings panel", () => Run(RecordingSpace));
         yield return ("all settings share the main page with fixed navigation and save actions", () => Run(UnifiedSettings));
         yield return ("save review countdown reflects its deadline and closes decisions at expiry", () => Run(SaveReviewCountdown));
+        yield return ("stop countdown starts on click and counts down from five seconds", () => Run(StopCountdownStarts));
+        yield return ("stop countdown cancel keeps recording going", () => Run(StopCountdownCancel));
+        yield return ("stop countdown stops the recording once after five seconds", () => Run(StopCountdownElapses));
+        yield return ("stop countdown clears when the recording ends another way", () => Run(StopCountdownClearsOnEnd));
+        yield return ("every stop control uses the cancelable stop countdown", () => Run(StopCountdownWiring));
         yield return ("focus loss keeps active capture visible unless explicitly closed", () => Run(PinBehavior));
         yield return ("title header is draggable without intercepting header controls", () => Run(DraggableTitleBar));
         yield return ("speaker avatar fallback uses initials only after explicit resolution", () => Run(SpeakerAvatarFallback));
@@ -499,6 +504,89 @@ internal static class UiStateChecks
         Check.True(submitted.IsVisible && !submitted.CanDecide);
         var hidden = SaveReviewPresentation.Create(false, deadline, now, false);
         Check.True(!hidden.IsVisible && !hidden.CanDecide);
+    }
+
+    private static readonly DateTimeOffset StopNow = new(2026, 10, 14, 17, 0, 0, TimeSpan.Zero);
+
+    private static void StopCountdownStarts()
+    {
+        var countdown = new StopCountdown();
+        var idle = countdown.Present(StopNow);
+        Check.True(!idle.IsActive);
+        Check.Equal("Stop", idle.ButtonText);
+        Check.Equal("Stop recording", idle.AccessibleName);
+
+        var recording = new object();
+        Check.True(countdown.Toggle(recording, StopNow));
+        Check.True(countdown.IsActive);
+        var start = countdown.Present(StopNow);
+        Check.Equal(5, start.RemainingSeconds);
+        Check.Equal(0d, start.Progress);
+        Check.Equal("Stopping in 5… (click to cancel)", start.ButtonText);
+        Check.Equal("Stopping in 5… (click to cancel)", start.MenuText);
+        Check.Equal("Stopping recording in 5 seconds. Click to cancel and keep recording.", start.AccessibleName);
+
+        Check.Equal("Stopping in 4… (click to cancel)", countdown.Present(StopNow.AddSeconds(1)).ButtonText);
+        var last = countdown.Present(StopNow.AddSeconds(4.5));
+        Check.Equal(1, last.RemainingSeconds);
+        Check.Equal("Stopping recording in 1 second. Click to cancel and keep recording.", last.AccessibleName);
+        Check.True(!countdown.Tick(StopNow.AddSeconds(4.9)));
+        Check.True(countdown.IsActive);
+    }
+
+    private static void StopCountdownCancel()
+    {
+        var countdown = new StopCountdown();
+        var recording = new object();
+        countdown.Toggle(recording, StopNow);
+        Check.True(!countdown.Toggle(recording, StopNow.AddSeconds(2)));
+        Check.True(!countdown.IsActive);
+        Check.True(!countdown.Tick(StopNow.AddSeconds(10)));
+        Check.Equal("Stop", countdown.Present(StopNow.AddSeconds(10)).ButtonText);
+    }
+
+    private static void StopCountdownElapses()
+    {
+        var countdown = new StopCountdown();
+        var recording = new object();
+        countdown.Toggle(recording, StopNow);
+        Check.True(!countdown.Tick(StopNow.AddSeconds(4.99)));
+        Check.True(countdown.Tick(StopNow.AddSeconds(5)));
+        Check.True(!countdown.IsActive);
+        Check.True(!countdown.Tick(StopNow.AddSeconds(6)));
+    }
+
+    private static void StopCountdownClearsOnEnd()
+    {
+        var countdown = new StopCountdown();
+        var recording = new object();
+        countdown.Toggle(recording, StopNow);
+        Check.True(!countdown.ClearIfRecordingEnded(true, recording));
+        Check.True(countdown.IsActive);
+        Check.True(countdown.ClearIfRecordingEnded(false, null));
+        Check.True(!countdown.IsActive);
+        Check.True(!countdown.Tick(StopNow.AddSeconds(5)));
+
+        countdown.Toggle(recording, StopNow);
+        Check.True(countdown.ClearIfRecordingEnded(true, new object()));
+        Check.True(!countdown.IsActive);
+    }
+
+    private static void StopCountdownWiring()
+    {
+        var window = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        var app = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "App.xaml.cs.txt"));
+        Check.True(window.Contains("private void OnStopClick(object sender, RoutedEventArgs e) => ToggleStopCountdown();", StringComparison.Ordinal));
+        Check.True(window.Contains("MeetingEndPrompt.IsOpen = false;\r\n        StartStopCountdown();", StringComparison.Ordinal) ||
+                   window.Contains("MeetingEndPrompt.IsOpen = false;\n        StartStopCountdown();", StringComparison.Ordinal));
+        Check.True(window.Contains("if (_stopCountdown.Tick(DateTimeOffset.UtcNow))", StringComparison.Ordinal));
+        Check.True(window.Contains("AutomationProperties.SetName(StopButton, presentation.AccessibleName);", StringComparison.Ordinal));
+        Check.True(window.Contains("AutomationProperties.SetName(PreferencesStopButton, presentation.AccessibleName);", StringComparison.Ordinal));
+        Check.True(window.Contains("_stopCountdown.ClearIfRecordingEnded(!_preparingExit && _pipeline.CanStop, _pipeline.CurrentSession)", StringComparison.Ordinal));
+        Check.True(app.Contains("_mainWindow?.ToggleStopCountdown();", StringComparison.Ordinal));
+        Check.True(app.Contains("_mainWindow.StopCountdownChanged += OnStopCountdownChanged;", StringComparison.Ordinal));
+        Check.True(!app.Contains("_pipeline.StopManualAsync()", StringComparison.Ordinal));
+        Check.Equal(1, System.Text.RegularExpressions.Regex.Matches(window, @"_pipeline\.StopManualAsync\(\)").Count);
     }
 
     private static void PinBehavior()

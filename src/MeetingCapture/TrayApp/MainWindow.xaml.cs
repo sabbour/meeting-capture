@@ -155,6 +155,11 @@ public sealed partial class MainWindow : Window
     private DispatcherQueueTimer? _intelligenceTimer;
     private DispatcherQueueTimer? _statusBarDismissTimer;
     private DispatcherQueueTimer? _saveReviewTimer;
+    private readonly StopCountdown _stopCountdown = new();
+    private DispatcherQueueTimer? _stopCountdownTimer;
+
+    /// <summary>Raised on the UI thread whenever the Stop countdown starts, ticks, or ends.</summary>
+    internal event EventHandler<StopCountdownPresentation>? StopCountdownChanged;
     private DateTimeOffset? _saveReviewDeadline;
     private string? _saveReviewSessionId;
     private bool _saveDecisionSubmitted;
@@ -959,6 +964,7 @@ public sealed partial class MainWindow : Window
     public void PrepareForExit()
     {
         _preparingExit = true;
+        ClearStopCountdown();
         _healthTimer?.Stop();
         StopRecordingTimer();
         StopSaveReview();
@@ -1175,7 +1181,7 @@ public sealed partial class MainWindow : Window
     private void OnMeetingEndStopClick(object sender, RoutedEventArgs e)
     {
         MeetingEndPrompt.IsOpen = false;
-        OnStopClick(sender, e);
+        StartStopCountdown();
     }
 
     private void OnMeetingEndKeepClick(object sender, RoutedEventArgs e)
@@ -1183,9 +1189,83 @@ public sealed partial class MainWindow : Window
         MeetingEndPrompt.IsOpen = false;
     }
 
-    private void OnStopClick(object sender, RoutedEventArgs e)
+    private void OnStopClick(object sender, RoutedEventArgs e) => ToggleStopCountdown();
+
+    /// <summary>
+    /// Starts the 5-second Stop countdown, or cancels it if it is already running.
+    /// Used by every Stop control, including the tray menu.
+    /// </summary>
+    public void ToggleStopCountdown()
     {
-        if (!_pipeline.CanStop) return;
+        if (!_stopCountdown.IsActive && (_preparingExit || !_pipeline.CanStop)) return;
+        _stopCountdown.Toggle(_pipeline.CurrentSession, DateTimeOffset.UtcNow);
+        OnStopCountdownChanged();
+    }
+
+    private void StartStopCountdown()
+    {
+        if (_preparingExit || !_pipeline.CanStop) return;
+        _stopCountdown.Start(_pipeline.CurrentSession, DateTimeOffset.UtcNow);
+        OnStopCountdownChanged();
+    }
+
+    private void ClearStopCountdown()
+    {
+        if (!_stopCountdown.IsActive) return;
+        _stopCountdown.Clear();
+        OnStopCountdownChanged();
+    }
+
+    private void OnStopCountdownChanged()
+    {
+        if (_stopCountdown.IsActive)
+        {
+            if (_stopCountdownTimer is null)
+            {
+                _stopCountdownTimer = _dispatcherQueue.CreateTimer();
+                _stopCountdownTimer.Interval = TimeSpan.FromMilliseconds(200);
+                _stopCountdownTimer.IsRepeating = true;
+                _stopCountdownTimer.Tick += (_, _) => OnStopCountdownTick();
+            }
+            _stopCountdownTimer.Start();
+        }
+        else
+        {
+            _stopCountdownTimer?.Stop();
+        }
+        UpdateStopCountdownPresentation();
+    }
+
+    private void OnStopCountdownTick()
+    {
+        if (_stopCountdown.ClearIfRecordingEnded(!_preparingExit && _pipeline.CanStop, _pipeline.CurrentSession))
+        {
+            OnStopCountdownChanged();
+            return;
+        }
+        if (_stopCountdown.Tick(DateTimeOffset.UtcNow))
+        {
+            OnStopCountdownChanged();
+            StopRecordingNow();
+            return;
+        }
+        UpdateStopCountdownPresentation();
+    }
+
+    private void UpdateStopCountdownPresentation()
+    {
+        var presentation = _stopCountdown.Present(DateTimeOffset.UtcNow);
+        StopCountdownFillTransform.ScaleX = presentation.Progress;
+        StopButtonLabel.Text = presentation.ButtonText;
+        AutomationProperties.SetName(StopButton, presentation.AccessibleName);
+        PreferencesStopButton.Content = presentation.IsActive ? presentation.ButtonText : "Stop recording";
+        AutomationProperties.SetName(PreferencesStopButton, presentation.AccessibleName);
+        StopCountdownChanged?.Invoke(this, presentation);
+    }
+
+    private void StopRecordingNow()
+    {
+        if (_preparingExit || !_pipeline.CanStop) return;
         StopButton.IsEnabled = PreferencesStopButton.IsEnabled = false;
         LifecycleText.Text = "Stopping capture...";
         StopRecordingTimer();
@@ -2539,6 +2619,8 @@ public sealed partial class MainWindow : Window
         AutomationProperties.SetHelpText(NewRecordingButton, newRecording.Message);
         BackToMeetingsButton.Visibility = _pipeline.CanStart ? Visibility.Visible : Visibility.Collapsed;
         StopButton.Visibility = _pipeline.CanStop ? Visibility.Visible : Visibility.Collapsed;
+        if (_stopCountdown.ClearIfRecordingEnded(!_preparingExit && _pipeline.CanStop, _pipeline.CurrentSession))
+            OnStopCountdownChanged();
         CancelRetryButton.Visibility = _retryBusy ? Visibility.Visible : Visibility.Collapsed;
         CancelRetryButton.IsEnabled = _retryCts is { IsCancellationRequested: false };
         RecordingUtilityActions.Visibility =

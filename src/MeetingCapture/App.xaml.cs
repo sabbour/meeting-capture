@@ -100,6 +100,7 @@ public partial class App : Application
         _mainWindow.MeetingDismissRequested += (_, _) => DismissPendingSession();
         _mainWindow.MeetingSnoozeRequested += (_, _) => SnoozeDetection();
         _mainWindow.InitialViewReady += OnInitialViewReady;
+        _mainWindow.StopCountdownChanged += OnStopCountdownChanged;
 
         _pipeline.StateChanged += OnPipelineStatusChanged;
         _pipeline.NotesSaved += OnNotesSaved;
@@ -659,21 +660,14 @@ public partial class App : Application
 
     private void OnStopManual()
     {
-        if (!_pipeline.CanStop || _exiting) return;
-        _stopManualItem.IsEnabled = false;
-        UpdateStatus("Stopping capture...");
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await _pipeline.StopManualAsync();
-            }
-            catch (Exception ex)
-            {
-                ReportActionFailure("Stop recording", ex);
-            }
-            finally { InvokeOnUi(() => _stopManualItem.IsEnabled = _pipeline.CanStop && !_exiting); }
-        });
+        if (_exiting) return;
+        _mainWindow?.ToggleStopCountdown();
+    }
+
+    private void OnStopCountdownChanged(object? sender, TrayApp.StopCountdownPresentation presentation)
+    {
+        _stopManualItem.Text = presentation.MenuText;
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(_stopManualItem, presentation.AccessibleName);
     }
 
     private void OnOpenNotesFolder()
