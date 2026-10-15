@@ -76,6 +76,7 @@ internal static class UiStateChecks
         yield return ("topic map preserves relations selection navigation and scroll", () => Run(TopicTimeline));
         yield return ("whole-meeting topic map lays out 8-15 topic branches and grounded leaves", () => Run(WholeMeetingBrainMapLayout));
         yield return ("topic collapse frees layout space and persists across live updates", () => Run(TopicCollapseFreesSpaceAndPersists));
+        yield return ("topic map and meeting notes share the full width through a bounded splitter", () => Run(TopicPaneSplitFillsWidth));
         yield return ("whole-meeting topic map assigns uncategorized items from cited transcript evidence", () => Run(UnassignedMeetingItemsUseCitations));
         yield return ("topic map nodes own Canvas insertion without re-adding the root", () => Run(BrainMapCanvasOwnership));
         yield return ("topic timeline projects confirmed speaker corrections without changing canonical topics", () => Run(TopicTimelineSpeakerProjection));
@@ -1663,11 +1664,14 @@ internal static class UiStateChecks
         Check.Equal("*", (string?)combinedColumns[0].Attribute("Width"));
         Check.Equal("0", (string?)combinedColumns[1].Attribute("Width"));
         Check.Equal("0", (string?)Control("BrainMapView").Attribute("Grid.Row"));
-        Check.Equal("1", (string?)Control("MeetingNotesView").Attribute("Grid.Column"));
+        Check.Equal("2", (string?)Control("MeetingNotesView").Attribute("Grid.Column"));
+        Check.Equal("1", (string?)Control("TopicPaneSplitter").Attribute("Grid.Column"));
+        Check.Equal("PaneSplitter", Control("TopicPaneSplitter").Name.LocalName);
         Check.Equal("2*", (string?)Control("MeetingNotesView").Ancestors()
             .First(element => element.Name.LocalName == "Grid")
             .Elements().Single(element => element.Name.LocalName == "Grid.ColumnDefinitions")
             .Elements().Last().Attribute("Width"));
+        Check.Equal("Auto", (string?)Control("TopicSplitterColumn").Attribute("Width"));
         var timelinePanel = Control("TrailList").Descendants()
             .Single(element =>
                 element.Name.LocalName == "StackPanel" &&
@@ -2089,6 +2093,44 @@ internal static class UiStateChecks
         Check.True(source.Contains("TopicCollapseState.LeafCounts(map, _collapsedTopicIds)", StringComparison.Ordinal));
         Check.True(source.Contains("TopicCollapseState.Apply(notes.Topics, _collapsedTopicIds)", StringComparison.Ordinal));
         Check.True(source.Contains("OnTopicMapBodySizeChanged", StringComparison.Ordinal));
+    }
+
+    private static void TopicPaneSplitFillsWidth()
+    {
+        Check.True(!TopicPaneSplit.IsSideBySide(639));
+        Check.True(TopicPaneSplit.IsSideBySide(640));
+
+        var body = 1400d;
+        var splitter = 12d;
+        var available = body - splitter;
+        Check.Equal(0.5, TopicPaneSplit.MainShare(available / 2, body, splitter));
+        Check.Equal(TopicPaneSplit.MinimumMainWidth / available, TopicPaneSplit.MainShare(0, body, splitter));
+        Check.Equal(
+            (available - TopicPaneSplit.MinimumNotesWidth) / available,
+            TopicPaneSplit.MainShare(double.MaxValue, body, splitter));
+        Check.Equal(
+            TopicPaneSplit.DefaultMainShare,
+            TopicPaneSplit.MainShare(double.NaN, body, splitter));
+
+        foreach (var width in new[] { 640d, 700d, 1000d, 2400d })
+        {
+            foreach (var requested in new[] { -50d, 0d, 300d, 5000d })
+            {
+                var share = TopicPaneSplit.MainShare(requested, width, splitter);
+                var main = share * (width - splitter);
+                var notes = (1 - share) * (width - splitter);
+                Check.True(main >= TopicPaneSplit.MinimumMainWidth - 0.001);
+                Check.True(notes >= TopicPaneSplit.MinimumNotesWidth - 0.001);
+                Check.True(Math.Abs(main + notes + splitter - width) < 0.001);
+            }
+        }
+
+        var xaml = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        var source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        Check.True(source.Contains("Grid.SetColumn(MeetingNotesView, sideBySide ? 2 : 0);", StringComparison.Ordinal));
+        Check.True(source.Contains("TopicPaneSplitter.Visibility = sideBySide", StringComparison.Ordinal));
+        Check.True(xaml.Contains("AutomationProperties.Name=\"Resize topic map and meeting notes\"",
+            StringComparison.Ordinal));
     }
 
     private static void UnassignedMeetingItemsUseCitations()
@@ -3089,7 +3131,7 @@ internal static class UiStateChecks
             StringComparison.Ordinal));
         Check.True(source.Contains("var wide = totalWidth >= 1380;",
             StringComparison.Ordinal));
-        Check.True(source.Contains("TopicDetailColumn.Width = wide ? new GridLength(360)",
+        Check.True(source.Contains("TopicDetailColumn.Width = wide ? GridLength.Auto",
             StringComparison.Ordinal));
         Check.True(source.Contains("Grid.SetRow(TopicDetailPanel, wide ? 1 : 2);",
             StringComparison.Ordinal));

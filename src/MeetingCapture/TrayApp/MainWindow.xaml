@@ -1716,7 +1716,8 @@
                            AutomationProperties.LiveSetting="Polite"/>
                 <Grid x:Name="TopicMapBodyGrid" Grid.Row="3" SizeChanged="OnTopicMapBodySizeChanged">
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition x:Name="TopicMapMainColumn" Width="3*"/>
+                        <ColumnDefinition x:Name="TopicMapMainColumn" Width="3*" MinWidth="240"/>
+                        <ColumnDefinition x:Name="TopicSplitterColumn" Width="Auto"/>
                         <ColumnDefinition x:Name="TopicNotesColumn" Width="2*" MinWidth="260"/>
                     </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
@@ -2129,9 +2130,20 @@
                     </ScrollViewer>
                     </Border>
                     </Grid>
+                    <local:PaneSplitter x:Name="TopicPaneSplitter"
+                                        Grid.Row="0"
+                                        Grid.Column="1"
+                                        Width="12"
+                                        Background="Transparent"
+                                        AutomationProperties.Name="Resize topic map and meeting notes"
+                                        ToolTipService.ToolTip="Drag to resize topic map and meeting notes">
+                        <Rectangle Width="1"
+                                   HorizontalAlignment="Center"
+                                   Fill="{ThemeResource DividerStrokeColorDefaultBrush}"/>
+                    </local:PaneSplitter>
                     <ScrollViewer x:Name="MeetingNotesView"
                                   Grid.Row="0"
-                                  Grid.Column="1"
+                                  Grid.Column="2"
                                   VerticalScrollBarVisibility="Auto"
                                   Padding="12,12,18,12"
                                   AutomationProperties.Name="Meeting notes by topic">

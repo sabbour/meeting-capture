@@ -112,6 +112,7 @@ public sealed partial class MainWindow : Window
     private int _visualizationAnalysisPending;
     private bool _visualizationExpanded;
     private bool _visualizationMaximizedWindow;
+    private double _topicMainShare = TopicPaneSplit.DefaultMainShare;
     private readonly bool _animationsEnabled;
     private readonly ObservableCollection<TrailItemViewModel> _visualizationTrail = new();
     private readonly ObservableCollection<MeetingTopicNotesViewModel> _meetingNotes = new();
@@ -266,6 +267,8 @@ public sealed partial class MainWindow : Window
         MeetingNotesList.ItemsSource = _meetingNotes;
 
         ConfigureVisualizationTransitions();
+        TopicPaneSplitter.LeftEdgeRequested += OnTopicPaneSplitterMoved;
+        TopicPaneSplitter.NudgeRequested += OnTopicPaneSplitterNudged;
         RootLayout.Loaded += OnRootLayoutLoaded;
 
         _questions.CollectionChanged += (_, _) => UpdateExpanderHeaders();
@@ -2775,7 +2778,8 @@ public sealed partial class MainWindow : Window
     private void UpdateTopicDetailLayout(double totalWidth)
     {
         var wide = totalWidth >= 1380;
-        TopicDetailColumn.Width = wide ? new GridLength(360) : new GridLength(0);
+        TopicDetailColumn.Width = wide ? GridLength.Auto : new GridLength(0);
+        TopicDetailPanel.Width = wide ? 360 : double.NaN;
         Grid.SetRow(TopicDetailPanel, wide ? 1 : 2);
         Grid.SetColumn(TopicDetailPanel, wide ? 1 : 0);
         Grid.SetColumnSpan(TopicDetailPanel, wide ? 1 : 2);
@@ -3392,17 +3396,39 @@ public sealed partial class MainWindow : Window
     }
 
     private void OnTopicMapBodySizeChanged(object sender, SizeChangedEventArgs e)
+        => ApplyTopicPaneLayout(e.NewSize.Width);
+
+    private void ApplyTopicPaneLayout(double bodyWidth)
     {
-        var sideBySide = e.NewSize.Width >= 640;
-        TopicMapMainColumn.Width = new GridLength(sideBySide ? 3 : 1, GridUnitType.Star);
-        TopicNotesColumn.MinWidth = sideBySide ? 260 : 0;
-        TopicNotesColumn.Width = sideBySide ? new GridLength(2, GridUnitType.Star) : new GridLength(0);
+        var sideBySide = TopicPaneSplit.IsSideBySide(bodyWidth);
+        TopicMapMainColumn.Width = new GridLength(sideBySide ? _topicMainShare : 1, GridUnitType.Star);
+        TopicMapMainColumn.MinWidth = sideBySide ? TopicPaneSplit.MinimumMainWidth : 0;
+        TopicNotesColumn.MinWidth = sideBySide ? TopicPaneSplit.MinimumNotesWidth : 0;
+        TopicNotesColumn.Width = sideBySide
+            ? new GridLength(1 - _topicMainShare, GridUnitType.Star)
+            : new GridLength(0);
+        TopicPaneSplitter.Visibility = sideBySide ? Visibility.Visible : Visibility.Collapsed;
         TopicMapMainRow.Height = new GridLength(sideBySide ? 1 : 3, GridUnitType.Star);
         TopicNotesRow.Height = sideBySide ? new GridLength(0) : new GridLength(2, GridUnitType.Star);
         Grid.SetRow(MeetingNotesView, sideBySide ? 0 : 1);
-        Grid.SetColumn(MeetingNotesView, sideBySide ? 1 : 0);
-        MeetingNotesView.Margin = sideBySide ? new Thickness(8, 0, 0, 0) : new Thickness(0, 8, 0, 0);
+        Grid.SetColumn(MeetingNotesView, sideBySide ? 2 : 0);
+        MeetingNotesView.Margin = sideBySide ? new Thickness(0) : new Thickness(0, 8, 0, 0);
     }
+
+    private void SetTopicMainWidth(double requestedMainWidth)
+    {
+        var bodyWidth = TopicMapBodyGrid.ActualWidth;
+        if (!TopicPaneSplit.IsSideBySide(bodyWidth))
+            return;
+        _topicMainShare = TopicPaneSplit.MainShare(requestedMainWidth, bodyWidth, TopicPaneSplitter.Width);
+        ApplyTopicPaneLayout(bodyWidth);
+    }
+
+    private void OnTopicPaneSplitterMoved(object? sender, double leftEdge)
+        => SetTopicMainWidth(leftEdge);
+
+    private void OnTopicPaneSplitterNudged(object? sender, double delta)
+        => SetTopicMainWidth(TopicMapMainColumn.ActualWidth + delta);
 
     private void UpdateBrainMapConnector(
         string connectorId,

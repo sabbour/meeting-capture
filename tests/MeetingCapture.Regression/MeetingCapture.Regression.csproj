@@ -59,6 +59,7 @@
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SaveReviewPresentation.cs" Link="Production\SaveReviewPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerAvatarPresentation.cs" Link="Production\SpeakerAvatarPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicMapState.cs" Link="Production\TopicMapState.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicPaneSplit.cs" Link="Production\TopicPaneSplit.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\RelatedContextPresentation.cs" Link="Production\RelatedContextPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\ParticipantPresentation.cs" Link="Production\ParticipantPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\CatchUpPresentation.cs" Link="Production\CatchUpPresentation.cs" />
