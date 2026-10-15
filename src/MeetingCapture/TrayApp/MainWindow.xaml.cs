@@ -1462,7 +1462,8 @@ public sealed partial class MainWindow : Window
         Interlocked.Exchange(ref _partialUiUpdateQueued, 0);
         _lastPartialUiUpdate = now;
         var p = update.Partial;
-        var rawSpeaker = string.IsNullOrWhiteSpace(p.SpeakerId) ? "Unknown" : p.SpeakerId;
+        var rawSpeaker = string.IsNullOrWhiteSpace(p.SpeakerId)
+            ? "Unknown" : _pipeline.SpeakerResolver.Canonical(p.SpeakerId)!;
         var display = _pipeline.SpeakerResolver.GetDisplayName(rawSpeaker);
         var result = _transcriptState.UpsertPartial(
             rawSpeaker,
@@ -1712,7 +1713,7 @@ public sealed partial class MainWindow : Window
         _recordingTimer = _dispatcherQueue.CreateTimer();
         _recordingTimer.Interval = TimeSpan.FromSeconds(30);
         _recordingTimer.IsRepeating = true;
-        _recordingTimer.Tick += (_, _) => UpdateTimeIndicator();
+        _recordingTimer.Tick += (_, _) => { UpdateTimeIndicator(); RefreshSpeakerTimeline(); };
         _recordingTimer.Start();
 
         _tldrTimer = _dispatcherQueue.CreateTimer();
@@ -2134,7 +2135,7 @@ public sealed partial class MainWindow : Window
         UpdateExpanderHeaders();
     }
 
-    // ── Speaker balance ─────────────────────────────────────────────────────────
+    // ── Speaker word tracking ───────────────────────────────────────────────────
 
     private void UpdateSpeakerBalance(string speakerId, string text)
     {
@@ -2146,24 +2147,7 @@ public sealed partial class MainWindow : Window
         _speakerWordCounts[speakerId] = count + words;
         _totalWords += words;
         _lastFinalSpeakerId = speakerId;
-
-        if (_totalWords == 0)
-            return;
-
-        var top = _speakerWordCounts
-            .OrderByDescending(kv => kv.Value)
-            .Take(4)
-            .Select(kv => new SpeakerBalance
-            {
-                SpeakerId = kv.Key,
-                Name = _pipeline.SpeakerResolver.GetDisplayName(kv.Key),
-                Percent = Math.Round(100.0 * kv.Value / _totalWords),
-            })
-            .ToList();
-
-        _speakerBalance.Clear();
-        foreach (var s in top)
-            _speakerBalance.Add(s);
+        RefreshSpeakerTimeline();
     }
 
     private void AppendTranscriptSegment(
@@ -2171,6 +2155,8 @@ public sealed partial class MainWindow : Window
         TranscriptionSegment segment,
         bool isNewRevision)
     {
+        if (!string.IsNullOrWhiteSpace(segment.SpeakerId))
+            segment = segment with { SpeakerId = _pipeline.SpeakerResolver.Canonical(segment.SpeakerId) };
         if (!_hasSummary && _summaryState.Status.Failure is null)
             TldrChip.Text = "Listening for enough conversation...";
         if (isNewRevision)
@@ -2562,6 +2548,7 @@ public sealed partial class MainWindow : Window
                 ? Visibility.Visible : Visibility.Collapsed;
         UpdateSaveReviewPresentation();
         UpdateRecordingPresentation();
+        RefreshSpeakerTimeline();
     }
 
     private void UpdateRecordingPresentation()
@@ -2587,6 +2574,7 @@ public sealed partial class MainWindow : Window
         SpeakerActivityText.Text = _totalWords > 0
             ? $"{_speakerWordCounts.Count} speaker{(_speakerWordCounts.Count == 1 ? "" : "s")}"
             : "Recognizing speech...";
+        UpdateCombineSpeakersButton();
         if (_pipeline.State is PipelineState.Saved or PipelineState.Failed)
         {
             if (!_hasSummary) TldrChip.Text = _finalizedSegmentCount == 0 ? "No speech was recognized." : "Recording ended";
@@ -4151,8 +4139,7 @@ public sealed partial class MainWindow : Window
                     line.AvatarImage = null;
                 }
             }
-            foreach (var speaker in _speakerBalance.Where(s => string.Equals(s.SpeakerId, e.SpeakerId, StringComparison.OrdinalIgnoreCase)))
-                speaker.Name = e.DisplayName;
+            RefreshSpeakerTimeline();
             if (!string.IsNullOrWhiteSpace(_acceptedRelatedContextTopic))
                 TldrChip.Text = ProjectVisualizationText(_acceptedRelatedContextTopic);
             var contextStatus = _relatedContext.Status;
@@ -4314,6 +4301,7 @@ public sealed partial class MainWindow : Window
                 return;
 
             _speakerAvatarImages[speakerId] = image;
+            RefreshSpeakerTimeline();
             foreach (var line in _transcript.Where(line =>
                          string.Equals(line.SpeakerId, speakerId, StringComparison.OrdinalIgnoreCase)))
                 line.AvatarImage = image;

@@ -15,7 +15,8 @@ internal static class Program
             .Concat(AudioMixingChecks.Cases()).Concat(RelatedContextChecks.Cases())
             .Concat(VisualizationChecks.Cases()).Concat(AiUsageChecks.Cases())
             .Concat(AiDiagnosticsChecks.Cases()).Concat(StartupFailureChecks.Cases())
-            .Concat(ResponsivenessChecks.Cases()).Concat(StartupPriorityChecks.Cases()).Concat(AboutChecks.Cases()).ToArray();
+            .Concat(ResponsivenessChecks.Cases()).Concat(StartupPriorityChecks.Cases()).Concat(AboutChecks.Cases())
+            .Concat(SpeakerChecks.Cases()).ToArray();
         var failed = 0;
         foreach (var (name, run) in tests)
         {

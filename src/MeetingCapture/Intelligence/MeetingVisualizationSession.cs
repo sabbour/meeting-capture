@@ -11,6 +11,7 @@ public sealed class MeetingVisualizationSession
     private readonly object _gate = new();
     private readonly List<VisualizationSegment> _segments = [];
     private readonly Dictionary<string, VisualizationSpeaker> _speakers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _speakerAliases = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<TopicCluster> _topics = [];
     private readonly List<TopicOccurrence> _trail = [];
     private readonly Dictionary<string, DiscussionQuestion> _questions = new(StringComparer.Ordinal);
@@ -109,6 +110,35 @@ public sealed class MeetingVisualizationSession
         {
             RequireSession();
             _speakers[speakerId.Trim()] = new(speakerId.Trim(), displayName.Trim(), isConfirmed);
+            publish = ChangedLocked();
+        }
+        PublishChanged(publish);
+    }
+
+    /// <summary>
+    /// Moves every segment of the absorbed speakers to the kept speaker and drops the absorbed entries.
+    /// Allowed after the session completes so a saved meeting can be corrected before it is re-saved.
+    /// </summary>
+    public void MergeSpeakers(SpeakerMergePlan plan, string keptDisplayName)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        bool publish;
+        lock (_gate)
+        {
+            RequireSession();
+            var keptName = string.IsNullOrWhiteSpace(keptDisplayName) ? plan.KeptId : keptDisplayName.Trim();
+            var confirmed = _speakers.TryGetValue(plan.KeptId, out var existing) && existing.IsConfirmed;
+            _speakers[plan.KeptId] = new(plan.KeptId, keptName, confirmed);
+            foreach (var id in plan.AbsorbedIds)
+            {
+                _speakers.Remove(id);
+                _speakerAliases[id] = plan.KeptId;
+            }
+            foreach (var alias in _speakerAliases.Where(pair => plan.Absorbs(pair.Value)).Select(pair => pair.Key).ToArray())
+                _speakerAliases[alias] = plan.KeptId;
+            for (var index = 0; index < _segments.Count; index++)
+                if (plan.Absorbs(_segments[index].SpeakerId))
+                    _segments[index] = _segments[index] with { SpeakerId = plan.KeptId };
             publish = ChangedLocked();
         }
         PublishChanged(publish);
@@ -241,7 +271,8 @@ public sealed class MeetingVisualizationSession
             var analyzed = analyzedPrefix.Segments[index];
             var current = _segments[index];
             if (analyzed.Id != current.Id || analyzed.Ordinal != current.Ordinal ||
-                analyzed.Text != current.Text || analyzed.SpeakerId != current.SpeakerId)
+                analyzed.Text != current.Text ||
+                !string.Equals(CanonicalSpeakerLocked(analyzed.SpeakerId), current.SpeakerId, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("The analyzed transcript prefix changed.");
         }
         var analyzedRevision = analyzedPrefix.TranscriptRevision;
@@ -675,6 +706,9 @@ public sealed class MeetingVisualizationSession
         if (_closed) throw new InvalidOperationException("The visualization session is complete.");
     }
 
+    private string? CanonicalSpeakerLocked(string? speakerId) =>
+        speakerId is not null && _speakerAliases.TryGetValue(speakerId, out var kept) ? kept : speakerId;
+
     private bool ChangedLocked()
     {
         _revision++;
@@ -715,6 +749,7 @@ public sealed class MeetingVisualizationSession
     {
         _segments.Clear();
         _speakers.Clear();
+        _speakerAliases.Clear();
         _topics.Clear();
         _trail.Clear();
         _questions.Clear();

@@ -1325,6 +1325,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             if (!ReferenceEquals(_run, run) || !run.AcceptCallbacks) return;
             run.LastTranscriptProgressAt = _getUtcNow();
+            segment = CanonicalSpeaker(segment);
             enriched = segment;
             run.Segments.Add(enriched);
             ordinal = run.Segments.Count;
@@ -1342,6 +1343,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 lock (_gate)
                 {
                     if (!ReferenceEquals(_run, run) || !run.AcceptCallbacks) return;
+                    segment = CanonicalSpeaker(segment);
                     enriched = Enrich(segment);
                     run.Segments[ordinal - 1] = enriched;
                     update = new SessionTranscriptSegment(run.Session.Id, ordinal, enriched);
@@ -1431,6 +1433,69 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private TranscriptionSegment Enrich(TranscriptionSegment segment) =>
         segment with { SpeakerDisplayName = _speakerResolver.GetDisplayName(segment.SpeakerId) };
+
+    private TranscriptionSegment CanonicalSpeaker(TranscriptionSegment segment) =>
+        string.IsNullOrWhiteSpace(segment.SpeakerId) ? segment
+            : segment with { SpeakerId = _speakerResolver.Canonical(segment.SpeakerId) };
+
+    /// <summary>
+    /// Combines speakers into <paramref name="keptSpeakerId"/>: transcript lines, the topic map's speaker data
+    /// and, for a finished meeting, the saved notes and companion JSON all move to the kept speaker.
+    /// Returns false when there was nothing to combine.
+    /// </summary>
+    public async Task<bool> MergeSpeakersAsync(
+        IEnumerable<string?> speakerIds, string keptSpeakerId, CancellationToken ct = default)
+    {
+        var plan = SpeakerMergePlan.Create(speakerIds, keptSpeakerId);
+        if (plan is null) return false;
+
+        TranscriptSnapshot? persistSnapshot = null;
+        string keptName;
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_preparingExit) throw new InvalidOperationException("Exit is already in progress.");
+            var state = _status.State;
+            if (state != PipelineState.Recording && !IsResting(state))
+                throw new InvalidOperationException("Speakers can be combined while recording or after the meeting is saved.");
+
+            _speakerResolver.Merge(plan);
+            keptName = _speakerResolver.GetDisplayName(plan.KeptId);
+            if (_run is { } run)
+                for (var index = 0; index < run.Segments.Count; index++)
+                    run.Segments[index] = Enrich(plan.Remap(run.Segments[index]));
+            if (_lastCompleted is { } completed && (_run is null || _run.Session.Id == completed.SessionId))
+            {
+                _lastCompleted = new TranscriptSnapshot(completed.SessionId, completed.Title, completed.StartedAt,
+                    completed.EndedAt, completed.Revision, completed.IsComplete,
+                    completed.Segments.Select(segment => Enrich(plan.Remap(segment))).ToArray());
+                if (!_owned && IsResting(state) && _lastSavedPath is not null)
+                {
+                    _owned = true;
+                    persistSnapshot = _lastCompleted;
+                }
+            }
+        }
+
+        try
+        {
+            _visualization.MergeSpeakers(plan, keptName);
+        }
+        catch (InvalidOperationException) { }
+
+        if (persistSnapshot is null) return true;
+        try
+        {
+            using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(ct, _exitCancellation.Token);
+            await PersistNotesAsync(persistSnapshot, PreservedNotes(persistSnapshot), lifetime.Token)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_gate) _owned = ResourcesStillOwned();
+        }
+        return true;
+    }
 
     private TranscriptSnapshot Snapshot(SessionRun run) => new(run.Session.Id, run.Session.Title,
         run.Session.StartedAt, run.Session.EndedAt, run.Segments.Count, run.Complete,

@@ -1217,10 +1217,24 @@
                                 Click="OnSpeakerNameApplyClick"/>
                     </StackPanel>
                 </Border>
-                <TextBlock x:Name="SpeakerActivityText" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" Visibility="Collapsed"
-                           FontSize="14" FontWeight="SemiBold"
-                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-                <ScrollViewer MaxHeight="72" VerticalScrollBarVisibility="Auto">
+                <Grid ColumnSpacing="8">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                        <ColumnDefinition Width="Auto"/>
+                    </Grid.ColumnDefinitions>
+                    <TextBlock x:Name="SpeakerActivityText" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" Visibility="Collapsed"
+                               VerticalAlignment="Center"
+                               FontSize="14" FontWeight="SemiBold"
+                               Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                    <Button x:Name="CombineSpeakersButton" Grid.Column="1"
+                            Content="Combine speakers"
+                            Visibility="Collapsed"
+                            Padding="10,3"
+                            FontSize="13"
+                            Click="OnCombineSpeakersClick"
+                            ToolTipService.ToolTip="Merge two or more speakers into one"/>
+                </Grid>
+                <ScrollViewer MaxHeight="132" VerticalScrollBarVisibility="Auto">
                     <ItemsControl x:Name="SpeakerBalancePanel">
                         <ItemsControl.ItemContainerStyle>
                             <Style TargetType="ContentPresenter">
@@ -1231,20 +1245,26 @@
                             <DataTemplate>
                                 <Grid ColumnSpacing="8" Margin="0,2">
                                     <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
                                         <ColumnDefinition Width="110"/>
                                         <ColumnDefinition Width="*"/>
-                                        <ColumnDefinition Width="38"/>
                                     </Grid.ColumnDefinitions>
-                                    <Button Tag="{Binding SpeakerId}" Click="OnSpeakerBalanceNameClick"
+                                    <PersonPicture Width="24" Height="24"
+                                                   VerticalAlignment="Center"
+                                                   Initials="{Binding AvatarInitials}"
+                                                   ProfilePicture="{Binding AvatarImage}"
+                                                   AutomationProperties.Name="{Binding AvatarAccessibleName}"/>
+                                    <Button Grid.Column="1" Tag="{Binding SpeakerId}" Click="OnSpeakerBalanceNameClick"
                                             Background="Transparent" BorderThickness="0" Padding="0"
                                             HorizontalAlignment="Stretch" ToolTipService.ToolTip="Rename this speaker label">
                                         <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis"
                                                    FontSize="14"/>
                                     </Button>
-                                    <ProgressBar Grid.Column="1" Minimum="0" Maximum="100" Value="{Binding Percent}"
-                                                 VerticalAlignment="Center" ToolTipService.ToolTip="Share of finalized words"/>
-                                    <TextBlock Grid.Column="2" Text="{Binding PercentText}" TextAlignment="Right"
-                                               VerticalAlignment="Center" FontSize="14"/>
+                                    <local:SpeakerTimelineBar Grid.Column="2"
+                                                              Spans="{Binding Spans}"
+                                                              SegmentBrush="{Binding Brush}"
+                                                              ToolTipService.ToolTip="{Binding TalkTimeText}"
+                                                              AutomationProperties.Name="{Binding TalkTimeText}"/>
                                 </Grid>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>

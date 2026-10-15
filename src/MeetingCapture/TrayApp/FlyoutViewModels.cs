@@ -31,33 +31,67 @@ public sealed class BoolToVisibleConverter : IValueConverter
 }
 
 /// <summary>
-/// View model for a single speaker's share of the conversation, shown as a labelled
-/// progress bar in the recording-state "speaker balance" panel. <see cref="Percent"/>
-/// raises change notifications so the bars animate without rebuilding the list.
+/// View model for a single speaker row in the recording-state speaker panel: avatar, name and the
+/// speaker's talking timeline on the shared meeting axis. Properties raise change notifications so
+/// rows update in place without rebuilding the list.
 /// </summary>
 public sealed class SpeakerBalance : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
 
     private string _name = string.Empty;
-    private double _percent;
+    private string _avatarInitials = "?";
+    private string _avatarAccessibleName = "Unknown speaker";
+    private ImageSource? _avatarImage;
+    private Brush? _brush;
+    private IReadOnlyList<SpeakerTimelineSpan> _spans = [];
+    private string _talkTimeText = string.Empty;
 
     public string SpeakerId { get; set; } = string.Empty;
 
     public string Name
     {
         get => _name;
-        set { _name = value; OnPropertyChanged(); }
+        set { if (_name != value) { _name = value; OnPropertyChanged(); } }
     }
 
-    /// <summary>Share of words spoken, 0–100.</summary>
-    public double Percent
+    public string AvatarInitials
     {
-        get => _percent;
-        set { _percent = value; OnPropertyChanged(); OnPropertyChanged(nameof(PercentText)); }
+        get => _avatarInitials;
+        set { if (_avatarInitials != value) { _avatarInitials = value; OnPropertyChanged(); } }
     }
 
-    public string PercentText => $"{_percent:0}%";
+    public string AvatarAccessibleName
+    {
+        get => _avatarAccessibleName;
+        set { if (_avatarAccessibleName != value) { _avatarAccessibleName = value; OnPropertyChanged(); } }
+    }
+
+    public ImageSource? AvatarImage
+    {
+        get => _avatarImage;
+        set { if (!ReferenceEquals(_avatarImage, value)) { _avatarImage = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>Colour of this speaker's segments; matches the speaker's transcript colour.</summary>
+    public Brush? Brush
+    {
+        get => _brush;
+        set { if (!ReferenceEquals(_brush, value)) { _brush = value; OnPropertyChanged(); } }
+    }
+
+    /// <summary>Talking intervals as fractions (0–1) of the meeting length.</summary>
+    public IReadOnlyList<SpeakerTimelineSpan> Spans
+    {
+        get => _spans;
+        set { _spans = value; OnPropertyChanged(); }
+    }
+
+    public string TalkTimeText
+    {
+        get => _talkTimeText;
+        set { if (_talkTimeText != value) { _talkTimeText = value; OnPropertyChanged(); } }
+    }
 
     private void OnPropertyChanged([CallerMemberName] string? name = null)
         => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));

@@ -13,6 +13,8 @@
     <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.xaml" Link="MainWindow.xaml" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.xaml.cs" Link="MainWindow.xaml.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.Settings.cs" Link="MainWindow.Settings.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\MainWindow.SpeakerTimeline.cs" Link="MainWindow.SpeakerTimeline.cs.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\SpeakerTimelineBar.cs" Link="SpeakerTimelineBar.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\src\MeetingCapture\Program.cs" Link="Program.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\src\MeetingCapture\TrayApp\FlyoutViewModels.cs" Link="FlyoutViewModels.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <None Include="..\..\src\MeetingCapture\App.xaml.cs" Link="App.xaml.cs.txt" CopyToOutputDirectory="PreserveNewest" />
@@ -60,6 +62,8 @@
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerAvatarPresentation.cs" Link="Production\SpeakerAvatarPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicMapState.cs" Link="Production\TopicMapState.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\TopicPaneSplit.cs" Link="Production\TopicPaneSplit.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerTimeline.cs" Link="Production\SpeakerTimeline.cs" />
+    <Compile Include="..\..\src\MeetingCapture\Transcription\SpeakerMerge.cs" Link="Production\SpeakerMerge.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\RelatedContextPresentation.cs" Link="Production\RelatedContextPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\ParticipantPresentation.cs" Link="Production\ParticipantPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\CatchUpPresentation.cs" Link="Production\CatchUpPresentation.cs" />
