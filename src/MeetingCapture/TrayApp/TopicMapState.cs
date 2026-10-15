@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Everything the topic pane shows for one document revision: topic trail, selected topic brief, maps and notes.</summary>
 internal sealed record VisualizationProjection(
     string SelectedTopicId,
     string CurrentTopicId,
@@ -14,10 +15,12 @@ internal sealed record VisualizationProjection(
     MeetingBrainMapViewModel? MeetingBrainMap = null,
     MeetingNotesViewModel? MeetingNotes = null);
 
+/// <summary>Notes grouped by topic for the notes pane.</summary>
 internal sealed record MeetingNotesViewModel(
     IReadOnlyList<MeetingTopicNotesViewModel> Topics,
     string EmptyMessage);
 
+/// <summary>One topic in the notes pane: its bullets and related suggestions, with current, selected and collapsed state.</summary>
 internal sealed record MeetingTopicNotesViewModel(
     string Id,
     string Heading,
@@ -37,8 +40,10 @@ internal sealed record MeetingTopicNotesViewModel(
         : $"Collapse topic: {Heading}";
 }
 
+/// <summary>Helpers for which topics are collapsed in the notes pane and topic map.</summary>
 internal static class TopicCollapseState
 {
+    /// <summary>Flips a topic between collapsed and expanded. Returns true if it is now collapsed.</summary>
     internal static bool Toggle(ISet<string> collapsed, string topicId)
     {
         ArgumentNullException.ThrowIfNull(collapsed);
@@ -61,6 +66,7 @@ internal static class TopicCollapseState
         topics.Select(topic => topic with { IsCollapsed = collapsed.Contains(topic.Id) }).ToArray();
 }
 
+/// <summary>A related item (such as a meeting, message, email or file) suggested for a topic.</summary>
 internal sealed record MeetingTopicSuggestionViewModel(
     string Id,
     string Title,
@@ -73,6 +79,7 @@ internal sealed record MeetingTopicSuggestionViewModel(
     public string Glyph => TopicMapState.SourceTypeGlyph(SourceKind);
 }
 
+/// <summary>The whole-meeting map: the meeting at the center with its topics around it.</summary>
 internal sealed record MeetingBrainMapViewModel(
     string MeetingTitle,
     string Detail,
@@ -80,12 +87,14 @@ internal sealed record MeetingBrainMapViewModel(
     IReadOnlyList<MeetingBrainMapTopicViewModel> Topics,
     string EmptyMessage);
 
+/// <summary>A topic node on the meeting map, with its leaf items.</summary>
 internal sealed record MeetingBrainMapTopicViewModel(
     string Id,
     string Title,
     string Detail,
     IReadOnlyList<MeetingBrainMapLeafViewModel> Leaves);
 
+/// <summary>A leaf on the meeting map. Selecting it shows the matching meeting notes.</summary>
 internal sealed record MeetingBrainMapLeafViewModel(
     string Id,
     string TopicId,
@@ -97,12 +106,15 @@ internal sealed record MeetingBrainMapLeafViewModel(
         $"{Kind}: {Title}. {Detail}. Select to view matching meeting notes.";
 }
 
+/// <summary>Positions of one topic node and its leaves on the meeting map.</summary>
 internal sealed record MeetingBrainMapTopicLayout(
     BrainMapRect Topic,
     IReadOnlyList<BrainMapRect> Leaves);
 
+/// <summary>A point on a map canvas.</summary>
 internal readonly record struct BrainMapPoint(double X, double Y);
 
+/// <summary>An RGB color with the WCAG relative luminance and contrast ratio, used to check text readability.</summary>
 internal readonly record struct TopicMapRgb(byte Red, byte Green, byte Blue)
 {
     internal double RelativeLuminance
@@ -126,11 +138,13 @@ internal readonly record struct TopicMapRgb(byte Red, byte Green, byte Blue)
     }
 }
 
+/// <summary>A line from the meeting node to a topic node.</summary>
 internal sealed record MeetingBrainMapConnectorLayout(
     string Id,
     BrainMapPoint Start,
     BrainMapPoint End);
 
+/// <summary>Size and node positions of the meeting map for a given width and number of leaves per topic.</summary>
 internal sealed record MeetingBrainMapLayout(
     double Width,
     double Height,
@@ -270,6 +284,7 @@ internal sealed record MeetingBrainMapLayout(
     }
 }
 
+/// <summary>The map of one topic: its label with branches such as related items and notes.</summary>
 internal sealed record BrainMapViewModel(
     string TopicId,
     string Label,
@@ -279,6 +294,7 @@ internal sealed record BrainMapViewModel(
     IReadOnlyList<BrainMapBranchViewModel> Branches,
     string EmptyMessage);
 
+/// <summary>A branch on a topic map. Selecting it opens the topic details.</summary>
 internal sealed record BrainMapBranchViewModel(
     string Id,
     string TopicId,
@@ -290,8 +306,10 @@ internal sealed record BrainMapBranchViewModel(
         $"{Kind}: {Title}. {Detail}. Select to open topic details.";
 }
 
+/// <summary>A rectangle on a map canvas.</summary>
 internal readonly record struct BrainMapRect(double X, double Y, double Width, double Height);
 
+/// <summary>Size and node positions of a single-topic map for a given width and branch count.</summary>
 internal sealed record BrainMapLayout(
     double Width,
     double Height,
@@ -340,9 +358,11 @@ internal sealed record BrainMapLayout(
     }
 }
 
+/// <summary>A fact in the Topic brief, with its evidence text.</summary>
 internal sealed record TopicBriefFactViewModel(
     string Id, string Title, string EvidenceText, string Metadata);
 
+/// <summary>A link from the selected topic to another topic, shown in the Topic brief.</summary>
 internal sealed record TopicBriefRelationshipViewModel(string Id, string Title, string Detail);
 
 /// <summary>An open or answered question shown in the Topic brief for the selected topic.</summary>
@@ -390,6 +410,7 @@ internal sealed record TopicBriefViewModel(
     IReadOnlyList<TopicBriefSourceViewModel> WorkIqSources,
     int WorkIqVerifiedTotal);
 
+/// <summary>One step in the chronological topic trail. Flags show revisits and the current and selected topic.</summary>
 internal sealed record TrailItemViewModel(
     string Id, string TopicId, string Sequence, string Label,
     string Detail, bool IsRevisit, bool IsCurrent, bool IsSelected, bool HasNext,
@@ -407,6 +428,7 @@ internal sealed record TrailItemViewModel(
         " Select to view details in the whole-meeting map.";
 }
 
+/// <summary>Builds the view models and layout values for the topic pane from a visualization document.</summary>
 internal static class TopicMapState
 {
     internal static TopicMapRgb TopicNodeBackground => new(38, 44, 58);

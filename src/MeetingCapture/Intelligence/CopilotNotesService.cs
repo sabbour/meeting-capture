@@ -271,6 +271,10 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         _diagnostics = diagnostics ?? new AiDiagnosticsStream();
     }
 
+    /// <summary>
+    /// Creates final meeting notes. Long transcripts are first summarized in chunks, then combined;
+    /// if chunking is unavailable, a bounded whole-transcript request is used.
+    /// </summary>
     public async Task<MeetingNotes> SynthesizeAsync(
         string meetingTitle, TranscriptionResult transcript, CancellationToken cancellationToken)
     {
@@ -296,6 +300,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         return IntelligenceResponseParser.ParseNotes(meetingTitle, transcript, response, Provider(settings), Model(settings, true));
     }
 
+    /// <summary>Returns a short topic label for the recent transcript, repairing the model response if needed.</summary>
     public async Task<string> SummarizeRecentAsync(string recentTranscript, CancellationToken cancellationToken)
     {
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
@@ -304,6 +309,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         return await RequestTopicWithRepairAsync(settings, input, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Returns a short recap of the recent transcript for the catch-up feature.</summary>
     public async Task<string> CatchUpAsync(
         string recentTranscript,
         CancellationToken cancellationToken)
@@ -315,12 +321,15 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         return IntelligenceResponseParser.ParseCatchUp(response, Provider(settings), Model(settings, false));
     }
 
+    /// <summary>Finds open questions in the recent transcript.</summary>
     public Task<List<string>> GetOpenQuestionsAsync(string recentTranscript, CancellationToken cancellationToken)
         => GetInsightsAsync(recentTranscript, QuestionsPrompt, cancellationToken);
 
+    /// <summary>Finds action items in the recent transcript.</summary>
     public Task<List<string>> GetActionsAsync(string recentTranscript, CancellationToken cancellationToken)
         => GetInsightsAsync(recentTranscript, ActionsPrompt, cancellationToken);
 
+    /// <summary>Analyzes a visualization document with the model and returns topic labels and a delta to apply.</summary>
     public async Task<MeetingVisualizationAnalysisResult> AnalyzeVisualizationAsync(
         MeetingVisualizationDocument document, CancellationToken cancellationToken)
     {
@@ -388,6 +397,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         return IntelligenceResponseParser.ParseInsights(response, Provider(settings), Model(settings, false));
     }
 
+    /// <summary>Sends a minimal request to check the selected model using effective credentials.</summary>
     public async Task<(bool ok, string detail)> ValidateModelAsync(
         bool isSynthesisModel, IntelligenceSettings? overrideSettings, CancellationToken cancellationToken)
     {
@@ -1015,12 +1025,15 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     }
 
     private sealed record VisualizationPromptInput(string Message, int[] SegmentOrdinals);
+    /// <summary>Bounds one transcript segment included in hierarchical note synthesis.</summary>
     internal sealed record SynthesisSourceSegment(int Ordinal, string? Speaker, string Text);
+    /// <summary>Groups chronological source segments for one intermediate synthesis request.</summary>
     internal sealed record SynthesisChunk(int Index, IReadOnlyList<SynthesisSourceSegment> Segments)
     {
         public int StartOrdinal => Segments[0].Ordinal;
         public int EndOrdinal => Segments[^1].Ordinal;
     }
+    /// <summary>Holds the final synthesis message and whether chunking succeeded or fell back.</summary>
     internal sealed record HierarchicalSynthesisInput(string Message, bool UsedHierarchy, bool FellBack);
     private sealed record ValidatedChunkSummary(JsonElement Content, int[] SourceOrdinals);
 
@@ -1148,6 +1161,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             throw IntelligenceErrors.Create(IntelligenceFailureKind.Configuration, Provider(settings), Model(settings, synthesis));
     }
 
+    /// <summary>Waits for requests in progress and cleanup to finish, then disposes the Copilot client.</summary>
     public ValueTask DisposeAsync()
     {
         lock (_lifetimeGate)

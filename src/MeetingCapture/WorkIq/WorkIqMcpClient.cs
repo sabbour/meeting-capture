@@ -9,8 +9,10 @@ using MeetingCapture.MeetingDetection;
 
 namespace MeetingCapture.WorkIq;
 
+/// <summary>The reason a WorkIQ request failed.</summary>
 public enum WorkIqFailure { SignedOut, Authentication, Denied, Unsupported, Incomplete, Malformed, Network, Timeout, Cache, ServiceDeclined, Unknown, ServiceUnavailable }
 
+/// <summary>A WorkIQ failure. The message is a fixed, user-safe text for the <see cref="Kind"/>.</summary>
 public sealed class WorkIqException(WorkIqFailure kind, string? code = null) : Exception(kind switch
 {
     WorkIqFailure.SignedOut => "WorkIQ is signed out. Sign in to connect Microsoft 365 context.",
@@ -32,6 +34,7 @@ public sealed class WorkIqException(WorkIqFailure kind, string? code = null) : E
     public string? Code { get; } = code;
 }
 
+/// <summary>A user's profile photo bytes and their content type.</summary>
 public sealed record WorkIqProfilePhoto(byte[] Content, string ContentType);
 
 /// <summary>Minimal hosted MCP client for bounded calendar metadata and profile-photo reads.</summary>

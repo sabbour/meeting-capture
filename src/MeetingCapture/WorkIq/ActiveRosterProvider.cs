@@ -7,11 +7,16 @@ using System.Windows.Automation;
 
 namespace MeetingCapture.WorkIq;
 
+/// <summary>How far a roster result can be trusted: verified live, not available, or unclear.</summary>
 public enum ActiveRosterAvailability { VerifiedLive, Unavailable, Indeterminate }
+
+/// <summary>Where a roster came from.</summary>
 public enum ActiveRosterSource { WorkIq, TeamsUiAutomation }
 
+/// <summary>A person seen in the live meeting roster.</summary>
 public sealed record ActiveRosterMember(string DisplayName);
 
+/// <summary>A list of people seen in a live meeting at one time. <c>Limitation</c> explains any gaps.</summary>
 public sealed record ActiveRosterSnapshot(
     ActiveRosterAvailability Availability,
     ActiveRosterSource Source,
@@ -21,21 +26,26 @@ public sealed record ActiveRosterSnapshot(
     bool IsPartial,
     string Limitation);
 
+/// <summary>Reads who is in the meeting that is happening now.</summary>
 public interface IActiveRosterProvider
 {
+    /// <summary>Returns the current roster. Gaps are described in the snapshot instead of thrown.</summary>
     Task<ActiveRosterSnapshot> GetSnapshotAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>The title of the meeting that is happening now, if it could be verified. <c>Limitation</c> explains why not.</summary>
 public sealed record ActiveMeetingIdentitySnapshot(string? Title, string Limitation)
 {
     public bool IsVerified => !string.IsNullOrWhiteSpace(Title);
 }
 
+/// <summary>Reads the title of the meeting that is happening now.</summary>
 public interface IActiveMeetingIdentityProvider
 {
     Task<ActiveMeetingIdentitySnapshot> GetSnapshotAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>Reads the active Teams meeting title through Windows UI Automation, with a short time limit.</summary>
 public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIdentityProvider
 {
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(3);
@@ -95,6 +105,7 @@ public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIde
         string? Limitation);
 }
 
+/// <summary>Reads the Teams participant list through Windows UI Automation, with a short time limit.</summary>
 public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
 {
     private static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(3);
@@ -230,6 +241,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
         string? Limitation);
 }
 
+/// <summary>Helper that reads the Teams window with UI Automation and tells a meeting roster from a chat roster.</summary>
 internal static partial class TeamsUiAutomationRosterHelper
 {
     private const string MeetingRosterKind = "MeetingParticipants";

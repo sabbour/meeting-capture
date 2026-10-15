@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 
 namespace MeetingCapture.MeetingDetection;
 
+/// <summary>A running process that may be a meeting app, and whether it currently has an active audio capture session.</summary>
 internal sealed record MeetingProcessSnapshot(
     int ProcessId, string ProcessName, DateTimeOffset StartedAt, bool HasActiveCapture = false);
 
@@ -33,9 +34,13 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
     private bool _confirmed;
     private bool _disposed;
 
+    /// <inheritdoc />
     public event EventHandler<MeetingSession>? MeetingStarted;
+
+    /// <inheritdoc />
     public event EventHandler<MeetingSession>? MeetingEnded;
 
+    /// <inheritdoc />
     public MeetingSession? ActiveSession
     {
         get { lock (_gate) return _activeSession; }

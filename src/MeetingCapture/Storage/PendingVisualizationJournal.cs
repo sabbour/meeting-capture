@@ -12,11 +12,14 @@ namespace MeetingCapture.Storage;
 /// </summary>
 public interface IPendingVisualizationJournal
 {
+    /// <summary>Keeps a topic map that could not be saved so it can be retried later.</summary>
     Task RecordAsync(string markdownPath, MeetingVisualizationDocument document, CancellationToken cancellationToken);
 
+    /// <summary>Tries to save each journaled entry with <paramref name="storage"/> and returns the notes paths it handled.</summary>
     Task<IReadOnlyList<string>> DrainAsync(IMeetingVisualizationStorage storage, CancellationToken cancellationToken);
 }
 
+/// <summary>Journal that keeps each pending entry as a file on disk.</summary>
 public sealed class FilePendingVisualizationJournal : IPendingVisualizationJournal
 {
     internal const int CurrentEntryVersion = 1;

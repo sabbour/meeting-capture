@@ -1,5 +1,6 @@
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Tracks the WorkIQ sign-in and calendar refresh state shown in the UI.</summary>
 public sealed class WorkIqConnectionStatus
 {
     private long _authRevision = -1;
@@ -66,6 +67,7 @@ public sealed class WorkIqConnectionStatus
             (LastSuccessfulRefresh is { } at ? $" Last successful refresh {at.LocalDateTime:t}." : ""));
 }
 
+/// <summary>Which sign-in buttons are available, plus the status text to show.</summary>
 public readonly record struct WorkIqControlState(
     (bool SignIn, bool SignOut, bool Cancel) Actions,
     bool CancelEnabled,

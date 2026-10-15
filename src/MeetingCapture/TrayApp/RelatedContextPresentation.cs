@@ -2,11 +2,16 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Label and disclosure text for a related-context topic. <c>IsEarlierTopic</c> marks a topic from earlier in the meeting.</summary>
 internal readonly record struct RelatedContextTopicPresentation(
     string Label,
     string Disclosure,
     bool IsEarlierTopic);
+
+/// <summary>Status text for related-context lookup; <c>IsQuerying</c> is true while a lookup runs.</summary>
 internal readonly record struct RelatedContextStatusPresentation(string Text, bool IsQuerying);
+
+/// <summary>State of the related-context information for one topic.</summary>
 internal enum TopicSemanticInfoState
 {
     Loading,
@@ -18,12 +23,14 @@ internal enum TopicSemanticInfoState
     Refreshing,
 }
 
+/// <summary>Status line shown for a topic's related context, with an accessible name.</summary>
 internal sealed record TopicContextStatusViewModel(
     TopicSemanticInfoState State,
     string Text,
     bool IsLoading,
     string AccessibleName);
 
+/// <summary>Builds user-facing text for related-context states and failures.</summary>
 internal static class RelatedContextPresentation
 {
     internal static string MeetingFailureMessage(
@@ -166,6 +173,7 @@ internal static class RelatedContextPresentation
             StringSplitOptions.RemoveEmptyEntries));
 }
 
+/// <summary>Cleans related-context titles and details for display.</summary>
 internal static class ContextTitlePresentation
 {
     internal static string Clean(string? value) => RelatedContextTitle.Clean(value, null);

@@ -4,6 +4,7 @@ using GitHub.Copilot;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>The feature that makes an AI request.</summary>
 public enum AiCapability
 {
     Synthesis,
@@ -13,6 +14,7 @@ public enum AiCapability
     WorkIqRetrieval
 }
 
+/// <summary>Current or final state of one AI request.</summary>
 public enum AiRequestState
 {
     Running,
@@ -23,6 +25,7 @@ public enum AiRequestState
     RateLimited
 }
 
+/// <summary>Broad reason an AI request failed.</summary>
 public enum AiRequestFailure
 {
     None,
@@ -38,21 +41,25 @@ public enum AiRequestFailure
     Unknown
 }
 
+/// <summary>A whole-number total (for example tokens) and how many calls did or did not report it.</summary>
 public sealed record AiReportedLong(long Total, int ReportedCalls, int UnreportedCalls)
 {
     public bool IsReported => ReportedCalls > 0;
 }
 
+/// <summary>A decimal total and how many calls did or did not report it.</summary>
 public sealed record AiReportedDouble(double Total, int ReportedCalls, int UnreportedCalls)
 {
     public bool IsReported => ReportedCalls > 0;
 }
 
+/// <summary>Cost reported by the provider, with its currency and unit when given.</summary>
 public sealed record AiProviderCost(
     AiReportedDouble Amount,
     string? Currency,
     string? Unit);
 
+/// <summary>Quota details reported by the provider for one quota.</summary>
 public sealed record AiQuotaSnapshot(
     string QuotaId,
     long EntitlementRequests,
@@ -64,6 +71,7 @@ public sealed record AiQuotaSnapshot(
     bool UsageAllowedWithExhaustedQuota,
     long UsedRequests);
 
+/// <summary>The quotas reported by the provider, and how many calls did or did not report them.</summary>
 public sealed record AiQuotaSnapshots(
     IReadOnlyList<AiQuotaSnapshot> Values,
     int ReportedCalls,
@@ -72,6 +80,10 @@ public sealed record AiQuotaSnapshots(
     public bool IsReported => ReportedCalls > 0;
 }
 
+/// <summary>
+/// Usage totals for one capability. Values are shown as reported only when the provider
+/// sent them for at least one call (see <c>IsReported</c> on each total).
+/// </summary>
 public sealed record AiCapabilityUsage(
     AiCapability Capability,
     int RequestsStarted,
@@ -90,6 +102,7 @@ public sealed record AiCapabilityUsage(
     AiReportedLong CacheWriteTokens,
     AiReportedLong ReasoningTokens);
 
+/// <summary>Usage and timing for a single AI request.</summary>
 public sealed record AiRequestUsage(
     long RequestId,
     AiCapability Capability,
@@ -109,6 +122,7 @@ public sealed record AiRequestUsage(
     long? CacheWriteTokens = null,
     long? ReasoningTokens = null);
 
+/// <summary>Point-in-time copy of AI usage per capability plus the most recent requests.</summary>
 public sealed record AiUsageSnapshot(
     string? SessionId,
     DateTimeOffset? SessionStartedAt,
@@ -119,6 +133,7 @@ public sealed record AiUsageSnapshot(
     public bool HasActiveRequests => Requests.Any(request => request.State == AiRequestState.Running);
 }
 
+/// <summary>Carries provider-reported usage values, leaving unavailable values unset.</summary>
 internal sealed record AiProviderUsage(
     long? InputTokens,
     long? OutputTokens,
@@ -129,6 +144,10 @@ internal sealed record AiProviderUsage(
     long? ReasoningTokens,
     IReadOnlyList<AiQuotaSnapshot>? QuotaSnapshots);
 
+/// <summary>
+/// Converts Copilot SDK usage data into <see cref="AiProviderUsage"/>. Quota snapshots are read
+/// by reflection, and the result is null when the SDK shape is not as expected.
+/// </summary>
 internal static class CopilotUsageMapper
 {
     private const BindingFlags InstanceMembers =
@@ -218,6 +237,11 @@ internal static class CopilotUsageMapper
     }
 }
 
+/// <summary>
+/// Tracks AI requests for the current recording session: counts, outcomes, tokens, cost, and
+/// quota, per capability and for the last 32 requests. Thread-safe. Updates from a previous
+/// session are ignored after <see cref="Reset"/>. Raises <see cref="Changed"/> on updates.
+/// </summary>
 public sealed class AiUsageMonitor
 {
     private const int MaxRequests = 32;
@@ -239,6 +263,7 @@ public sealed class AiUsageMonitor
 
     public event EventHandler? Changed;
 
+    /// <summary>Clears all usage and starts tracking a new recording session.</summary>
     public void Reset(string sessionId)
     {
         if (string.IsNullOrWhiteSpace(sessionId))
@@ -337,6 +362,7 @@ public sealed class AiUsageMonitor
             Changed?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>Collects usage and completion updates for one monitored AI request.</summary>
     internal sealed class RequestObservation(
         AiUsageMonitor owner,
         long generation,
@@ -423,6 +449,7 @@ public sealed class AiUsageMonitor
             => value is null ? current : (current ?? 0) + value.Value;
     }
 
+    /// <summary>Accumulates timing, outcome, and reported usage for one monitored AI request.</summary>
     internal sealed class RequestState(
         long id,
         AiCapability capability,

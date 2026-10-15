@@ -6,6 +6,7 @@ using System.Threading.Channels;
 
 namespace MeetingCapture.Diagnostics;
 
+/// <summary>Named startup and UI steps whose duration is timed in the responsiveness log.</summary>
 internal enum ResponsivenessPhase
 {
     ApplicationStart,
@@ -42,6 +43,7 @@ internal enum ResponsivenessPhase
     WorkIqRelatedOther
 }
 
+/// <summary>Kinds of entries written to the responsiveness log.</summary>
 internal enum ResponsivenessEventKind
 {
     ProcessStarted,
@@ -60,6 +62,7 @@ internal enum ResponsivenessEventKind
     ProcessStopping
 }
 
+/// <summary>Progress of posting a heartbeat probe to the UI thread.</summary>
 internal enum UiProbePostState
 {
     Pending,
@@ -68,6 +71,11 @@ internal enum UiProbePostState
     Rejected
 }
 
+/// <summary>
+/// Writes a bounded JSON-lines log (responsiveness.jsonl) of timed startup phases and UI stalls.
+/// Events go through a bounded queue to a background writer, so callers do not wait on file I/O.
+/// A heartbeat monitor posts probes to the UI thread to detect when it stops responding.
+/// </summary>
 public sealed class ResponsivenessDiagnostics : IDisposable
 {
     internal const int QueueCapacity = 128;
@@ -132,9 +140,11 @@ public sealed class ResponsivenessDiagnostics : IDisposable
     internal Task Completion => Task.WhenAll(
         _writer, _monitor ?? Task.CompletedTask, _poster ?? Task.CompletedTask);
 
+    /// <summary>Replaces the callback used to report diagnostic-writer failures.</summary>
     internal void SetFailureReporter(Action<string> reportFailure)
         => Volatile.Write(ref _reportFailure, reportFailure);
 
+    /// <summary>Updates the supplied window values in the last-known state snapshot.</summary>
     internal void SetWindowState(bool? visible = null, bool? active = null)
     {
         var state = Volatile.Read(ref _state);
@@ -145,6 +155,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         });
     }
 
+    /// <summary>Updates the last-known Work IQ authentication and request state.</summary>
     internal void SetWorkIqState(bool authenticated, bool busy, bool calendarBusy)
     {
         var state = Volatile.Read(ref _state);
@@ -156,13 +167,17 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         });
     }
 
+    /// <summary>Updates whether audio capture was last observed as active.</summary>
     internal void SetCaptureState(bool active)
     {
         var state = Volatile.Read(ref _state);
         Volatile.Write(ref _state, state with { CaptureActive = active });
     }
 
+    /// <summary>Starts timing a phase that runs on the UI thread. Dispose the scope to end it.</summary>
     internal PhaseScope BeginUiPhase(ResponsivenessPhase phase) => BeginPhase(phase, true);
+
+    /// <summary>Starts timing a phase that runs off the UI thread. Dispose the scope to end it.</summary>
     internal PhaseScope BeginBackgroundPhase(ResponsivenessPhase phase) => BeginPhase(phase, false);
 
     private PhaseScope BeginPhase(ResponsivenessPhase phase, bool ui)
@@ -177,6 +192,10 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         return scope;
     }
 
+    /// <summary>
+    /// Starts the heartbeat monitor. <paramref name="post"/> queues an action on the UI thread
+    /// and returns false if it is rejected. Does nothing if already started or stopped.
+    /// </summary>
     internal void StartMonitor(Func<Action, bool> post)
     {
         if (_monitor is not null || Volatile.Read(ref _stopped) != 0) return;
@@ -361,6 +380,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         }
     }
 
+    /// <summary>Tracks one timed diagnostic phase and records its completion or failure.</summary>
     internal sealed class PhaseScope(
         ResponsivenessDiagnostics owner, ResponsivenessPhase phase,
         long id, long started, bool ui, PhaseScope? parent) : IDisposable
@@ -370,6 +390,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         internal long Started { get; } = started;
         private int _ended;
 
+        /// <summary>Records a phase failure using only the exception type.</summary>
         internal void Fail(Exception error)
             => owner.Enqueue(owner.Snapshot(ResponsivenessEventKind.PhaseFailure) with
             {
@@ -377,12 +398,14 @@ public sealed class ResponsivenessDiagnostics : IDisposable
             });
 
         // Detail must be a fixed classification (for example a failure enum name), never message text.
+        /// <summary>Records a phase failure with a fixed, non-sensitive classification.</summary>
         internal void Fail(Exception error, string detail)
             => owner.Enqueue(owner.Snapshot(ResponsivenessEventKind.PhaseFailure) with
             {
                 Phase = Phase, OperationId = Id, ExceptionType = $"{error.GetType().Name}:{detail}"
             });
 
+        /// <summary>Ends the phase once and records its elapsed time.</summary>
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _ended, 1) != 0) return;
@@ -436,6 +459,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
     }
 }
 
+/// <summary>Measures UI-dispatcher response delays without depending on the UI thread for monitoring.</summary>
 internal sealed class UiHeartbeat(
     TimeProvider time, Func<Action, bool> post, Action<UiHeartbeat.Observation> record)
 {
@@ -451,6 +475,7 @@ internal sealed class UiHeartbeat(
     private bool _postDelayed;
     private bool _rejected;
 
+    /// <summary>Checks the prior response and posts a new UI probe when one is not pending.</summary>
     internal bool Tick()
     {
         var now = time.GetTimestamp();
@@ -573,6 +598,7 @@ internal sealed class UiHeartbeat(
             started, startedUtc, time.GetTimestamp(), time.GetUtcNow(), exceptionType));
     }
 
+    /// <summary>Carries one UI heartbeat result to the diagnostic event writer.</summary>
     internal sealed record Observation(
         ResponsivenessEventKind Kind, DateTimeOffset Utc, DateTimeOffset? ProbeSentUtc,
         DateTimeOffset? LastUiResponseUtc, TimeSpan Delay, string? ExceptionType = null)

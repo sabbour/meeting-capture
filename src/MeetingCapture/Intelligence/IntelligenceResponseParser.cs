@@ -3,6 +3,10 @@ using MeetingCapture.Transcription;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>
+/// Validates and converts raw model responses into summaries, topics, and insight lists.
+/// Throws <see cref="IntelligenceException"/> when a response is empty or malformed.
+/// </summary>
 public static class IntelligenceResponseParser
 {
     public static string ParseSummary(string response, string provider, string? model)

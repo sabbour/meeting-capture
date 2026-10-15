@@ -1,5 +1,6 @@
 namespace MeetingCapture.AudioCapture;
 
+/// <summary>Thread-safe counters and state for one audio source, reported as <see cref="AudioSourceHealth"/> snapshots.</summary>
 internal sealed class AudioHealthTracker(string source)
 {
     private readonly object _gate = new();

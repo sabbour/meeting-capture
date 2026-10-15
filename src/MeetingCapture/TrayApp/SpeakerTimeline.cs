@@ -5,12 +5,14 @@ namespace MeetingCapture.TrayApp;
 /// <summary>A talking interval on the shared meeting axis; both ends are fractions of the meeting length (0..1).</summary>
 public readonly record struct SpeakerTimelineSpan(double Start, double End);
 
+/// <summary>One speaker's row on the timeline: talking spans and total talk time.</summary>
 public sealed record SpeakerTimelineRow(
     string SpeakerId,
     string DisplayName,
     IReadOnlyList<SpeakerTimelineSpan> Spans,
     TimeSpan TalkTime);
 
+/// <summary>The meeting length and one row per speaker.</summary>
 public sealed record SpeakerTimelineModel(TimeSpan Duration, IReadOnlyList<SpeakerTimelineRow> Rows)
 {
     public static SpeakerTimelineModel Empty { get; } = new(TimeSpan.Zero, []);

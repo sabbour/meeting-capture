@@ -7,6 +7,7 @@ using NAudio.Wave.SampleProviders;
 namespace MeetingCapture.AudioCapture;
 
 // Microphone and loopback share exactly the same ownership/drain protocol.
+/// <summary>Owns one WASAPI device and converts its captured audio to drained 16 kHz mono PCM.</summary>
 internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> createCapture,
     Action<byte[], int> output, ILogger logger)
 {
@@ -14,7 +15,9 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
     private readonly object _gate = new();
     private Session? _session;
     private readonly AudioHealthTracker _health = new(source);
+    /// <summary>Returns the current health snapshot for this capture source.</summary>
     public AudioSourceHealth Health => _health.Snapshot();
+    /// <summary>Reports whether the worker currently owns an active capture session.</summary>
     public bool IsCapturing { get { lock (_gate) return _session is not null; } }
 
     private sealed class Session(WasapiCapture capture)
@@ -34,6 +37,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         public bool Released;
     }
 
+    /// <summary>Starts the device and PCM consumer, releasing owned resources if startup fails.</summary>
     public async Task StartAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -153,6 +157,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         finally { session.Drained.TrySetResult(); }
     }
 
+    /// <summary>Chooses a 20 ms PCM read for exact-rate multiples while preserving other rates' read size.</summary>
     internal static int PcmReadBufferSize(int inputSampleRate)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputSampleRate);
@@ -162,6 +167,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             : 8192;
     }
 
+    /// <summary>Downmixes multichannel input when needed, then resamples it to 16 kHz PCM.</summary>
     internal static IWaveProvider CreatePcmProvider(BufferedWaveProvider input)
     {
         ISampleProvider samples = input.ToSampleProvider();
@@ -169,6 +175,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         return new SampleToWaveProvider16(new WdlResamplingSampleProvider(samples, OutputSampleRate));
     }
 
+    /// <summary>Stops capture, drains queued audio, and releases the device and consumer worker.</summary>
     public Task StopAsync(CancellationToken ct)
     {
         lock (_gate)
@@ -224,6 +231,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
     }
 }
 
+/// <summary>Averages all channels of a float sample stream into one mono channel.</summary>
 internal sealed class MonoDownmixSampleProvider : ISampleProvider
 {
     private readonly ISampleProvider _source;

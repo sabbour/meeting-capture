@@ -9,6 +9,7 @@ using Microsoft.Extensions.Options;
 
 namespace MeetingCapture.Transcription;
 
+/// <summary>Live transcription with Azure AI Speech. Audio is pushed in and results arrive as segments.</summary>
 public sealed class AzureSpeechTranscriptionService : ITranscriptionService
 {
     private readonly object _gate = new();

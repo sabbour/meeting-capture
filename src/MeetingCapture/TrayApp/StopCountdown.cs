@@ -1,5 +1,6 @@
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Countdown state shown on the Stop button while the user can still cancel.</summary>
 internal readonly record struct StopCountdownPresentation(
     bool IsActive,
     int RemainingSeconds,

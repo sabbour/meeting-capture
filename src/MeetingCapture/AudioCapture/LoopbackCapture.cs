@@ -6,6 +6,10 @@ using NAudio.Wave;
 
 namespace MeetingCapture.AudioCapture;
 
+/// <summary>
+/// Captures what the default playback device is playing (the remote side of a meeting).
+/// Supports only 16 kHz mono PCM.
+/// </summary>
 public sealed class LoopbackCapture : IAudioCapture
 {
     private readonly WasapiCaptureWorker _worker;
@@ -41,9 +45,11 @@ public sealed class LoopbackCapture : IAudioCapture
     }
 }
 
+/// <summary>Captures the default playback device through an event-synchronized WASAPI loopback stream.</summary>
 internal sealed class EventSynchronizedLoopbackCapture()
     : WasapiCapture(WasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice(), true, 100)
 {
+    /// <summary>Enables WASAPI loopback mode for the playback-device stream.</summary>
     protected override AudioClientStreamFlags GetAudioClientStreamFlags() =>
         AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
 }

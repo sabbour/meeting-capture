@@ -9,6 +9,10 @@ using Microsoft.Identity.Client;
 
 namespace MeetingCapture.WorkIq;
 
+/// <summary>
+/// Signs the user in to Microsoft WorkIQ and provides calendar, people and related work context
+/// (the source of related meetings, messages, mail and files).
+/// </summary>
 public sealed class WorkIqService : IDisposable, IRelatedContextSource
 {
     public const string ClientId = "ba081686-5d24-4bc6-a0d6-d034ecffed87";

@@ -3,6 +3,7 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>One AI diagnostic event as display text.</summary>
 internal sealed record AiDiagnosticEventPresentation(
     long Sequence,
     string Time,
@@ -21,6 +22,7 @@ internal sealed record AiDiagnosticEventPresentation(
     bool PayloadTruncated,
     string AutomationName);
 
+/// <summary>Turns AI diagnostic events into display text.</summary>
 internal static class AiDiagnosticsPresentation
 {
     internal static AiDiagnosticEventPresentation Event(AiDiagnosticEvent value)

@@ -2,14 +2,18 @@ using GitHub.Copilot;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>A Copilot model that can be chosen in settings.</summary>
 public sealed record CopilotModelOption(string Id, string Name);
 
+/// <summary>The model list from the Copilot service and when it was retrieved.</summary>
 public sealed record CopilotModelCatalogSnapshot(
     IReadOnlyList<CopilotModelOption> Models,
     DateTimeOffset RetrievedAt);
 
+/// <summary>Why the Copilot model list could not be loaded.</summary>
 public enum CopilotModelCatalogFailure { Timeout, Unavailable, Empty }
 
+/// <summary>Thrown when the Copilot model list is unavailable, empty, or times out.</summary>
 public sealed class CopilotModelCatalogException(
     CopilotModelCatalogFailure kind,
     Exception? innerException = null) : Exception(kind switch
@@ -22,6 +26,11 @@ public sealed class CopilotModelCatalogException(
     public CopilotModelCatalogFailure Kind { get; } = kind;
 }
 
+/// <summary>
+/// Loads the list of Copilot models the user can select. Results are cached for 15 minutes,
+/// requests time out after 45 seconds, and concurrent callers share one fetch.
+/// Failures throw <see cref="CopilotModelCatalogException"/>.
+/// </summary>
 public sealed class CopilotModelCatalog
 {
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(45);
@@ -48,6 +57,10 @@ public sealed class CopilotModelCatalog
             throw new ArgumentOutOfRangeException(nameof(cacheLifetime));
     }
 
+    /// <summary>
+    /// Returns the model list from the cache when it is still fresh, otherwise fetches it.
+    /// Set <paramref name="forceRefresh"/> to skip the cache.
+    /// </summary>
     public async Task<CopilotModelCatalogSnapshot> GetModelsAsync(
         bool forceRefresh,
         CancellationToken cancellationToken)

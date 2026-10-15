@@ -1,5 +1,6 @@
 namespace MeetingCapture.Transcription;
 
+/// <summary>Turns speech service cancellation errors into reconnect decisions and readable messages.</summary>
 internal static class SpeechCancellationDiagnostics
 {
     public static bool RequiresReconnect(string errorCode) =>

@@ -2,10 +2,12 @@ using System.Collections.ObjectModel;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>The items added and changed by a reconcile.</summary>
 internal sealed record VisualizationReconcileResult<T>(
     IReadOnlyList<T> Added,
     IReadOnlyList<T> Changed);
 
+/// <summary>Updates a UI collection to match new data by id, so unchanged items are not rebuilt.</summary>
 internal static class VisualizationCollectionState
 {
     internal static VisualizationReconcileResult<T> Reconcile<T>(

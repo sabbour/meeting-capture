@@ -212,6 +212,7 @@ internal sealed class TrayContextMenuHost : IDisposable
         internal const uint MonitorDefaultToNearest = 2;
         private const int MonitorDpiTypeEffective = 0;
 
+        /// <summary>Matches the native Win32 point structure used for cursor and monitor queries.</summary>
         [StructLayout(LayoutKind.Sequential)]
         internal struct Point
         {

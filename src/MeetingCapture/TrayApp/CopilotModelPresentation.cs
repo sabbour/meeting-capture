@@ -2,8 +2,10 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>A model entry in the settings list. <c>IsAvailable</c> is false for a configured model the service no longer offers.</summary>
 internal sealed record CopilotModelChoice(string Id, string Display, bool IsAvailable);
 
+/// <summary>Builds the model list for the settings page.</summary>
 internal static class CopilotModelPresentation
 {
     internal static IReadOnlyList<CopilotModelChoice> Merge(

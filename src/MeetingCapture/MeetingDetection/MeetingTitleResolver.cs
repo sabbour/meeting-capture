@@ -1,5 +1,6 @@
 namespace MeetingCapture.MeetingDetection;
 
+/// <summary>A person invited to a calendar meeting. Rooms and other resources are not treated as people.</summary>
 public sealed record MeetingInvitee(string? Name, string? Email, string? Type = null)
 {
     public bool IsHuman =>
@@ -10,15 +11,22 @@ public sealed record MeetingInvitee(string? Name, string? Email, string? Type = 
         : !string.IsNullOrWhiteSpace(Email) ? Email.Trim() : "Unknown attendee";
 }
 
+/// <summary>A calendar event that might match the meeting being detected.</summary>
 public sealed record MeetingTitleCandidate(
     string Subject, DateTimeOffset Start, DateTimeOffset End,
     string? OnlineMeetingProvider, string? JoinUrl, bool IsCancelled = false, bool IsAllDay = false,
     bool? IsOnlineMeeting = null, bool? IsOrganizer = null, MeetingInvitee? Organizer = null,
     IReadOnlyList<MeetingInvitee>? Attendees = null);
+/// <summary>The chosen meeting title (null if none could be trusted), with a reason and the matched event.</summary>
 public sealed record MeetingTitleResolution(string? Title, string Detail, MeetingTitleCandidate? Meeting = null);
 
+/// <summary>
+/// Chooses a meeting title from calendar events. A title is used only when exactly one verified
+/// online meeting for the same platform is in progress or starts within five minutes of detection.
+/// </summary>
 public static class MeetingTitleResolver
 {
+    /// <summary>Returns a display name for the meeting app's process name.</summary>
     public static string AppLabel(string process) => process.ToLowerInvariant() switch
     {
         "teams" or "ms-teams" => "Microsoft Teams",
@@ -28,6 +36,7 @@ public static class MeetingTitleResolver
         _ => process
     };
 
+    /// <summary>Returns a generic title, such as "Teams meeting", when no calendar title is available.</summary>
     public static string FallbackTitle(string process) => process.ToLowerInvariant() switch
     {
         "teams" or "ms-teams" or "msteams" => "Teams meeting",
@@ -37,9 +46,11 @@ public static class MeetingTitleResolver
         _ => "Meeting"
     };
 
+    /// <summary>Returns the matching meeting title, or null. See <see cref="ResolveWithReason"/> for the reason.</summary>
     public static string? Resolve(string process, DateTimeOffset detectedAt, IEnumerable<MeetingTitleCandidate> meetings)
         => ResolveWithReason(process, detectedAt, meetings).Title;
 
+    /// <summary>Like <see cref="Resolve"/>, but also explains why no title was chosen.</summary>
     public static MeetingTitleResolution ResolveWithReason(string process, DateTimeOffset detectedAt, IEnumerable<MeetingTitleCandidate> meetings)
     {
         var all = meetings.Where(IsEligibleOnlineMeeting).ToArray();
@@ -60,6 +71,10 @@ public static class MeetingTitleResolver
                 "One calendar event matches the time and meeting platform.", candidates[0]);
     }
 
+    /// <summary>
+    /// Returns eligible online meetings for the app's platform that are in progress or start within
+    /// five minutes of detection, ordered by start.
+    /// </summary>
     public static IReadOnlyList<MeetingTitleCandidate> MatchingCandidates(
         string process, DateTimeOffset detectedAt, IEnumerable<MeetingTitleCandidate> meetings)
     {
@@ -73,6 +88,10 @@ public static class MeetingTitleResolver
             .ToArray();
     }
 
+    /// <summary>
+    /// True for a non-cancelled, timed event with online-call evidence and enough human attendees
+    /// to be a real meeting.
+    /// </summary>
     public static bool IsEligibleOnlineMeeting(MeetingTitleCandidate meeting)
     {
         if (meeting.IsCancelled || meeting.IsAllDay || meeting.End <= meeting.Start || !HasOnlineCallEvidence(meeting))
@@ -85,6 +104,7 @@ public static class MeetingTitleResolver
             .Distinct(StringComparer.OrdinalIgnoreCase).Take(2).Count() > 1;
     }
 
+    /// <summary>Returns the distinct human attendees, plus the organizer when the user is not the organizer.</summary>
     public static IReadOnlyList<MeetingInvitee> InviteParticipants(MeetingTitleCandidate? meeting)
     {
         if (meeting is null) return [];
@@ -108,6 +128,7 @@ public static class MeetingTitleResolver
         !string.IsNullOrWhiteSpace(attendee.Email) ? attendee.Email.Trim() :
         !string.IsNullOrWhiteSpace(attendee.Name) ? attendee.Name.Trim() : "";
 
+    /// <summary>Checks that the event's provider or join-link domain belongs to the given platform.</summary>
     public static bool MatchesPlatform(string platform, MeetingTitleCandidate meeting)
     {
         var provider = meeting.OnlineMeetingProvider;

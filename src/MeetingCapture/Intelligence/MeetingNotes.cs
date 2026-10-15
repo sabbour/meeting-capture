@@ -41,11 +41,13 @@ public sealed class MeetingNotes
     public int EstimatedDurationMinutes { get; set; }
 }
 
+/// <summary>Notes for one topic: a title and its bullet points.</summary>
 public sealed record MeetingTopicNotes(
     string TopicId,
     string Topic,
     IReadOnlyList<string> Bullets);
 
+/// <summary>Helpers for cleaning model-generated note text.</summary>
 public static class MeetingNotesText
 {
     private static readonly Regex GroundingOrdinal = new(
@@ -55,6 +57,7 @@ public static class MeetingNotesText
         @"\bsegments?\s+\d+(?:\s*[–-]\s*\d+)?\b",
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
+    /// <summary>Removes "segment N" style references so they do not appear in user-facing text.</summary>
     public static string WithoutSegmentOrdinals(string? value)
     {
         if (string.IsNullOrEmpty(value))
@@ -66,10 +69,12 @@ public static class MeetingNotesText
     }
 }
 
+/// <summary>Builds per-topic note bullets from a visualization document, using only transcript-based evidence.</summary>
 public static class MeetingTopicNotesBuilder
 {
     private const int BulletCharacterLimit = 220;
 
+    /// <summary>Returns one entry per topic cluster, with short bullets that are shortened to a fixed length.</summary>
     public static IReadOnlyList<MeetingTopicNotes> Build(MeetingVisualizationDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
@@ -223,8 +228,10 @@ public static class MeetingTopicNotesBuilder
     }
 }
 
+/// <summary>A meeting participant's name and optional role.</summary>
 public record ParticipantInfo(string Name, string? Role);
 
+/// <summary>A follow-up task found in the meeting, with an optional owner and due date.</summary>
 public sealed class ActionItem
 {
     public string Description { get; init; } = string.Empty;

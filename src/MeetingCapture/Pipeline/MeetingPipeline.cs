@@ -9,6 +9,11 @@ using Microsoft.Extensions.Logging;
 
 namespace MeetingCapture.Pipeline;
 
+/// <summary>
+/// Coordinates a recording from start to saved notes: meeting detection, audio capture,
+/// transcription, live insights and topic map, the save review, final notes, and exit.
+/// Public events report progress. Capture lifetime is owned by the pipeline.
+/// </summary>
 public sealed class MeetingPipeline : IAsyncDisposable
 {
     private static readonly TimeSpan SaveReviewDuration = TimeSpan.FromSeconds(5);
@@ -152,23 +157,56 @@ public sealed class MeetingPipeline : IAsyncDisposable
         _speakerResolver.SpeakerResolved += OnSpeakerResolved;
     }
 
+    /// <summary>Raised when <see cref="Status"/> changes.</summary>
     public event EventHandler<PipelineStatus>? StateChanged;
+
+    /// <summary>Raised with a short status message for display.</summary>
     public event EventHandler<string>? StatusChanged;
+
+    /// <summary>Raised after notes are saved.</summary>
     public event EventHandler<NotesSavedInfo>? NotesSaved;
+
+    /// <summary>Raised when the detector finds a possible meeting that the user can confirm or dismiss.</summary>
     public event EventHandler<MeetingSession>? MeetingDetected;
+
+    /// <summary>Raised when a possible meeting is withdrawn before it was confirmed.</summary>
     public event EventHandler<MeetingSession>? PendingMeetingCancelled;
+
+    /// <summary>Raised when the detected call ends while a recording is still running.</summary>
     public event EventHandler<MeetingSession>? MeetingEndedWhileRecording;
+
+    /// <summary>Raised for each final transcript segment.</summary>
     public event EventHandler<SessionTranscriptSegment>? TranscriptSegmentReceived;
+
+    /// <summary>Raised for each in-progress (partial) transcript update.</summary>
     public event EventHandler<SessionPartialTranscript>? PartialTranscriptReceived;
 
+    /// <summary>The latest pipeline status.</summary>
     public PipelineStatus Status { get { lock (_gate) return _status; } }
+
+    /// <summary>The current pipeline state.</summary>
     public PipelineState State => Status.State;
+
+    /// <summary>ID of the current recording session, or null when none (an audio preview is not a session).</summary>
     public string? CurrentSessionId { get { lock (_gate) return _preview ? null : _run?.Session.Id; } }
+
+    /// <summary>The current recording session, or null when none.</summary>
     public MeetingSession? CurrentSession { get { lock (_gate) return _preview ? null : _run?.Session; } }
+
+    /// <summary>True when a new recording can start: the pipeline is resting, not owned, not exiting, and has no pending topic-map save.</summary>
     public bool CanStart { get { lock (_gate) return !_disposed && !_preparingExit && !_owned &&
         _pendingVisualizationPath is null && IsResting(_status.State); } }
+
+    /// <summary>True while a recording is starting or running and can be stopped.</summary>
     public bool CanStop { get { lock (_gate) return _run is { Closed: false } && _status.State is PipelineState.Starting or PipelineState.Recording; } }
+
+    /// <summary>True while a save review is open, so the user can save or discard.</summary>
     public bool CanReviewSave { get { lock (_gate) return _saveReview is not null; } }
+
+    /// <summary>
+    /// True only when a failed recording left a durable partial transcript saved, with transcription
+    /// work still pending, so the app can be closed after the user confirms.
+    /// </summary>
     public bool CanForceCloseAfterSavedPartial
     {
         get
@@ -189,11 +227,22 @@ public sealed class MeetingPipeline : IAsyncDisposable
             }
         }
     }
+    /// <summary>True while a recording is in progress (not an audio preview).</summary>
     public bool IsRunning => State == PipelineState.Recording && !_preview;
+
+    /// <summary>Maps diarized speaker IDs to display names.</summary>
     public SpeakerResolver SpeakerResolver => _speakerResolver;
+
+    /// <summary>AI usage for the current session.</summary>
     public AiUsageMonitor AiUsage => _usage;
+
+    /// <summary>Recent AI diagnostic events for the current session.</summary>
     public AiDiagnosticsStream AiDiagnostics => _diagnostics;
+
+    /// <summary>Snapshot of the transcript of the current recording, or null when none.</summary>
     public TranscriptSnapshot? CurrentTranscript { get { lock (_gate) return _preview || _run is null ? null : Snapshot(_run); } }
+
+    /// <summary>Snapshot of the transcript of the most recent finished recording.</summary>
     public TranscriptSnapshot? LastCompletedTranscript { get { lock (_gate) return _lastCompleted; } }
     private static bool IsResting(PipelineState state) =>
         state is PipelineState.Idle or PipelineState.Saved or PipelineState.Discarded or PipelineState.Failed;
@@ -218,14 +267,17 @@ public sealed class MeetingPipeline : IAsyncDisposable
         RecordingStartFailures.Classify(error,
             _devices.SelectMany(device => device.Health).ToArray(), _transcription.Health, resourcesRetained);
 
+    /// <summary>Starts the meeting detector.</summary>
     public Task StartDetectorAsync(CancellationToken ct) => _detector.StartAsync(ct);
 
+    /// <summary>Stops the meeting detector and any operations the pipeline owns.</summary>
     public async Task StopDetectorAsync(CancellationToken ct)
     {
         await _detector.StopAsync(ct).ConfigureAwait(false);
         await StopOwnedOperationsAsync().ConfigureAwait(false);
     }
 
+    /// <summary>Dismisses a detected meeting that was not confirmed, and hides it for the cooldown period.</summary>
     public bool DismissPendingMeeting(string sessionId, TimeSpan cooldown)
     {
         var dismissed = _detector.Dismiss(sessionId, cooldown);
@@ -234,6 +286,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         return dismissed;
     }
 
+    /// <summary>Pauses meeting prompts for a while and cancels any pending prompt.</summary>
     public void SnoozeDetection(TimeSpan duration)
     {
         _detector.Snooze(duration);
@@ -242,11 +295,17 @@ public sealed class MeetingPipeline : IAsyncDisposable
         if (pending is not null) Publish(PendingMeetingCancelled, pending);
     }
 
+    /// <summary>Turns meeting prompts back on after a snooze or dismissal.</summary>
     public void ResumeDetection() => _detector.Resume();
 
+    /// <summary>Starts a recording chosen by the user, with the given title.</summary>
     public Task StartManualAsync(string title, CancellationToken ct) =>
         StartAsync(new MeetingSession { Title = title, SourceProcess = "manual" }, ct);
 
+    /// <summary>
+    /// Starts a recording linked to a calendar meeting. Throws <see cref="RecordingStartException"/>
+    /// if the meeting is not eligible.
+    /// </summary>
     public Task StartManualAsync(string title, MeetingTitleCandidate meeting, CancellationToken ct)
     {
         var session = new MeetingSession { Title = title, SourceProcess = "manual" };
@@ -255,6 +314,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         return StartAsync(session, ct);
     }
 
+    /// <summary>Confirms a detected meeting and starts recording it.</summary>
     public Task ConfirmAndStartAsync(MeetingSession session, CancellationToken ct) =>
         StartAsync(session, ct, confirmDetection: true);
 
@@ -328,8 +388,10 @@ public sealed class MeetingPipeline : IAsyncDisposable
         return await review.Decision.Task.ConfigureAwait(false);
     }
 
+    /// <summary>Saves the recording now during the save review. Returns false if no matching review is open.</summary>
     public bool SaveNow(string sessionId) => TryDecideSave(sessionId, SaveDecision.Save);
 
+    /// <summary>Discards the recording during the save review. Returns false if no matching review is open.</summary>
     public bool DiscardPendingRecording(string sessionId) =>
         TryDecideSave(sessionId, SaveDecision.Discard);
 
@@ -571,6 +633,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         return true;
     }
 
+    /// <summary>Stops the current recording. Returns a completed task when there is nothing to stop.</summary>
     public Task StopManualAsync()
     {
         lock (_gate)
@@ -948,6 +1011,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             $"The saved transcript contains only audio that was successfully received. {action}";
     }
 
+    /// <summary>Runs final note generation again for the last finished session. Only allowed when no recording or finalization is active.</summary>
     public Task<string> RetryIntelligenceAsync(string sessionId, CancellationToken ct)
     {
         lock (_gate)
@@ -986,6 +1050,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>Asks for a new topic-map analysis of the current transcript.</summary>
     public Task RefreshVisualizationAnalysisAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
@@ -1234,6 +1299,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         return notes;
     }
 
+    /// <summary>Starts audio capture without recording, so the user can check input levels.</summary>
     public Task StartAudioPreviewAsync(CancellationToken ct)
     {
         lock (_gate)
@@ -1280,6 +1346,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>Stops the audio preview.</summary>
     public Task StopAudioPreviewAsync(CancellationToken ct)
     {
         lock (_gate)
@@ -1568,6 +1635,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>Returns a short recap of the recent transcript for the "What did I miss?" button.</summary>
     public Task<string> WhatDidIMissAsync(string recentTranscript, CancellationToken ct) =>
         _intelligence.CatchUpAsync(recentTranscript, ct);
 
@@ -1630,6 +1698,10 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     }
 
+    /// <summary>
+    /// Prepares the app to close: cancels work in progress, makes the transcript durable, and
+    /// releases capture. The same task is returned if called again. See <see cref="ExitReadiness"/>.
+    /// </summary>
     public Task<ExitReadiness> PrepareForExitAsync()
     {
         lock (_gate)
@@ -1761,6 +1833,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
+    /// <summary>Stops the pipeline and releases its resources. Safe to call more than once.</summary>
     public ValueTask DisposeAsync()
     {
         lock (_gate)

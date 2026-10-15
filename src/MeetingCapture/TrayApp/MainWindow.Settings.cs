@@ -8,6 +8,7 @@ using Windows.Storage.Pickers;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Settings page part of the main window: settings editor state, Copilot model lists and AI diagnostics.</summary>
 public sealed partial class MainWindow
 {
     private CancellationTokenSource? _settingsEditorLifetime;

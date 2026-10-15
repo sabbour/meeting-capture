@@ -3,6 +3,7 @@ using MeetingCapture.Transcription;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>Reasons an AI call can fail. Used to choose the message shown to the user.</summary>
 public enum IntelligenceFailureKind
 {
     Configuration, Authentication, Authorization,
@@ -11,6 +12,7 @@ public enum IntelligenceFailureKind
     Disabled, SignedOut, Unknown
 }
 
+/// <summary>An <see cref="IntelligenceException"/> failure, with provider, model, and optional retry delay.</summary>
 public sealed record IntelligenceFailure(
     IntelligenceFailureKind Kind,
     string Provider,
@@ -18,6 +20,7 @@ public sealed record IntelligenceFailure(
     string Message,
     TimeSpan? RetryAfter = null);
 
+/// <summary>Exception for an AI failure. <see cref="Failure"/> holds the structured details.</summary>
 public sealed class IntelligenceException : Exception
 {
     public IntelligenceFailure Failure { get; }
@@ -52,6 +55,7 @@ public interface INotesIntelligence
         string recentTranscript,
         CancellationToken cancellationToken);
 
+    /// <summary>Same as <see cref="SummarizeRecentAsync"/> by default; implementations may override it with a longer recap.</summary>
     Task<string> CatchUpAsync(
         string recentTranscript,
         CancellationToken cancellationToken)

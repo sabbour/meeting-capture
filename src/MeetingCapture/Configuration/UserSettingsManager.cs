@@ -5,8 +5,10 @@ using System.Text.Json.Nodes;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.Json;
 
+/// <summary>The intelligence settings with a revision number that increases each time they are saved.</summary>
 public sealed record IntelligenceConfiguration(long Revision, IntelligenceSettings Settings);
 
+/// <summary>Raised after settings are saved: says whether intelligence changed and which sections need a restart.</summary>
 public sealed record SettingsSavedEventArgs(
     long IntelligenceRevision,
     bool IntelligenceChanged,

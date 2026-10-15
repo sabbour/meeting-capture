@@ -1,193 +1,94 @@
 # Meeting Capture
 
-A .NET 10 WinUI 3 Windows tray application for microphone/system-audio capture, Azure Speech transcription, live AI summaries and insights, and Markdown meeting notes. Inference uses the GitHub Copilot SDK with either GitHub Copilot or Azure BYOC. WorkIQ is the sole calendar connection; local recording does not require sign-in.
+Meeting Capture is a Windows tray app for taking notes during meetings. It captures microphone and system audio, sends the audio to Azure Speech for transcription, and can use GitHub Copilot or Azure AI to create live topic notes and a final summary. You can start a recording yourself or confirm a meeting suggestion; the app does not start recording automatically.
 
-## Requirements and build
+Work IQ is optional. When you sign in, the app can use your work calendar and related Microsoft 365 content to add context. You do not need to sign in to record or save a transcript.
 
-- Windows on ARM64 for the repository's default `win-arm64` build. The target framework is `net10.0-windows10.0.19041.0`; the project declares a minimum Windows build of 17763. The installed Windows App SDK and dependencies may impose additional OS requirements.
-- .NET 10 SDK for development (`global.json` selects 10.0.100 with `latestFeature` roll-forward).
-- Azure Speech endpoint/region and credentials for cloud transcription. The local NPU transcription path is not implemented.
-- A working Copilot SDK runtime and appropriate authentication for the selected inference provider. GitHub inference needs access to the selected Copilot models; Azure BYOC needs an endpoint, key, API version, and deployment names. Available models depend on the account/provider; this project does not choose a replacement model.
+## Requirements
 
-From the repository root, using PowerShell:
+- Windows 10 or later on ARM64 or x64. The project targets Windows 10 build 19041 and declares a minimum build of 17763; Windows App SDK requirements also apply.
+- An Azure Speech endpoint and key for transcription.
+- For AI notes, either a GitHub account with Copilot access and the GitHub CLI, or an Azure AI endpoint, key, and deployments. AI notes are optional.
+- A work account is needed only for optional Work IQ calendar and related-content features.
+
+## Install
+
+1. Open [GitHub Releases](https://github.com/sabbour/meeting-capture/releases/latest).
+2. Download the signed archive for your device: **ARM64** for Windows on ARM, or **x64** for Intel and AMD 64-bit Windows PCs.
+3. Unzip the archive, then run `MeetingCapture.exe`.
+
+The app runs as your Windows user and does not need an installer.
+
+## First-run setup
+
+Open **Settings** in the app to configure the services you want to use:
+
+1. **Transcription:** Enter your Azure Speech endpoint and key. The app uses Azure Speech for transcription. Audio capture and manual recording are available without a Work IQ sign-in, but transcription needs a working Speech service configuration.
+2. **Meeting notes:** Choose **GitHub Copilot** or **Azure AI**. For GitHub Copilot, install the GitHub CLI if needed and sign in on this PC with `gh auth login` using an account that has Copilot access. Then select and test separate models for live insights and final notes. For Azure AI, enter the endpoint, key, API version, and deployment names, then test each model.
+3. **Optional Work IQ:** Sign in with your work account to use calendar titles, attendee details, and related work content. Your organization may require consent.
+4. Save your settings. Restart the app when it says a setting needs a restart; changes to the AI provider and models apply to new requests.
+
+Both microphone and system audio are enabled by default. Check the audio settings before recording if you do not want to capture one of them.
+
+Settings that you save in the app are stored in `%APPDATA%\MeetingCapture\settings.user.json`. This file is not encrypted. Keep it private, especially if it contains service keys.
+
+## Notes and files
+
+By default, notes are saved under `Microsoft Scout\Meetings` in your Windows Documents folder. You can change the folder in **Settings**. Each saved meeting has a Markdown file with the notes and recognized transcript, plus a JSON file with the topic-map data when it is available. The app does not save a copy of the raw audio. Files remain until you remove them; the app does not apply a retention or deletion policy.
+
+## Privacy
+
+- Microphone and system audio are sent to Azure Speech for transcription. The app does not keep a raw audio backup.
+- Transcript text is sent to the selected GitHub Copilot or Azure AI service to create notes. Notes and transcript files are saved in the folder you configure.
+- Work IQ requests use your signed-in work account and are optional. Work IQ sign-in is not needed to record.
+- The app stores Work IQ sign-in data in a Windows-protected local cache. Service keys saved through Settings are stored in the user settings file described above.
+- The Copilot runtime may keep its own session history. The app does not promise zero retention by an external service.
+
+Read the [architecture guide](docs/ARCHITECTURE.md) for more about the components and data flow.
+
+## Build from source
+
+Build on Windows with the .NET 10 SDK. The default build targets ARM64:
 
 ```powershell
-Copy-Item src\MeetingCapture\appsettings.template.json src\MeetingCapture\appsettings.json
 dotnet build src\MeetingCapture\MeetingCapture.csproj -c Release
 ```
 
-Edit the copied, gitignored configuration before running. Keep `appsettings.json` local;
-only the placeholder template belongs in git. Builds also work when only the template exists,
-but you must supply your own settings before using transcription or AI. The default executable is:
+To build for an x64 PC:
 
-```text
-src\MeetingCapture\bin\Release\net10.0-windows10.0.19041.0\win-arm64\MeetingCapture.exe
+```powershell
+dotnet build src\MeetingCapture\MeetingCapture.csproj -c Release -r win-x64
 ```
 
-The project is unpackaged and self-contained, including .NET and Windows App SDK. Do not assume an x64 output exists without explicitly building and validating that RID. Open the application from its tray icon; closing/hiding its window does not by itself mean recording has stopped.
+`src\MeetingCapture\appsettings.template.json` lists the available settings and uses placeholders for credentials and endpoints. The app does not load that template automatically. For development, configure the app in Settings or use local configuration, user secrets, or environment variables. Do not commit `appsettings.json`, service keys, or meeting files.
 
-GitHub Actions runs the full offline regression suite and publishes unsigned Release builds for `win-arm64` and `win-x64` on pushes and pull requests to `master`, or when started manually. CI builds include the matching Copilot CLI and the settings template, not local settings or credentials. Signed releases are made locally with Trusted Signing; CI does not sign builds or use signing secrets.
+## Run the regression tests
 
-The tray window opens at a DPI-scaled 600 x 900 logical-pixel default when the monitor work area allows it. It is natively resizable, remains inside the active monitor work area, and preserves the user's current size when hidden and reopened from the tray.
-The executable declares Per-Monitor V2 DPI awareness so Windows renders text and icons at the monitor's native scale rather than stretching a 96-DPI window. It runs with the current user's permissions and requires no elevation.
+The regression project is a Windows console test suite. Restore its dependencies, then run it from the repository root:
 
-### Startup and window-response logs
+```powershell
+dotnet restore tests\MeetingCapture.Regression\MeetingCapture.Regression.csproj --source https://api.nuget.org/v3/index.json
+dotnet run --project tests\MeetingCapture.Regression\MeetingCapture.Regression.csproj -c Release --no-restore
+```
 
-The app automatically writes diagnostic logs to `%LOCALAPPDATA%\MeetingCapture\Diagnostics`. Each line is a JSON record. No setting enables these logs. The active file is `responsiveness.jsonl`. The two previous files are `responsiveness.1.jsonl` and `responsiveness.2.jsonl`. Each file has a 1 MiB limit. Each launch starts a new active file.
+The suite uses synthetic audio and service responses, so it does not need a microphone or cloud credentials.
 
-The logs contain UTC timestamps, elapsed times from a monotonic clock, process ID, native UI thread ID, build version, and build ID. Named phases measure settings reads, the notes-directory check, service creation, initial view loading, tray creation, and window position, show, activation, foreground, and hide calls. Separate phases measure the WorkIQ restoration wait, its actual worker, cache access, authentication, connection, and calendar requests. `PhaseEnd` means that execution left the phase, not that the operation succeeded.
+## Project layout
 
-A background monitor requests one UI response at a time, once per second. Separate, fixed background threads run the monitor, UI request, and log writer. These threads do not use the app's shared background workers. A blocked UI request cannot stop the monitor. After five seconds, `UiProbePostDelayed` identifies a request that has not returned. `UiProbePostResumed` records when that request returns. After an accepted request waits five seconds for its UI response, the monitor records a UI stall. Continued delays produce records every ten seconds. Recovery records use the actual response time. Healthy responses produce a checkpoint every thirty seconds. A delayed monitor does not count a prompt UI response as a stall.
-
-Each record includes the active UI phase and the last completed UI and background phases. Response records also show request state, start and return times, request duration, and the interval between monitor checks. These values distinguish a blocked request from a delayed monitor. Available window, capture, and WorkIQ states are last-known values, not live reads during a stall. Background phases never replace the active UI phase. File writes, file rotation, and flushes run outside the UI thread. The queue holds at most 128 records. `droppedEvents` reports records lost during overload or a file error. File errors report only the exception type through the existing application logger. The writer retries without stopping the response monitor. Exit does not wait for any diagnostic thread, so final records can be absent.
-
-These files exclude meeting content, titles, participant and account details, tokens, request payloads, and recording paths. They are separate from the in-memory **AI diagnostics** stream. Sensitive-content capture does not change these files.
-
-After a freeze, preserve all three files before further launches can replace older records. Record the local freeze time and whether the window eventually responded. A process restart or a forced exit can leave an incomplete final line.
-
-These logs show whether the UI response callback was delayed and which measured app call remained active. They do not identify a blocked Windows graphics-cache file, driver fault, or file-filter cause. A healthy launch does not prove that the intermittent freeze is fixed. The response monitor starts after Windows provides the UI dispatcher. Earlier native startup waits have phase timing but no UI response probe.
+| Path | Contents |
+|---|---|
+| `src\MeetingCapture\` | WinUI 3 tray application |
+| `src\MeetingCapture\AudioCapture\` | Microphone, system-audio, and audio-mixing code |
+| `src\MeetingCapture\MeetingDetection\` | Meeting-activity suggestions |
+| `src\MeetingCapture\Transcription\` | Azure Speech streaming transcription |
+| `src\MeetingCapture\Pipeline\` | Recording, transcription, and save lifecycle |
+| `src\MeetingCapture\Intelligence\` | Copilot/Azure AI requests and live meeting notes |
+| `src\MeetingCapture\WorkIq\` | Optional work-calendar and related-content access |
+| `src\MeetingCapture\Storage\` | Markdown notes and topic-map files |
+| `src\MeetingCapture\TrayApp\` | Main window, tray menu, and presentation code |
+| `tests\MeetingCapture.Regression\` | Offline regression tests |
+| `docs\ARCHITECTURE.md` | Component overview and data-flow diagram |
 
 ## License
 
-Meeting Capture is licensed under the [MIT License](LICENSE).
-See [third-party notices](THIRD-PARTY-NOTICES.md) for dependency credits and separate license terms.
-
-## Configuration
-
-`src\MeetingCapture\appsettings.template.json` is the committed schema example. There is no runtime `Intelligence:Deployment` setting: use the separate synthesis and intelligence fields below.
-
-| Setting | Meaning |
-|---|---|
-| `Transcription:Provider` | `azure`; local `npu` is not implemented |
-| `Transcription:Endpoint`, `Region`, `Language` | Speech endpoint, optional explicit region, language (`en-US` by default) |
-| `Transcription:ApiKey` | Speech credential |
-| `Intelligence:Provider` | `azure` or `github` |
-| `Intelligence:Endpoint`, `ApiKey`, `ApiVersion` | Shared Azure inference connection settings |
-| `Intelligence:SynthesisDeployment` | Azure deployment for final structured notes |
-| `Intelligence:IntelligenceDeployment` | Azure deployment for live summary, questions, and decisions |
-| `Intelligence:SynthesisModel` | Explicit GitHub model for final notes |
-| `Intelligence:IntelligenceModel` | Explicit GitHub model for live insights |
-| `Storage:NotesPath` | Markdown destination; defaults to `Documents\Microsoft Scout\Meetings`, not automatically OneDrive |
-| `Audio:CaptureMicrophone`, `CaptureLoopback`, `DualCapture` | Select microphone, system audio, or both; defaults are `true` |
-| `Audio:SampleRate`, `Channels` | Speech PCM format: 16000 Hz mono |
-| `MeetingDetection:KnownMeetingProcesses` | Processes eligible for a recording confirmation prompt |
-| `MeetingDetection:PollIntervalSeconds` | Detection polling interval; default 10 seconds |
-
-The configuration precedence, lowest to highest, is the executable's optional `appsettings.json`, `%APPDATA%\MeetingCapture\settings.user.json`, .NET user secrets, then environment variables. Hierarchical environment names use double underscores, such as `Intelligence__IntelligenceModel`. `AZURE_SPEECH_KEY` is a fallback Speech key; `AZURE_FOUNDRY_KEY` (then `AZURE_OPENAI_API_KEY`) is a fallback intelligence key when `Intelligence:ApiKey` is empty.
-
-Prefer user secrets or protected environment configuration over committing credentials:
-
-```powershell
-dotnet user-secrets set "Transcription:ApiKey" "<speech-key>" --project src\MeetingCapture
-dotnet user-secrets set "Intelligence:ApiKey" "<inference-key>" --project src\MeetingCapture
-```
-
-User secrets and the settings file are local configuration, **not encrypted secret vaults**. Typing a new key into Settings persists it to `settings.user.json`; leaving a password field blank preserves the existing key. Never share those files or transcripts. AI Diagnostics shows redacted request metadata by default; its separate sensitive-content capture is session-only, explicitly warns that payloads may contain private meeting or Microsoft 365 content, never persists payloads, and removes them immediately when disabled or when the app exits.
-
-### Saving and testing settings
-
-Intelligence and synthesis changes hot-apply to **new requests**. A request already running retains its original settings snapshot. For GitHub Copilot, Settings asynchronously loads the models available to the signed-in account and presents the friendly name with the exact model ID; **Refresh models** bypasses the cached catalog. A configured model that is absent or cannot be fetched remains selected with an explicit status instead of being silently replaced. Azure BYOC continues to use deployment-name text fields because Copilot account models are not Azure deployments. Test synthesis and live intelligence separately; a successful test of one does not validate the other. Testing sends a minimal `Reply OK` request to the selected service, not a transcript. Empty output, malformed output, authentication failures, and unavailable models are failures, not a passed connection test.
-
-The effective snapshot respects higher-priority configuration. A user-secret or environment override can keep a value active despite a different value saved by the dialog. Test actions with a blank key reuse the effective credential. No model is selected silently when a model/deployment field is blank.
-
-The **AI diagnostics** Settings section presents a bounded in-memory timeline of AI and WorkIQ activity with time, capability, provider/model, status, duration, request identifiers, reported usage, retry information, and quota snapshots. Event metadata remains available without enabling payload capture. Expanded raw prompt, request, and response fields are selectable monospaced text only after the session-only sensitive-content toggle is explicitly enabled; disabling it wipes captured payloads while retaining metadata. **Clear events** clears the active stream and rejects late events from cleared requests. Secrets and authorization headers are scrubbed by the diagnostics stream and diagnostic content is never written to settings, notes, files, or application logs.
-
-Audio, transcription, storage, and detection settings require an application restart. The settings-save result identifies sections that differ from startup; saving does not recreate capture or storage services during a recording. A save/reload failure is reported explicitly rather than claiming the new settings are active.
-
-### WorkIQ calendar sign-in
-
-Choose **Settings > Sign in to WorkIQ** in the app. No user-supplied Graph application registration is required for this route. The hosted MCP endpoint is `https://workiq.svc.cloud.microsoft/mcp`, using its official public MCP-host client (`ba081686-5d24-4bc6-a0d6-d034ecffed87`), organizational account selection, and MSAL's system-browser PKCE flow with `http://localhost` and a dynamically selected loopback port. Account access and tenant/admin consent still apply. An external session probe or Scout sign-in does not sign this app in.
-
-Sign-in has a 90-second limit and a **Cancel** action in both idle and recording views. Token acquisition, authenticated MCP initialization, and discovery of the supported `fetch(entityUrls)` tool first establish authentication. The primary WorkIQ status then shows **connecting calendar**, followed by **connected** with the calendar-event count and last successful refresh, or an explicit calendar failure. Authentication alone never means end-to-end connected. This verification also runs asynchronously when signing in during a recording; capture stays available throughout. Background refresh and startup restoration never open a browser.
-
-Both views show **Sign in** only when signed out and no authentication operation is pending, **Cancel** during sign-in/restoration, and **Sign out** after authentication. Calendar failures remain visible without showing a redundant sign-in button for an authenticated account; use Refresh calendar to retry, or sign out to change accounts. Expired authentication returns to the signed-out state. Late cancellation and stale authentication notifications cannot replace a newer connected state.
-
-Restoration starts after the initial view loads. Its separate 30-second UI wait limit applies even if cached-account loading or native authentication work ignores cancellation. After timeout, recording remains available. Authentication stays busy until the worker finishes, so another sign-in cannot overlap unfinished restoration. Late results cannot authenticate the app. A timeout does not sign you out or clear existing credentials.
-
-Refreshing does not mark a previously verified connection as disconnected. Any retained rows are explicitly labelled **previously loaded**, potentially outdated, until refresh completes. The UI wait has its own 30-second cancellation bound; success, failure, timeout, cancellation, and sign-out leave the refreshing state. A failed refresh hides the old list and retains the last successful refresh time in the error status.
-
-The app stores only its own MSAL token cache at `%LOCALAPPDATA%\MeetingCapture\workiq.msal.bin`, protected with Windows DPAPI for the current Windows user. Tokens are never placed in settings, logs, prompts, or repository files. Silent refresh uses this cache; **Sign out** clears it and invalidates in-flight results. This does not sign you out of your browser or other Microsoft apps. A cache failure is explicit; no plaintext fallback is used.
-
-WorkIQ is the only calendar route. There is no Graph sign-in, calendar-provider selector, or required user app registration. Old Graph configuration is not used by the app; existing settings files are left intact. Calendar authorization failures never trigger a fallback. Related-topic lookups use the same WorkIQ sign-in to search email, Teams, meetings, and documents; there is no separate Graph sign-in.
-
-Metadata uses a bounded, read-only `fetch` of today's `/me/calendarView`, selecting subject, start/end, online-meeting flags/provider/link, organizer state, organizer, attendees, cancellation, and all-day flags. Restore and metadata each have a 30-second end-to-end budget including queue wait; streamed MCP reads also have a deadline. A next-page link or a full 100-item page is treated as incomplete, not a unique title match. Empty, signed-out, denied, unsupported, incomplete, malformed, and timeout outcomes are distinct. Calendar and invite-roster data stay in memory except the title the user accepts into recording/notes.
-
-The scrollable **Around now** group uses the selected window: meetings starting from one hour ago through one hour from now, including both boundaries, plus longer meetings still in progress. Active meetings come first; other nearby starts are chronological. **Rest of today** keeps every later meeting accessible, and **Earlier today** holds older ended meetings. Groups never duplicate meetings or impose a five-row cap. Rows show scheduled state/time and expose the complete subject in a tooltip. Personal blockers, resource-only events, events without usable attendee metadata, cancelled/all-day events, and invalid durations are excluded. Cached groups follow the clock once per minute without another network call. An incomplete WorkIQ response remains an explicit error, not a claim that the full day was loaded.
-
-Account controls, audio preview, and detection preferences live in **Settings**. Audio counters are available under **Audio > Diagnostics**, not on the home screen. After recording, **Back to meetings** returns to the calendar without deleting the saved transcript; **New recording** starts another session. Empty recordings show that no speech was recognized rather than remaining in a listening state.
-
-The completed recording keeps **New recording** visible. If cleanup or another operation still blocks capture, the disabled button shows the reason. A new recording uses a separate session and transcript. Previously saved notes stay unchanged, and WorkIQ sign-in is not required.
-
-The recording view scrolls its content separately from **Stop**, **Catch me up**, **New recording**, and the save controls. Stop and Catch me up use separate full-width rows in the fixed footer, outside both the scrollable recording body and the adjacent Topic map/Meeting notes panel, so expansion cannot cover or crowd them.
-
-**Live validation boundary:** on 2026-09-23, silent authentication completed authenticated MCP verification and sanitized raw-response comparison of projected, expanded, and unprojected calendar fetches. WorkIQ honored `$select` and returned Teams provider, `isOnlineMeeting`, `onlineMeeting.joinUrl`, organizer, and attendee fields. Expanded body/location fields contained no additional Teams links beyond `onlineMeeting.joinUrl`. The production parser accepted the live envelope and found one eligible unique Teams match in the checked overlap window. This validates request and parsing shape, not that microphone activity proves the user joined that meeting or that every tenant/event exposes identical metadata.
-
-### Related content and speaker names
-
-Work IQ searches related email, past meetings, Teams direct/group/channel messages, and OneDrive/SharePoint documents for each accepted topic while recording. When Work IQ retrieval declines a request, Microsoft 365 keyword search is used through the same connection. Search results show accessible content, not proof that you attended or took part; participation is labelled only when source metadata proves it. Failure in one source family does not hide results from the others. Email results keep the first message per conversation when a conversation ID is available. Searches run one at a time without dropping topics that arrive while another search is running, and results stay under the topic they belong to. Signing in retries existing topics, starting with the current topic. Meeting notes provides a **Sign in to Work IQ** button when signed out. Failed searches show the known reason without treating every failure as a connection problem; `Diagnostics\related.log` records only error type, HTTP status, endpoint name, and sign-in state, not meeting text or tokens. The attached meeting invite roster is available in the searchable speaker picker, alongside **(You)** and manual name entry. This is user-directed labeling only: roster order, microphone activity, and Speech speaker IDs do not establish identity. Legacy Graph service/parser source remains unregistered; the running app does not construct it.
-
-## Recording and saved output
-
-Start manually or confirm a possible meeting. Suggestions require a known app's process identity **and at least 20 seconds of sampled, active Windows microphone-capture session state**. An open Teams process or render-only notification/media sound is not enough. Default eligible apps include Teams, Zoom, Webex, and Skype for Business (`lync`), **not Outlook or Slack**; existing explicit process overrides remain unchanged. Detection can be dismissed or snoozed.
-
-This is a conservative activity heuristic, not a Teams presence/call API: pre-join microphone tests can qualify, and muted/listen-only calls, browser/child-process audio, exclusive/protected audio paths, or unavailable session attribution can be missed. No Teams scraping, window-title inference, microphone opening, or audio-sample inspection is used for detection. Manual recording remains available. Unconfirmed suggestions tolerate 30 seconds of signal loss; confirmed recordings do **not** stop just because a microphone stream closes on mute. Stop them explicitly (process exit still ends the pinned detection). After completion, continuing activity is suppressed until the signal resets, allowing another call in the same app process without repeating the same suggestion.
-
-Prompts, tray actions, and the notification show the calendar subject when WorkIQ finds exactly one eligible matching meeting: currently in progress or starting within five minutes, with matching online-meeting provider or HTTPS join-link platform and evidence of another human invitee. Otherwise the prompt simply asks which meeting to take notes for; provider diagnostics stay out of the main prompt. Calendar presence and Teams microphone activity remain heuristics, not evidence that you joined a specific meeting. The accepted title and in-memory invite roster stay with the session.
-
-Detection enrichment runs asynchronously with an eight-second cancellation budget and never initiates sign-in. Dismissal, confirmation, replacement, auth changes, and process exit reject delayed updates; enrichment does not restart the prompt timeout or repeat the notification. Without usable metadata the title is an honest microphone-activity label with "meeting name unavailable." Starting recording before enrichment finishes freezes the fallback title rather than accepting a stale result.
-
-WorkIQ opens the system browser only after you choose **Sign in**. Recording, stopping, transcript capture, and settings remain available without sign-in. Late cancelled results cannot sign the app in; if browser cleanup is still pending, another sign-in waits for cleanup. Closing a browser tab alone may not complete its localhost callback, so use the in-app cancel action.
-
-The one-second health check updates WorkIQ controls only when their visible state changes. Sign-in, cancellation, restore, and calendar messages still update when their state changes.
-
-Microphone and loopback capture use NAudio WASAPI, and transcription uses Azure Speech. This is not per-application audio isolation or a guaranteed echo-cancellation system. AI failures do not imply that audio/transcription failed.
-
-For device rates that are exact multiples of 16 kHz, conversion uses 20 ms reads. Smaller reads reduce temporary memory use. Other rates keep their previous read size because changing it can change the converted samples.
-
-The recording workspace puts **Current topic** first, followed by **Questions** and **Actions** in one discoverable row, speaker activity, and the live transcript, with Stop and **Catch me up** in a fixed footer. Topic summaries use readable normal-weight body text rather than oversized headline treatment; topic, checklists, and transcript use distinct theme-aware surfaces and labels. Questions and Actions sit in their own layout row outside the title/topic ScrollViewer, so their complete wrapping headers remain reachable even when the topic or transcription notice scrolls. Questions and actions start collapsed and keep the user's explicit expand/collapse choices. Checking an item keeps it visible with a strikethrough, updates separate open/done counts, and can be undone by unchecking it. Completed items remain part of the session's retained set, so a later AI refresh does not silently reopen an identical item. A successful empty panel compacts to its counted header instead of retaining an empty body. On resize or expansion, checklist content retains its own bounded scrolling while the layout reserves a usable transcript viewport and reduces only the title/topic region as needed. Live transcript rows update incrementally: repeated partial text mutates one provisional row, finalization keeps that row identity, unchanged snapshots retain existing rows and avatars, and corrections update in place. Manual scrollback remains paused until **Latest** is selected; automatic scrolling occurs only while following current output. **Catch me up** opens its own labelled result panel over the recording workspace instead of overwriting the one-line **Current topic** card. It summarizes the last ten minutes of recognized speech (bounded to the most recent segments) as a short grounded recap, and adds bounded sections for earlier points, decisions, unresolved questions, and actions drawn from the same session document the visualizations use, plus related sources when grounding is available. Its progress, error, retry, and result all appear inside that panel, which keeps a single scrolling region and leaves Stop reachable. Topics reuse the periodic intelligence refresh; the last successful topic remains readable while an update is in progress, with explicit updating/error state. These manual checklist states do not rewrite the independently synthesized final notes.
-
-The header pin keeps the panel visible above ordinary windows using the native always-on-top presenter state and suppresses focus-loss auto-hide. While capture is starting or recording, focus loss does not hide the panel even when unpinned; clicking X still hides it to the tray without stopping capture. Outside active capture, unpinning restores normal window stacking and focus-loss auto-hide.
-
-The recording header includes a compact, non-animated AI activity indicator with the active capability and elapsed time only while work is running. The **Meeting context** flyout stays a compact meeting aid: related suggestions, a bounded participant preview, and an AI activity details status with a link to **Settings > AI diagnostics**. That status shows live total, input, and output token counts when reported; partial or unavailable values are explicitly labelled **Partial** or **Not reported**, never inferred as zero. Cumulative session call counts by capability and the exact provider-reported input tokens, output tokens, cached-read tokens, cached-write tokens, reasoning tokens, provider cost, Total Nano AIUs, and quota snapshots remain in AI diagnostics. When Total Nano AIUs are reported, the diagnostics timeline shows the raw count with its explicit equivalent of **1 AIC = 1,000,000,000 (one billion) nano-AIUs** and **1 AIC = $0.01 USD**. The AIC USD equivalent is not provider cost. Provider cost remains the independently reported SDK value and is never substituted with that AIC equivalent.
-
-The flyout's **Participants** section shows at most five initial chips plus a `+N` count, never a full list. Verified joined participants and scheduled invitees stay visibly separate: invitees are labelled as unverified and their complete list appears only behind an explicit, collapsed-by-default expansion. **Refresh roster** runs a fresh accessibility probe of the joined call on every press, shows a checking state, and then updates both the outcome and a second-precision last-checked time even when the roster is still unavailable, so a repeated attempt is visibly distinct. When Teams requires its Participants pane to be open, the flyout says so and asks for another refresh; invitees are never promoted into the verified roster.
-
-Calculated cost uses only this explicit formula: `input_rate × input_tokens + cached_rate × cached_tokens + output_rate × output_tokens + reasoning_rate × reasoning_tokens`. It appears only when every applicable token count and its rate is explicitly reported, with a component breakdown; otherwise it is **Not reported**. The installed SDK usage event reports the input, output, cache-read, cache-write, and reasoning token counts plus independently reported provider cost. Its model metadata offers input/cache/output price fields and a batch-size field, but does not supply a reasoning rate or a documented normalized price unit; the current model catalog intentionally exposes only model ID/name. Therefore, the app does not calculate a token-based cost or treat omitted cache/reasoning values as zero. Every unavailable metric says **Not reported**; the app never substitutes zero, estimates a value, or derives one metric from another. Quota rows retain the provider quota ID, request units, remaining percentage, and reset time when reported. Meaningful active, idle, unavailable, rate-limited, and failed transitions are announced without repeating elapsed-time updates. The flyout also keeps WorkIQ suggestions and participant information out of the transcript layout. **Related suggestions** are explicitly identified as suggestions rather than verified meeting facts and use compact source rows with a concise title, source type, actual date or **Date unavailable**, and a validated HTTPS external-open action. Unique detail remains available without repeating generic retrieval boilerplate. Context retrieval and verified live-roster refreshes have separate controls, statuses, loading states, and announcements. Earlier-topic suggestions disclose that they may be stale for the current discussion. The same flyout keeps verified live participants separate from scheduled calendar invitees, shows roster source, observation time, and partial-coverage limitations, and never assigns speakers or photos from roster order or name-only matches.
-
-The optional meeting visualization is a **Topic map** beside **Meeting notes**, both projected from one shared meeting document. The map uses multiple columns as space grows, with the map and notes filling the full width (three-to-two by default, adjustable by dragging or using the arrow keys on the divider between them) and stacked panels in narrow windows. Each topic can be collapsed from either panel; both panels keep that choice across updates, remove the hidden details from the layout, and retain its heading and current-topic marker. Meeting notes lists accepted topics in first-discussion order, each with up to two concise, transcript-grounded speaker bullets; it updates as analysis arrives and is included in saved Markdown. Related Work IQ suggestions appear under their matching topic with a clear “not from this meeting” disclosure, separate from meeting evidence. Each title is a clickable link with an inline source icon and an accessible source label. Repeated links (or repeated titles of the same source type when no usable link exists) appear once within each topic, while useful associations with other topics are retained. Up to five suggestions are shown, with a mix of source types before remaining slots are filled by search order. If Work IQ is signed out, declines the request, cannot be reached, or sends a reply the app cannot read, one concise availability message appears for the meeting instead of per-topic failure chips. The scrollable topic map centers the meeting title and branches to accepted topics, with key points, decisions, open questions, and actions as clickable leaves. Leaf surfaces are slightly lighter than topic surfaces to reinforce hierarchy, and the live topic is marked **Now** with a restrained static accent glow. Selecting a topic or leaf scrolls meeting notes to and highlights the matching heading; selecting the root returns notes to the top. **Go to current topic** selects and reveals the live topic when another topic is selected. Opening the surface makes no additional Copilot or Work IQ request; suggestions reuse existing related-context results. **Expand** gives the side pane the available work-area width while retaining a usable recording workspace and essential controls; **Restore** returns to prior bounds without losing the selected topic. Stable IDs preserve evidence association and speaker-name corrections without rewriting canonical transcript text or source quotations. Transcript rows keep stable objects while aligning avatar, renameable speaker name, real timestamps, and wrapping speech content into a consistent reading rhythm. Exact topic aliases can merge automatically; semantic reassignment requires a validated existing topic ID. Chronological proximity is not treated as an explained topic link, and related context remains a suggestion rather than automatic support or contradiction evidence.
-
-Each newly started recording shows a dismissible **Transcription is on** reminder. **Copy message** copies a notice for the user to share in the meeting chat; the app does not post it or claim other participants have been notified. Dismissing this reminder does not stop transcription, and the recording indicator remains visible. The reminder closes when recording stops.
-
-Speaker labels and the per-speaker timeline use finalized recognized speech, independently of AI; unresolved labels stay anonymous until the user chooses an invite attendee or types a name. Each speaker row shows a bar over the shared meeting time axis: a light track for the full meeting with a coloured segment wherever that speaker was talking (a line only carries the time it finished, so segment lengths are estimated from its word count). **Combine speakers** merges two or more speakers into one chosen name, moving their transcript lines, timeline segments and talk time to it; the merge is also written to the saved Markdown topic notes and companion visualization data, so the saved meeting shows the merged result. Interim captions are explicitly **provisional** and do not add finalized words or speaker counts. With no recognized speech, one waiting state is shown. Pagination appears only beyond the 500-row viewport; paused scrollback offers Latest without unnecessary page controls.
-
-ConversationTranscriber requests intermediate diarization so provisional captions can carry SDK speaker IDs before final results. IDs can still be unknown, merged, split, or revised; Azure Speech may not separate every person. Mixed microphone/system audio and recent microphone activity are not voice identity, so the app never auto-assigns a speaker from those signals. This setting does not establish why a session has no final recognized speech and is not a substitute for live Speech SDK/device validation.
-
-Microphone and system audio are mixed into one 20 ms PCM output stream instead of appending the two sources sequentially. Per-source buffers are bounded, missing samples become silence, and a frame limiter prevents clipping. Simultaneous audio therefore does not double the transcription timeline. This corrects the audio supplied to Speech; it does not guarantee separate speaker IDs or identify participants.
-
-The mixing clock starts before the devices, and mixer byte counts measure emitted mono audio rather than the sum of source inputs. At 16 kHz/16-bit mono, one second is approximately 32,000 bytes. If a Speech audio write fails or takes more than five seconds, capture stops and the recognized transcript is saved as incomplete. Normal Stop drains accepted audio before Speech finalization; a stalled final flush also has a five-second deadline. The app does not keep an audio backup, so audio that did not reach transcription cannot be recovered. If a native Speech operation remains active after the partial transcript is saved, Meeting Capture keeps that session owned and blocks new recordings. Exit then offers an explicit **Close app** confirmation; confirming closes the process without disposing or reusing the active SDK session, while **Keep app open** cancels the close. The confirmation is not offered until capture has stopped and the transcript is durably saved. Service timeouts distinguish reported service inactivity from other response timeouts without logging raw SDK error details. No automatic reconnect silently resets speaker labels.
-
-Confirmed speaker names are reused for that speaker ID during the current recording, and combined speakers keep resolving to the speaker they were merged into. A new recording clears these mappings: `Guest-1` is not a persistent person identifier across recordings.
-
-AI requests use a dedicated meeting-analysis system prompt and serialize the transcript and title as untrusted source data, with tools and repository context disabled. Spoken questions are reported as meeting content, not answered by the assistant.
-
-Account, calendar, audio, transcription, AI, storage, diagnostics, and meeting-suggestion settings share one scrollable **Settings** page in the main window; tray, home, and recording entry points all open that page instead of a separate dialog. Back, Save/Cancel, and **Stop recording** remain outside the settings scroll content. Provider-specific fields stack vertically for compact windows, blank password fields preserve existing keys, and model tests keep independent synthesis and live-intelligence results. Pending sign-in retains an immediately reachable Cancel action in the recording header area, and auth/capture errors remain actionable. Speaker naming appears inline beside speaker activity with the targeted speaker shown explicitly, attendee search or direct name entry, and clear **Apply name** and **Cancel** actions. Transcript rows show a compact circular speaker picture: an explicitly selected WorkIQ participant can use their authorized profile photo, while unavailable photos and manually typed names use initials; unresolved diarization IDs use a neutral unknown avatar and are never matched by name or speaker order. Saved-output actions appear only when relevant after recording. Summary retry requires finalized speech and an actual summary failure; catch-up is unavailable before finalized speech. Stopping with only provisional captions does not turn them into saved transcript content.
-
-While recording, Settings also retains a **Stop recording** button outside its scrollable content.
-
-After capture and final speech flushing finish, the recording view shows the actual five-second automatic-save countdown with **Discard** and **Save now** actions. Discard permanently clears that pending transcript and its recording UI; doing nothing preserves the default automatic save. The decision controls remain fixed outside scrollable content and stopping from Settings returns to this review state.
-
-After Stop releases audio devices and flushes final recognized speech, a five-second review window allows the unsaved recording to be saved immediately or discarded; doing nothing saves automatically. Discard wins only before persistence begins and removes only that unsaved in-memory session, not historical files or live insight requests already made while recording. Exit defaults to preserving the finalized transcript. After the decision, finalization saves the full transcript independently of AI generation. Structured notes include a summary, participants, topics, decisions, action items, open questions, quotes, and follow-ups. Markdown also includes the topic-ordered Meeting Notes section, session identity, an explicit AI outcome, and the raw transcript. Failed AI can be retried from the preserved completed-session transcript while that session remains available in the running app.
-
-Tray **Exit** shows shutdown progress and rejects new capture or retry work. It cancels optional AI work before waiting for capture/transcription to stop and the transcript to be saved; repeated Exit requests join the same shutdown. An earlier failed save is retried rather than ignored. If saving fails or the capture device remains active, the app stays open with an explicit recovery error. If only a Speech SDK operation remains active after a partial transcript is durably saved, Exit asks before closing the whole process without disposing that still-owned SDK session; canceling leaves the app open and blocks new recordings until the operation settles. Only background cleanup after the normal durability check has a five-second deadline; it cannot abandon an unsaved transcript. Tray actions use dispatcher-routed commands for the native popup menu.
-
-New sessions use `YYYY-MM-DD_HH-mm_<meeting-title-or-grounded-opening-speech>_<session-hash>.md` under `NotesPath`. For example, `2026-01-02_12-34_Quarterly planning_<hash>.md`; a manual recording with no recognized speech uses the neutral `Recording` label. Names are Windows-safe and length-bounded. The stable session hash prevents same-title/time collisions and lets transcript-first saves, AI updates, and retries atomically replace the same file. Existing `session_<hash>.md` files remain at their historical paths and are updated in place rather than renamed. Failed writes are errors; a previously saved file is not truncated. The output directory can be set to a synced folder, but OneDrive synchronization is managed externally.
-
-Each saved Markdown transcript also has a versioned companion `.json` with the same basename. It contains the visualization document, save time, and a SHA-256 digest of the exact Markdown bytes. Markdown is published first and is the finalization success boundary; if the JSON write fails, the notes remain saved and the status reports the sidecar as pending. Exit retries it and journals any remaining failure for the next launch; a required Markdown-save or capture-cleanup failure remains explicit and failed. Use the header’s native file picker to select a completed `.md` file; the app derives and validates its companion JSON and opens valid visualization data as a separate read-only projection. Opening is blocked while a recording or save decision is active and rechecked after both the picker and file load return. Missing JSON opens the legacy Markdown notes normally and reports that no visualization is available; corrupt, newer-schema, or digest-mismatched JSON is warned and is not loaded, migrated, or silently overwritten. Offline opening and view switching make no model or WorkIQ call and never replace the live visualization singleton.
-
-No application crash-recovery cache, automatic retention/deletion policy, or restart-time transcript import is introduced. Markdown output remains until you remove it. The Copilot runtime can retain its own session history; disposing an SDK session does not delete that history. Session telemetry, tool access, configuration discovery, custom instructions, and infinite-session workspaces are disabled for note-generation sessions, but that is not a zero-retention guarantee from the SDK or cloud provider. Restrict access to local runtime data and the notes folder, and configure cloud synchronization deliberately; files contain meeting content and participant information. Full transcript durability at stop is not a claim of crash protection during recording.
-
-## Validation boundaries
-
-The improvement plan defines separate offline regression and Windows hardware checks. Pure tests cannot establish UI latency, actual device shutdown, cloud model availability, long-meeting memory behavior, or Speech/WorkIQ access. Those require explicit validation on representative Windows hardware and configured accounts. No measured performance or universal model-availability claim is implied by these features.
-
-Native visual-fidelity acceptance compares the deployed app with Windows surfaces such as People and Calendar on the same monitor, DPI, theme, and text-scaling settings. The check covers actual text and SymbolThemeFontFamily icon rendering, native-control polish, spacing, contrast, and focus states. Black padding, resampling, or apparent scale differences introduced by `PrintWindow` capture are capture artifacts and are not by themselves evidence of low-resolution application rendering.
+Meeting Capture is licensed under the [MIT License](LICENSE). See [third-party notices](THIRD-PARTY-NOTICES.md) for dependency credits and license terms.

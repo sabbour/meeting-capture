@@ -1,5 +1,6 @@
 namespace MeetingCapture.Configuration;
 
+/// <summary>Root of the application settings, bound from configuration and user settings.</summary>
 public sealed class AppSettings
 {
     public TranscriptionSettings Transcription { get; init; } = new();
@@ -9,6 +10,7 @@ public sealed class AppSettings
     public MeetingDetectionSettings MeetingDetection { get; init; } = new();
 }
 
+/// <summary>Settings for the speech-to-text service.</summary>
 public sealed class TranscriptionSettings
 {
     /// <summary>
@@ -35,9 +37,11 @@ public sealed class TranscriptionSettings
     /// </summary>
     public string Region { get; init; } = string.Empty;
 
+    /// <summary>Recognition language tag, for example "en-US".</summary>
     public string Language { get; init; } = "en-US";
 }
 
+/// <summary>Settings for the AI provider that creates live insights and final notes.</summary>
 public sealed class IntelligenceSettings
 {
     /// <summary>
@@ -80,6 +84,7 @@ public sealed class IntelligenceSettings
     public string IntelligenceModel { get; init; } = string.Empty;
 }
 
+/// <summary>Settings for where meeting output is saved.</summary>
 public sealed class StorageSettings
 {
     /// <summary>Root directory where meeting notes are persisted.</summary>
@@ -89,12 +94,13 @@ public sealed class StorageSettings
             "Microsoft Scout", "Meetings");
 }
 
+/// <summary>Settings for which audio sources are captured and in what PCM format.</summary>
 public sealed class AudioSettings
 {
     /// <summary>Capture microphone input.</summary>
     public bool CaptureMicrophone { get; init; } = true;
 
-    /// <summary>Capture system audio (WASAPI loopback — requires exclusive loopback access).</summary>
+    /// <summary>Capture system audio using WASAPI loopback.</summary>
     public bool CaptureLoopback { get; init; } = true;
 
     /// <summary>
@@ -115,6 +121,7 @@ public sealed class AudioSettings
     public int Channels { get; init; } = 1;
 }
 
+/// <summary>Settings for detecting that a meeting may be in progress.</summary>
 public sealed class MeetingDetectionSettings
 {
     /// <summary>

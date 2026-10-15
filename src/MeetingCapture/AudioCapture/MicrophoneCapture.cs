@@ -5,6 +5,10 @@ using NAudio.CoreAudioApi;
 
 namespace MeetingCapture.AudioCapture;
 
+/// <summary>
+/// Captures the default microphone as 16 kHz mono PCM and tracks when it last carried
+/// significant audio (see <see cref="MicActivityTimestamp"/>).
+/// </summary>
 public sealed class MicrophoneCapture : IAudioCapture, IMicActivitySource
 {
     private readonly WasapiCaptureWorker _worker;

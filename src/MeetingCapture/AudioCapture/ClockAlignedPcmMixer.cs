@@ -1,5 +1,9 @@
 namespace MeetingCapture.AudioCapture;
 
+/// <summary>
+/// Mixes loopback and microphone 16-bit mono PCM into fixed-size frames. Each source has its own
+/// bounded ring buffer; when the mixed peak would clip, the frame is scaled down.
+/// </summary>
 internal sealed class ClockAlignedPcmMixer
 {
     private readonly object _gate = new();
@@ -26,6 +30,7 @@ internal sealed class ClockAlignedPcmMixer
         _sums = new int[FrameBytes / sizeof(short)];
     }
 
+    /// <summary>Queues PCM bytes for one source. Returns the number of bytes the buffer accepted.</summary>
     public int Add(AudioSource source, byte[] buffer, int bytes)
     {
         ArgumentNullException.ThrowIfNull(buffer);
@@ -34,6 +39,10 @@ internal sealed class ClockAlignedPcmMixer
         lock (_gate) return Queue(source).Write(buffer, bytes);
     }
 
+    /// <summary>
+    /// Writes one mixed frame to <paramref name="output"/>. Returns false when no audio is buffered
+    /// and <paramref name="includeSilence"/> is false.
+    /// </summary>
     public bool ReadFrame(byte[] output, bool includeSilence)
     {
         ArgumentNullException.ThrowIfNull(output);

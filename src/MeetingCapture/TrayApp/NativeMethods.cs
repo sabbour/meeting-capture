@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Windows API calls used for window icons, placement and similar shell features.</summary>
 internal static class NativeMethods
 {
     private const uint ImageIcon = 1;
@@ -66,6 +67,7 @@ internal static class NativeMethods
     internal const uint WmNcDestroy = 0x0082;
     private const uint MonitorDefaultToNearest = 0x00000002;
 
+    /// <summary>Delegate for the window-message callback registered with the common-controls subclass API.</summary>
     internal delegate IntPtr SubclassProc(
         IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, UIntPtr idSubclass, UIntPtr refData);
 
@@ -118,6 +120,7 @@ internal static class NativeMethods
         => new(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
 
     [StructLayout(LayoutKind.Sequential)]
+    /// <summary>Native rectangle layout used with Windows API calls.</summary>
     internal struct RECT
     {
         public int Left;
