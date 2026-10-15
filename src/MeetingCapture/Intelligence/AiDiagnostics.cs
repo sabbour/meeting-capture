@@ -267,11 +267,23 @@ public sealed class AiDiagnosticsStream
         var changed = false;
         lock (_gate)
         {
-            if (generation != _generation || !request.Accepted || request.Ended)
+            if (generation != _generation || !request.Accepted ||
+                (request.Ended && kind != AiDiagnosticEventKind.UsageReported))
                 return;
+            if (request.Ended)
+            {
+                state = request.FinalState;
+                failure = request.FinalFailure;
+                retryAfter = request.FinalRetryAfter;
+            }
             update?.Invoke(request);
             if (state != AiRequestState.Running)
+            {
                 request.Ended = true;
+                request.FinalState = state;
+                request.FinalFailure = failure;
+                request.FinalRetryAfter = retryAfter;
+            }
             var payload = CaptureLocked(sensitiveResponsePayload);
             var root = exception?.GetBaseException();
             AppendLocked(request, kind, state, failure, retryAfter,
@@ -448,6 +460,9 @@ public sealed class AiDiagnosticsStream
         public string? Model { get; } = model;
         public bool Accepted { get; } = accepted;
         public bool Ended { get; set; }
+        public AiRequestState FinalState { get; set; }
+        public AiRequestFailure FinalFailure { get; set; }
+        public TimeSpan? FinalRetryAfter { get; set; }
         public int CallsStarted { get; set; }
         public long? InputTokens { get; set; }
         public long? OutputTokens { get; set; }

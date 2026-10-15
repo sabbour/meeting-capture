@@ -311,15 +311,19 @@ public sealed class AiUsageMonitor
     private void Update(
         long generation,
         RequestState request,
-        Action<RequestState, CapabilityState> update)
+        Action<RequestState, CapabilityState> update,
+        bool allowCompleted = false)
     {
         var changed = false;
         lock (_gate)
         {
             if (generation != _generation || !request.Accepted ||
-                request.State != AiRequestState.Running || !_requests.Contains(request))
+                (!allowCompleted && request.State != AiRequestState.Running))
                 return;
-            update(request, _capabilities[request.Capability]);
+            var aggregate = _capabilities[request.Capability];
+            aggregate.AddUsage(request, -1);
+            update(request, aggregate);
+            aggregate.AddUsage(request, 1);
             if (_requests.Count > MaxRequests && request.State != AiRequestState.Running)
             {
                 var removable = _requests.FindLastIndex(
@@ -353,7 +357,7 @@ public sealed class AiUsageMonitor
             long? cacheReadTokens = null,
             long? cacheWriteTokens = null,
             long? reasoningTokens = null)
-            => owner.Update(generation, request, (current, _) =>
+            => owner.Update(generation, request, (current, aggregate) =>
             {
                 current.InputTokens = Add(current.InputTokens, inputTokens);
                 current.OutputTokens = Add(current.OutputTokens, outputTokens);
@@ -374,8 +378,9 @@ public sealed class AiUsageMonitor
                     current.QuotaSnapshotReports++;
                     foreach (var snapshot in quotaSnapshots)
                         current.QuotaSnapshots[snapshot.QuotaId] = snapshot;
+                    aggregate.QuotaSnapshots.Report(quotaSnapshots);
                 }
-            });
+            }, allowCompleted: true);
 
         public void Complete(bool hasResults = true)
             => Finish(hasResults ? AiRequestState.Succeeded : AiRequestState.SucceededEmpty,
@@ -409,32 +414,6 @@ public sealed class AiUsageMonitor
                     case AiRequestState.RateLimited: aggregate.RateLimited++; break;
                     default: aggregate.Failed++; break;
                 }
-                aggregate.InputTokens.Add(
-                    current.InputTokens, current.InputTokenReports, current.CallsStarted);
-                aggregate.OutputTokens.Add(
-                    current.OutputTokens, current.OutputTokenReports, current.CallsStarted);
-                aggregate.ProviderCost.Add(
-                    current.ProviderCost, current.ProviderCostReports, current.CallsStarted);
-                aggregate.TotalNanoAiu.Add(
-                    current.TotalNanoAiu,
-                    current.TotalNanoAiuReports,
-                    current.CallsStarted);
-                aggregate.CacheReadTokens.Add(
-                    current.CacheReadTokens,
-                    current.CacheReadTokenReports,
-                    current.CallsStarted);
-                aggregate.CacheWriteTokens.Add(
-                    current.CacheWriteTokens,
-                    current.CacheWriteTokenReports,
-                    current.CallsStarted);
-                aggregate.ReasoningTokens.Add(
-                    current.ReasoningTokens,
-                    current.ReasoningTokenReports,
-                    current.CallsStarted);
-                aggregate.QuotaSnapshots.Add(
-                    current.QuotaSnapshots.Values,
-                    current.QuotaSnapshotReports,
-                    current.CallsStarted);
             });
 
         private static long? Add(long? current, long? value)
@@ -519,6 +498,18 @@ public sealed class AiUsageMonitor
         public LongMetric ReasoningTokens { get; } = new();
         public QuotaMetric QuotaSnapshots { get; } = new();
 
+        public void AddUsage(RequestState request, int direction)
+        {
+            InputTokens.Add(request.InputTokens, request.InputTokenReports, request.CallsStarted, direction);
+            OutputTokens.Add(request.OutputTokens, request.OutputTokenReports, request.CallsStarted, direction);
+            ProviderCost.Add(request.ProviderCost, request.ProviderCostReports, request.CallsStarted, direction);
+            TotalNanoAiu.Add(request.TotalNanoAiu, request.TotalNanoAiuReports, request.CallsStarted, direction);
+            CacheReadTokens.Add(request.CacheReadTokens, request.CacheReadTokenReports, request.CallsStarted, direction);
+            CacheWriteTokens.Add(request.CacheWriteTokens, request.CacheWriteTokenReports, request.CallsStarted, direction);
+            ReasoningTokens.Add(request.ReasoningTokens, request.ReasoningTokenReports, request.CallsStarted, direction);
+            QuotaSnapshots.Add(request.QuotaSnapshotReports, request.CallsStarted, direction);
+        }
+
         public void Reset()
         {
             RequestsStarted = CallsStarted = Succeeded = SucceededEmpty =
@@ -558,16 +549,16 @@ public sealed class AiUsageMonitor
         private int _reported;
         private int _unreported;
 
-        public void Add(long? value, int reports, int calls)
+        public void Add(long? value, int reports, int calls, int direction)
         {
             if (value is { } reported)
             {
-                _total += reported;
-                _reported += reports;
-                _unreported += Math.Max(0, calls - reports);
+                _total += direction * reported;
+                _reported += direction * reports;
+                _unreported += direction * Math.Max(0, calls - reports);
             }
             else
-                _unreported += calls;
+                _unreported += direction * calls;
         }
 
         public AiReportedLong Snapshot() => new(_total, _reported, _unreported);
@@ -580,16 +571,16 @@ public sealed class AiUsageMonitor
         private int _reported;
         private int _unreported;
 
-        public void Add(double? value, int reports, int calls)
+        public void Add(double? value, int reports, int calls, int direction)
         {
             if (value is { } reported)
             {
-                _total += reported;
-                _reported += reports;
-                _unreported += Math.Max(0, calls - reports);
+                _total += direction * reported;
+                _reported += direction * reports;
+                _unreported += direction * Math.Max(0, calls - reports);
             }
             else
-                _unreported += calls;
+                _unreported += direction * calls;
         }
 
         public AiReportedDouble Snapshot() => new(_total, _reported, _unreported);
@@ -602,12 +593,16 @@ public sealed class AiUsageMonitor
         private int _reported;
         private int _unreported;
 
-        public void Add(IEnumerable<AiQuotaSnapshot> values, int reports, int calls)
+        public void Report(IEnumerable<AiQuotaSnapshot> values)
         {
             foreach (var snapshot in values)
                 _latest[snapshot.QuotaId] = snapshot;
-            _reported += reports;
-            _unreported += Math.Max(0, calls - reports);
+        }
+
+        public void Add(int reports, int calls, int direction)
+        {
+            _reported += direction * reports;
+            _unreported += direction * Math.Max(0, calls - reports);
         }
 
         public AiQuotaSnapshots Snapshot() => new(

@@ -29,3 +29,10 @@ appsettings.*.json
 # OS
 Thumbs.db
 .DS_Store
+
+# Local tools and run output
+.playwright-mcp/
+.learnings/
+.impeccable/
+run_stdout.txt
+.dockerignore

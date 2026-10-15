@@ -154,7 +154,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
                 if (due > TimeSpan.Zero && stop.WaitOne(due)) break;
                 if (stop.WaitOne(0)) break;
                 EmitFrame(mixer, frame, includeSilence: true);
-                frameNumber++;
+                frameNumber = NextFrameNumber(frameNumber, clock.Elapsed);
             }
             while (mixer.ReadFrame(frame, includeSilence: false)) Emit(frame);
         }
@@ -165,6 +165,13 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
             _logger.LogError("Audio mixer worker failed ({ErrorType}).", ex.GetType().Name);
         }
         finally { drained.TrySetResult(); }
+    }
+
+    internal static long NextFrameNumber(long currentFrame, TimeSpan elapsed)
+    {
+        var frameTicks = TimeSpan.FromMilliseconds(FrameMilliseconds).Ticks;
+        var firstFutureFrame = elapsed.Ticks / frameTicks + 1;
+        return Math.Max(currentFrame + 1, firstFutureFrame);
     }
 
     private void EmitFrame(ClockAlignedPcmMixer mixer, byte[] frame, bool includeSilence)

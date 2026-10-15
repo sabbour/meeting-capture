@@ -62,6 +62,61 @@ internal static class NativeMethods
         SendMessage(hWnd, WmSetIcon, IconSmall, hIcon);
     }
 
+    internal const uint WmGetMinMaxInfo = 0x0024;
+    internal const uint WmNcDestroy = 0x0082;
+    private const uint MonitorDefaultToNearest = 0x00000002;
+
+    internal delegate IntPtr SubclassProc(
+        IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, UIntPtr idSubclass, UIntPtr refData);
+
+    [DllImport("comctl32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool SetWindowSubclass(
+        IntPtr hWnd, SubclassProc pfnSubclass, UIntPtr uIdSubclass, UIntPtr dwRefData);
+
+    [DllImport("comctl32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool RemoveWindowSubclass(
+        IntPtr hWnd, SubclassProc pfnSubclass, UIntPtr uIdSubclass);
+
+    [DllImport("comctl32.dll")]
+    internal static extern IntPtr DefSubclassProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    // A captionless resizable window is maximized to the full monitor by default, which
+    // puts the bottom of the window behind the taskbar. Limit it to the monitor work area
+    // while keeping the default hidden resize-frame overhang.
+    internal static void ConstrainMaximizedBoundsToWorkArea(IntPtr hWnd, IntPtr minMaxInfo)
+    {
+        if (minMaxInfo == IntPtr.Zero)
+            return;
+        var monitor = MonitorFromWindow(hWnd, MonitorDefaultToNearest);
+        if (monitor == IntPtr.Zero)
+            return;
+        var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(monitor, ref info))
+            return;
+
+        var mmi = Marshal.PtrToStructure<MINMAXINFO>(minMaxInfo);
+        var bounds = WindowPlacement.MaximizedBounds(
+            ToBounds(info.rcMonitor),
+            ToBounds(info.rcWork),
+            Math.Max(0, -mmi.ptMaxPosition.X),
+            Math.Max(0, -mmi.ptMaxPosition.Y));
+        mmi.ptMaxPosition = new POINT { X = bounds.X, Y = bounds.Y };
+        mmi.ptMaxSize = new POINT { X = bounds.Width, Y = bounds.Height };
+        Marshal.StructureToPtr(mmi, minMaxInfo, false);
+    }
+
+    private static WindowBounds ToBounds(RECT rect)
+        => new(rect.Left, rect.Top, rect.Right - rect.Left, rect.Bottom - rect.Top);
+
     [StructLayout(LayoutKind.Sequential)]
     internal struct RECT
     {
@@ -69,5 +124,31 @@ internal static class NativeMethods
         public int Top;
         public int Right;
         public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MINMAXINFO
+    {
+        public POINT ptReserved;
+        public POINT ptMaxSize;
+        public POINT ptMaxPosition;
+        public POINT ptMinTrackSize;
+        public POINT ptMaxTrackSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
     }
 }

@@ -117,7 +117,7 @@ public static class RelatedContextNormalizer
                 RelatedContextAvailability.Unavailable => snapshot with
                 {
                     Items = [],
-                    Detail = "Related context is unavailable."
+                    Detail = SafeUnavailableDetail(snapshot.Detail)
                 },
                 _ => snapshot with
                 {
@@ -142,6 +142,20 @@ public static class RelatedContextNormalizer
             }
             : snapshot with { Items = items };
     }
+
+    private static string SafeUnavailableDetail(string? detail) => detail switch
+    {
+        "Work IQ is not signed in." or
+        "Work IQ declined the related-sources request." or
+        "Work IQ sent a reply this app could not read." or
+        "Work IQ could not be reached." or
+        "The Work IQ service is having a problem right now." or
+        "Work IQ timed out while finding related suggestions." or
+        "Your Work IQ account cannot access related suggestions." or
+        "Work IQ does not support related suggestions." or
+        "Work IQ request failed. See Diagnostics/related.log for the error type." => detail,
+        _ => "Related context is unavailable."
+    };
 
     private static RelatedContextItem? NormalizeItem(RelatedContextItem item)
     {

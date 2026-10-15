@@ -3,7 +3,7 @@ namespace MeetingCapture.TrayApp;
 internal readonly record struct WindowBounds(int X, int Y, int Width, int Height);
 internal readonly record struct RecordingLayoutAllocation(
     double OverviewMaxHeight,
-    double TranscriptMinHeight);
+    double TranscriptMaxHeight);
 internal readonly record struct VisualizationLayoutAllocation(
     double PrimaryWidth,
     double VisualizationWidth);
@@ -82,6 +82,22 @@ internal static class WindowPlacement
         };
     }
 
+    // Returns maximized bounds relative to the monitor origin, as WM_GETMINMAXINFO expects.
+    internal static WindowBounds MaximizedBounds(
+        WindowBounds monitor,
+        WindowBounds workArea,
+        int frameX,
+        int frameY)
+    {
+        frameX = Math.Max(0, frameX);
+        frameY = Math.Max(0, frameY);
+        return new(
+            workArea.X - monitor.X - frameX,
+            workArea.Y - monitor.Y - frameY,
+            Math.Max(1, workArea.Width) + 2 * frameX,
+            Math.Max(1, workArea.Height) + 2 * frameY);
+    }
+
     private static double DpiScale(int dpi) => (dpi > 0 ? dpi : 96) / 96d;
     private static int Scale(int value, double scale) => (int)Math.Round(value * scale);
 }
@@ -118,6 +134,7 @@ internal static class VisualizationLayout
 internal static class RecordingLayout
 {
     internal const double DesiredOverviewHeight = 320;
+    internal const double MinimumOverviewHeight = 130;
     internal const double MinimumTranscriptHeight = 130;
     internal const double DesiredTranscriptHeight = 180;
 
@@ -126,9 +143,9 @@ internal static class RecordingLayout
         double fixedHeight)
     {
         var available = Math.Max(0, panelHeight - Math.Max(0, fixedHeight));
-        var transcript = Math.Min(DesiredTranscriptHeight,
-            Math.Min(available, Math.Max(MinimumTranscriptHeight, available * 0.28)));
-        var overview = Math.Min(DesiredOverviewHeight, Math.Max(0, available - transcript));
+        var overview = Math.Clamp(available - DesiredTranscriptHeight,
+            MinimumOverviewHeight, DesiredOverviewHeight);
+        var transcript = Math.Max(MinimumTranscriptHeight, available - overview);
         return new(overview, transcript);
     }
 }

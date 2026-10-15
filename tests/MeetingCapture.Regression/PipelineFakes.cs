@@ -68,11 +68,14 @@ internal sealed class FakeCapture : IAudioCapture, IMicActivitySource
 internal sealed class FakeTranscription : ITranscriptionService
 {
     private TranscriptionResult _result = new();
+    private int _activePushes;
+    private TaskCompletionSource _pushesSettled = NewCompletion();
+    private TaskCompletionSource _stopCompleted = NewCompletion();
     public event EventHandler<TranscriptionSegment>? SegmentRecognized;
     public event EventHandler<PartialTranscript>? PartialResultReceived;
     public bool IsTranscribing { get; private set; }
     public bool RetainResources { get; set; }
-    public bool HasActiveResources => IsTranscribing || RetainResources;
+    public bool HasActiveResources => IsTranscribing || RetainResources || Volatile.Read(ref _activePushes) > 0;
     public long TotalAudioBytesReceived { get; private set; }
     public CaptureHealthState? HealthState { get; set; }
     public string? HealthError { get; set; }
@@ -83,10 +86,14 @@ internal sealed class FakeTranscription : ITranscriptionService
     public int Stops { get; private set; }
     public int Disposals { get; private set; }
     public int Pushes { get; private set; }
+    public List<byte[]> AudioFrames { get; } = [];
     public int FinalSubscribers => SegmentRecognized?.GetInvocationList().Length ?? 0;
     public int PartialSubscribers => PartialResultReceived?.GetInvocationList().Length ?? 0;
     public Func<CancellationToken, Task>? OnStart { get; set; }
     public Func<CancellationToken, Task>? OnStop { get; set; }
+    public Func<CancellationToken, Task>? OnPushAudio { get; set; }
+    public Task PushesSettled => _pushesSettled.Task;
+    public Task StopCompleted => _stopCompleted.Task;
     public Exception? PushFailure { get; set; }
     public Exception? DisposeFailure { get; set; }
 
@@ -97,18 +104,33 @@ internal sealed class FakeTranscription : ITranscriptionService
         IsTranscribing = true;
         TotalAudioBytesReceived = 0;
         Pushes = 0;
+        AudioFrames.Clear();
         _result = new();
+        _activePushes = 0;
+        _pushesSettled = NewCompletion();
+        _stopCompleted = NewCompletion();
         if (OnStart is not null) await OnStart(ct);
     }
 
-    public Task PushAudioAsync(byte[] pcmData, int bytesRecorded, CancellationToken ct)
+    public async Task PushAudioAsync(byte[] pcmData, int bytesRecorded, CancellationToken ct)
     {
         Check.True(IsTranscribing);
         ct.ThrowIfCancellationRequested();
         Pushes++;
-        if (PushFailure is not null) throw PushFailure;
-        TotalAudioBytesReceived += bytesRecorded;
-        return Task.CompletedTask;
+        Interlocked.Increment(ref _activePushes);
+        try
+        {
+            if (OnPushAudio is not null) await OnPushAudio(ct);
+            lock (AudioFrames)
+                AudioFrames.Add(pcmData.AsSpan(0, bytesRecorded).ToArray());
+            if (PushFailure is not null) throw PushFailure;
+            TotalAudioBytesReceived += bytesRecorded;
+        }
+        finally
+        {
+            if (Interlocked.Decrement(ref _activePushes) == 0)
+                _pushesSettled.TrySetResult();
+        }
     }
 
     public async Task<TranscriptionResult> StopAsync(CancellationToken ct)
@@ -119,7 +141,11 @@ internal sealed class FakeTranscription : ITranscriptionService
             if (OnStop is not null) await OnStop(ct);
             return _result;
         }
-        finally { IsTranscribing = false; }
+        finally
+        {
+            IsTranscribing = false;
+            _stopCompleted.TrySetResult();
+        }
     }
 
     public void Emit(string text)
@@ -141,6 +167,9 @@ internal sealed class FakeTranscription : ITranscriptionService
         if (DisposeFailure is not null) throw DisposeFailure;
         return ValueTask.CompletedTask;
     }
+
+    private static TaskCompletionSource NewCompletion() =>
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 }
 
 internal sealed class FakeIntelligence : INotesIntelligence, IMeetingVisualizationIntelligence
@@ -285,11 +314,13 @@ internal sealed class PipelineFixture : IAsyncDisposable
     public MeetingPipeline Pipeline { get; }
     public List<PipelineStatus> Statuses { get; } = [];
     public List<NotesSavedInfo> Saved { get; } = [];
+    public string AiLogDirectory => System.IO.Path.Combine(Directory.Path, "diagnostics");
 
     public PipelineFixture(FakeCapture? second = null, Func<CancellationToken, Task<string?>>? localUser = null,
         Func<TimeSpan, CancellationToken, Task>? saveDelay = null,
         Func<DateTimeOffset>? getUtcNow = null,
-        ObservedVisualizationStorage? visualizationStorage = null)
+        ObservedVisualizationStorage? visualizationStorage = null,
+        TimeSpan? transcriptionTimeout = null)
     {
         Storage = new(CoreChecks.CreateStorage(Directory.Path));
         VisualizationStorage = visualizationStorage ??
@@ -299,7 +330,8 @@ internal sealed class PipelineFixture : IAsyncDisposable
             Transcription, Intelligence, Storage, Intelligence, Visualization, VisualizationStorage, new SpeakerResolver(),
             localUser ?? (_ => Task.FromResult<string?>(null)), NullLogger<MeetingPipeline>.Instance,
             saveDelay ?? ((_, _) => Task.CompletedTask), getUtcNow, Usage,
-            pendingVisualizationJournal: Journal);
+            pendingVisualizationJournal: Journal, transcriptionTimeout: transcriptionTimeout,
+            aiFinalizationLogDirectory: AiLogDirectory);
         Pipeline.StateChanged += (_, status) => Statuses.Add(status);
         Pipeline.NotesSaved += (_, saved) => Saved.Add(saved);
     }

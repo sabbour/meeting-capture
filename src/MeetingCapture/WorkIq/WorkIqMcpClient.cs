@@ -9,7 +9,7 @@ using MeetingCapture.MeetingDetection;
 
 namespace MeetingCapture.WorkIq;
 
-public enum WorkIqFailure { SignedOut, Authentication, Denied, Unsupported, Incomplete, Malformed, Network, Timeout, Cache, Unknown }
+public enum WorkIqFailure { SignedOut, Authentication, Denied, Unsupported, Incomplete, Malformed, Network, Timeout, Cache, ServiceDeclined, Unknown, ServiceUnavailable }
 
 public sealed class WorkIqException(WorkIqFailure kind, string? code = null) : Exception(kind switch
 {
@@ -22,6 +22,9 @@ public sealed class WorkIqException(WorkIqFailure kind, string? code = null) : E
     WorkIqFailure.Network => "WorkIQ could not be reached. Check your connection.",
     WorkIqFailure.Timeout => "WorkIQ timed out. Local recording remains available.",
     WorkIqFailure.Cache => "WorkIQ could not read or save its protected sign-in cache. Sign out to clear it.",
+    WorkIqFailure.ServiceDeclined => "WorkIQ declined the related-sources request.",
+    WorkIqFailure.ServiceUnavailable =>
+        "The WorkIQ service is having a problem right now. Your connection is working; try again in a few minutes.",
     _ => "WorkIQ request failed."
 })
 {
@@ -36,6 +39,8 @@ public sealed class WorkIqMcpClient(HttpClient http, TimeSpan? requestTimeout = 
 {
     public const string Endpoint = "https://workiq.svc.cloud.microsoft/mcp";
     private const int MaxProfilePhotoBytes = 1024 * 1024;
+    internal static TimeSpan[] ServiceBusyRetryDelays { get; set; } =
+        [TimeSpan.FromMilliseconds(500), TimeSpan.FromSeconds(2)];
     private string? _session;
     private string? _protocol;
     private bool _retrieveAvailable;
@@ -188,7 +193,7 @@ UNTRUSTED_TOPIC_JSON:
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or JsonException)
         {
-            throw new WorkIqException(WorkIqFailure.Malformed);
+            throw new WorkIqException(WorkIqFailure.Malformed, "shape:messageId");
         }
     }
 
@@ -355,15 +360,29 @@ UNTRUSTED_TOPIC_JSON:
     {
         try
         {
-            var structured = result.GetProperty("structuredContent");
+            if (result.TryGetProperty("isError", out var isError))
+            {
+                if (isError.ValueKind != JsonValueKind.True &&
+                    isError.ValueKind != JsonValueKind.False)
+                    throw new WorkIqException(WorkIqFailure.Malformed, "shape:isError");
+                if (isError.GetBoolean())
+                    throw new WorkIqException(WorkIqFailure.ServiceDeclined, "tool-error");
+            }
+            if (!result.TryGetProperty("structuredContent", out var structured) ||
+                structured.ValueKind != JsonValueKind.Object)
+                throw new WorkIqException(WorkIqFailure.Malformed, "shape:structuredContent");
             if (TryGetStatusCode(result, structured, out var status))
-                EnsureStatus(status);
-            if (result.TryGetProperty("isError", out var isError) && isError.GetBoolean())
-                throw new WorkIqException(WorkIqFailure.Malformed);
-            var retrieval = structured.GetProperty("application/vnd.ms-workiq.retrieval");
-            var hits = retrieval.GetProperty("retrievalHits");
+                EnsureStatus(status, includeHttpCode: true);
+            if (!structured.TryGetProperty("application/vnd.ms-workiq.retrieval", out var retrieval) ||
+                retrieval.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
+            if (retrieval.ValueKind != JsonValueKind.Object)
+                throw new WorkIqException(WorkIqFailure.Malformed, "shape:retrieval");
+            if (!retrieval.TryGetProperty("retrievalHits", out var hits) ||
+                hits.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined)
+                return new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
             if (hits.ValueKind != JsonValueKind.Array || hits.GetArrayLength() > 50)
-                throw new WorkIqException(WorkIqFailure.Malformed);
+                throw new WorkIqException(WorkIqFailure.Malformed, "shape:retrievalHits");
             if (hits.GetArrayLength() == 0)
                 return new RelatedContextSnapshot(retrievedAt, [],
                     RelatedContextAvailability.NoEvidence);
@@ -375,6 +394,11 @@ UNTRUSTED_TOPIC_JSON:
             var unverifiedParticipation = 0;
             foreach (var hit in hits.EnumerateArray())
             {
+                if (hit.ValueKind != JsonValueKind.Object)
+                {
+                    omitted++;
+                    continue;
+                }
                 if (!hit.TryGetProperty("webUrl", out var urlValue) ||
                     !hit.TryGetProperty("entityType", out var typeValue))
                 {
@@ -464,7 +488,7 @@ UNTRUSTED_TOPIC_JSON:
 
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException or JsonException)
         {
-            throw new WorkIqException(WorkIqFailure.Malformed);
+            throw new WorkIqException(WorkIqFailure.Malformed, "shape:retrievalHit");
         }
     }
 
@@ -506,6 +530,9 @@ UNTRUSTED_TOPIC_JSON:
                     : null);
         return snapshots.Any(snapshot => snapshot.Availability == RelatedContextAvailability.Unavailable)
             ? new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.Unavailable,
+                snapshots.FirstOrDefault(snapshot =>
+                    snapshot.Availability == RelatedContextAvailability.Unavailable &&
+                    !string.IsNullOrWhiteSpace(snapshot.Detail))?.Detail ??
                 "Some Microsoft 365 source families were unavailable.")
             : new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
     }
@@ -660,7 +687,7 @@ UNTRUSTED_TOPIC_JSON:
         }
     }
 
-    private static void EnsureStatus(int status)
+    private static void EnsureStatus(int status, bool includeHttpCode = false)
     {
         if (status is >= 200 and < 300) return;
         throw new WorkIqException(status switch
@@ -669,8 +696,11 @@ UNTRUSTED_TOPIC_JSON:
             403 => WorkIqFailure.Denied,
             400 or 404 or 405 or 422 => WorkIqFailure.Unsupported,
             408 or 504 => WorkIqFailure.Timeout,
+            >= 500 and < 600 => WorkIqFailure.ServiceUnavailable,
             _ => WorkIqFailure.Network
-        }, status.ToString(CultureInfo.InvariantCulture));
+        }, includeHttpCode
+            ? $"http:{status.ToString(CultureInfo.InvariantCulture)}"
+            : status.ToString(CultureInfo.InvariantCulture));
     }
 
     private Task<JsonElement> FetchResultAsync(string token, string path, CancellationToken ct)
@@ -918,11 +948,20 @@ UNTRUSTED_TOPIC_JSON:
         try { return await RequestCoreAsync(method, parameters, token, deadline.Token, notification).ConfigureAwait(false); }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
-            throw new WorkIqException(WorkIqFailure.Timeout);
+            var failure = new WorkIqException(WorkIqFailure.Timeout);
+            MeetingCapture.Diagnostics.RelatedDiagnostics.Record(method, null, failure);
+            throw failure;
         }
         catch (Exception ex) when (ex is KeyNotFoundException or InvalidOperationException or FormatException or JsonException)
         {
-            throw new WorkIqException(WorkIqFailure.Malformed);
+            var failure = new WorkIqException(WorkIqFailure.Malformed);
+            MeetingCapture.Diagnostics.RelatedDiagnostics.Record(method, null, failure);
+            throw failure;
+        }
+        catch (Exception ex) when (ex is WorkIqException or HttpRequestException)
+        {
+            MeetingCapture.Diagnostics.RelatedDiagnostics.Record(method, null, ex);
+            throw;
         }
     }
 
@@ -931,15 +970,27 @@ UNTRUSTED_TOPIC_JSON:
         var id = Interlocked.Increment(ref _id);
         object payload = notification ? new { jsonrpc = "2.0", method, @params = parameters }
             : new { jsonrpc = "2.0", id, method, @params = parameters };
-        using var request = new HttpRequestMessage(HttpMethod.Post, Endpoint);
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-        request.Headers.Accept.ParseAdd("application/json");
-        request.Headers.Accept.ParseAdd("text/event-stream");
-        if (_session is not null) request.Headers.Add("Mcp-Session-Id", _session);
-        if (_protocol is not null) request.Headers.Add("MCP-Protocol-Version", _protocol);
-        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
-        using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
-        EnsureStatus((int)response.StatusCode);
+        var requestBody = JsonSerializer.Serialize(payload);
+        HttpResponseMessage? sent = null;
+        // A busy service (502/503) is usually brief, so try twice more before reporting it.
+        for (var attempt = 0; ; attempt++)
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Post, Endpoint);
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
+            request.Headers.Accept.ParseAdd("application/json");
+            request.Headers.Accept.ParseAdd("text/event-stream");
+            if (_session is not null) request.Headers.Add("Mcp-Session-Id", _session);
+            if (_protocol is not null) request.Headers.Add("MCP-Protocol-Version", _protocol);
+            request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
+            sent = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+            if (attempt >= ServiceBusyRetryDelays.Length ||
+                sent.StatusCode is not (HttpStatusCode.BadGateway or HttpStatusCode.ServiceUnavailable))
+                break;
+            sent.Dispose();
+            await Task.Delay(ServiceBusyRetryDelays[attempt], ct).ConfigureAwait(false);
+        }
+        using var response = sent;
+        EnsureStatus((int)response.StatusCode, includeHttpCode: true);
         if (method == "initialize" && response.Headers.TryGetValues("Mcp-Session-Id", out var sessions))
             _session = sessions.Single();
         if (notification) return default;
@@ -970,15 +1021,23 @@ UNTRUSTED_TOPIC_JSON:
             rid.ValueKind == JsonValueKind.Number && rid.TryGetInt32(out var value) && value == id;
         JsonElement Result(JsonElement message)
         {
-            if (message.GetProperty("jsonrpc").GetString() != "2.0")
-                throw new WorkIqException(WorkIqFailure.Malformed);
+            if (!message.TryGetProperty("jsonrpc", out var version) ||
+                version.ValueKind != JsonValueKind.String ||
+                version.GetString() != "2.0")
+                throw new WorkIqException(WorkIqFailure.Malformed, "shape:jsonrpc");
             if (message.TryGetProperty("error", out var error))
             {
-                var code = error.GetProperty("code").GetInt32();
-                throw new WorkIqException(code is -32601 or -32602 ? WorkIqFailure.Unsupported : WorkIqFailure.Malformed,
-                    code.ToString(CultureInfo.InvariantCulture));
+                if (error.ValueKind != JsonValueKind.Object ||
+                    !error.TryGetProperty("code", out var codeValue) ||
+                    !codeValue.TryGetInt32(out var code))
+                    throw new WorkIqException(WorkIqFailure.Malformed, "shape:rpcError");
+                throw new WorkIqException(
+                    code is -32601 or -32602 ? WorkIqFailure.Unsupported : WorkIqFailure.Malformed,
+                    $"rpc:{code.ToString(CultureInfo.InvariantCulture)}");
             }
-            return message.GetProperty("result").Clone();
+            if (!message.TryGetProperty("result", out var result))
+                throw new WorkIqException(WorkIqFailure.Malformed, "shape:result");
+            return result.Clone();
         }
     }
 

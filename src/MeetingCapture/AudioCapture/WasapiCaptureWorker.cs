@@ -10,6 +10,7 @@ namespace MeetingCapture.AudioCapture;
 internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> createCapture,
     Action<byte[], int> output, ILogger logger)
 {
+    private const int OutputSampleRate = 16000;
     private readonly object _gate = new();
     private Session? _session;
     private readonly AudioHealthTracker _health = new(source);
@@ -124,10 +125,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             {
                 ReadFully = false, DiscardOnBufferOverflow = false, BufferDuration = TimeSpan.FromSeconds(10)
             };
-            ISampleProvider samples = buffered.ToSampleProvider();
-            if (format.Channels > 1) samples = new MonoDownmixSampleProvider(samples);
-            var pcm = new SampleToWaveProvider16(new WdlResamplingSampleProvider(samples, 16000));
-            var buffer = new byte[8192];
+            var pcm = CreatePcmProvider(buffered);
+            var buffer = new byte[PcmReadBufferSize(format.SampleRate)];
             foreach (var (data, bytes) in session.Queue.GetConsumingEnumerable())
             {
                 buffered.AddSamples(data, 0, bytes);
@@ -152,6 +151,22 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             logger.LogError("Audio source {Source} worker failed ({ErrorType}).", source, ex.GetType().Name);
         }
         finally { session.Drained.TrySetResult(); }
+    }
+
+    internal static int PcmReadBufferSize(int inputSampleRate)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputSampleRate);
+        // WDL changes fractional-rate samples with the read size, so preserve those reads.
+        return inputSampleRate % OutputSampleRate == 0
+            ? OutputSampleRate * sizeof(short) / 50
+            : 8192;
+    }
+
+    internal static IWaveProvider CreatePcmProvider(BufferedWaveProvider input)
+    {
+        ISampleProvider samples = input.ToSampleProvider();
+        if (input.WaveFormat.Channels > 1) samples = new MonoDownmixSampleProvider(samples);
+        return new SampleToWaveProvider16(new WdlResamplingSampleProvider(samples, OutputSampleRate));
     }
 
     public Task StopAsync(CancellationToken ct)

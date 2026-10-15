@@ -23,6 +23,7 @@ internal static class CoreChecks
         yield return ("settings persisted-but-not-applied failure emits no success", () => Run(SettingsApplyFailure));
         yield return ("atomic Markdown retry preserves raw transcript and session identity", Storage);
         yield return ("notes synthesis preserves bounded topic narratives and nuances", NotesQualityRoundTrip);
+        yield return ("meeting notes are chronological speaker-attributed and transcript-grounded", MeetingTopicNotes);
         yield return ("hierarchical synthesis preserves chunk coverage evidence and fallback", HierarchicalSynthesis);
         yield return ("typed provider failures stay distinct and sanitized", () => Run(ErrorMapping));
         yield return ("typed responses distinguish valid empty, missing, and malformed output", () => Run(ResponseParsing));
@@ -223,10 +224,16 @@ internal static class CoreChecks
             SessionId = "synthetic-session-a",
             MeetingTitle = "Synthetic: meeting?",
             CreatedAt = time,
-            RawTranscript = "FIRST synthetic utterance\n```md\n# literal transcript\n```\nLAST synthetic utterance",
+            RawTranscript = "FIRST synthetic utterance\n```md\n# literal transcript\n```\nLAST synthetic utterance mentions segment 35",
+            Summary = "Grounded in segment 34.",
             IntelligenceFailure = new IntelligenceFailure(
                 IntelligenceFailureKind.ModelUnavailable, "github", "synthetic-model", "Model unavailable.")
         };
+        notes.TopicNotes.Add(new(
+            "topic-0001",
+            "Release segment 34",
+            ["Discussed around segments 34–37."]));
+        notes.Participants.Add(new("Synthetic participant", "Presenter"));
         var path = await storage.SaveAsync(notes, CancellationToken.None);
         Check.True(Path.GetFileName(path).StartsWith(
             $"{time.LocalDateTime:yyyy-MM-dd_HH-mm}_Synthetic meeting_"));
@@ -235,6 +242,18 @@ internal static class CoreChecks
         Check.True(first.Contains(notes.RawTranscript));
         Check.True(first.Contains(notes.SessionId));
         Check.True(first.Contains("Model unavailable"));
+        Check.True(first.Contains(
+            "  - name: \"Synthetic participant\"" + Environment.NewLine +
+            "    role: \"Presenter\"" + Environment.NewLine));
+        Check.True(first.Contains(
+            Environment.NewLine + Environment.NewLine + "## Raw Transcript" + Environment.NewLine));
+        var rawTranscriptStart = first.IndexOf("## Raw Transcript", StringComparison.Ordinal);
+        Check.True(rawTranscriptStart > 0);
+        Check.True(!System.Text.RegularExpressions.Regex.IsMatch(
+            first[..rawTranscriptStart],
+            @"\bsegments?\s+\d+(?:\s*[–-]\s*\d+)?\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase));
+        Check.True(first[rawTranscriptStart..].Contains("segment 35", StringComparison.Ordinal));
         var improved = new MeetingNotes
         {
             SessionId = notes.SessionId,
@@ -375,6 +394,124 @@ internal static class CoreChecks
             DateTimeOffset.UtcNow));
         Check.True(CopilotNotesService.BuildSynthesisMessage(oversized).Length <
             CopilotNotesService.TranscriptFallbackCharacterLimit + 200);
+    }
+
+    private static async Task MeetingTopicNotes()
+    {
+        var startedAt = DateTimeOffset.Parse("2026-10-14T10:00:00-07:00");
+        var document = new MeetingVisualizationDocument(
+            1,
+            "synthetic-topic-notes",
+            "Synthetic planning review",
+            startedAt,
+            startedAt.AddMinutes(5),
+            3,
+            true,
+            [
+                new("seg-000001", 1, "We should use the revised review sequence.",
+                    startedAt.AddSeconds(1), "Guest-1", 0.99),
+                new("seg-000002", 2, "The review sequence preserves validation time.",
+                    startedAt.AddSeconds(2), "Guest-2", 0.98),
+                new("seg-000003", 3, "Morgan will send the validation checklist.",
+                    startedAt.AddSeconds(3), "Guest-2", 0.98),
+            ],
+            [new("Guest-1", "Avery", true), new("Guest-2", "Morgan", true)],
+            [
+                new("topic-0001", "Review sequence", ["Review sequence"], 1, 2),
+                new("topic-0002", "Validation checklist", ["Validation checklist"], 3, 3),
+            ],
+            [
+                new("occ-000001", "topic-0001", 1, 1, "Review sequence"),
+                new("occ-000002", "topic-0002", 3, 3, "Validation checklist"),
+            ],
+            [],
+            [
+                new("fact-1", EvidenceOrigin.Analysis, VisualizationProvenance.TranscriptFact,
+                    1, "topic-0001", null, null, null, null,
+                    "Guest-1 recommends Guest-2's revised review sequence.", "Review sequence"),
+                new("fact-2", EvidenceOrigin.Transcript, VisualizationProvenance.TranscriptFact,
+                    2, "topic-0001", null, null, null, null,
+                    "The sequence preserves time for validation.", "Validation time"),
+                new("fact-3", EvidenceOrigin.Transcript, VisualizationProvenance.TranscriptFact,
+                    3, "topic-0002", null, null, null, null,
+                    "Morgan will send the validation checklist.", "Checklist follow-up"),
+                new("source-1", EvidenceOrigin.RelatedContext,
+                    VisualizationProvenance.RelatedSourceSuggestion,
+                    null, "topic-0001", "Synthetic document", "https://example.test/synthetic",
+                    ContextSourceType.Document, null, "Not a meeting fact."),
+            ],
+            [])
+        {
+            Decisions =
+            [
+                new("decision-1", null, "Use Guest-2's revised review sequence.", ["fact-1", "fact-2"]),
+            ],
+        };
+
+        var topicNotes = MeetingTopicNotesBuilder.Build(document);
+        Check.Equal(2, topicNotes.Count);
+        Check.Equal("topic-0001", topicNotes[0].TopicId);
+        Check.Equal("Review sequence", topicNotes[0].Topic);
+        Check.Equal(2, topicNotes[0].Bullets.Count);
+        Check.Equal(
+            "Decision discussed by Avery and Morgan: Use Morgan's revised review sequence.",
+            topicNotes[0].Bullets[0]);
+        Check.True(topicNotes[0].Bullets[1].StartsWith(
+            "Avery recommends", StringComparison.Ordinal));
+        Check.True(topicNotes[0].Bullets[1].Contains(
+            "Morgan's revised review sequence", StringComparison.Ordinal));
+        Check.True(topicNotes[0].Bullets.All(item => item.Length <= 220));
+        Check.Equal("Morgan will send the validation checklist.", topicNotes[1].Bullets.Single());
+        Check.True(!topicNotes.SelectMany(item => item.Bullets).Any(item =>
+            item.Contains("Synthetic document", StringComparison.Ordinal) ||
+            item.Contains("Not a meeting fact", StringComparison.Ordinal)));
+
+        var notes = new MeetingNotes
+        {
+            SessionId = document.SessionId,
+            MeetingTitle = document.MeetingTitle,
+            CreatedAt = startedAt,
+            RawTranscript = string.Join("\n", document.Segments.Select(item => item.Text)),
+        };
+        notes.TopicNotes.AddRange(topicNotes);
+        using var directory = new TemporaryDirectory();
+        var markdown = await File.ReadAllTextAsync(
+            await CreateStorage(directory.Path).SaveAsync(notes, CancellationToken.None));
+        Check.True(markdown.Contains("## Meeting Notes", StringComparison.Ordinal));
+        Check.True(markdown.IndexOf("### Review sequence", StringComparison.Ordinal) <
+            markdown.IndexOf("### Validation checklist", StringComparison.Ordinal));
+        Check.True(markdown.Contains(
+            "- Decision discussed by Avery and Morgan: Use Morgan's revised review sequence.",
+            StringComparison.Ordinal));
+        Check.True(markdown.Contains("- Morgan will send the validation checklist.", StringComparison.Ordinal));
+        Check.True(!markdown.Contains("Morgan: Morgan", StringComparison.Ordinal));
+
+        var decisionDocument = document with
+        {
+            Segments =
+            [
+                new("seg-000001", 1, "Network isolation is the term.",
+                    startedAt.AddSeconds(1), "Guest-1", 0.99),
+            ],
+            Speakers = [new("Guest-1", "Shashank", true)],
+            TopicClusters = [new("topic-0001", "Terminology", ["Terminology"], 1, 1)],
+            TopicTrail = [new("occ-000001", "topic-0001", 1, 1, "Terminology")],
+            Evidence =
+            [
+                new("fact-1", EvidenceOrigin.Transcript, VisualizationProvenance.TranscriptFact,
+                    1, "topic-0001", null, null, null, null,
+                    "Guest-1 planned the rollout.", "Rollout"),
+            ],
+            Decisions =
+            [
+                new("decision-1", null, "Guest-1 chose network isolation as the term.", ["fact-1"]),
+            ],
+        };
+        var natural = MeetingTopicNotesBuilder.Build(decisionDocument).Single().Bullets;
+        Check.Equal("Shashank chose network isolation as the term.", natural[0]);
+        Check.Equal("Shashank planned the rollout.", natural[1]);
+        Check.True(natural.All(item =>
+            item.Split("Shashank", StringSplitOptions.None).Length == 2));
     }
 
     private static async Task HierarchicalSynthesis()

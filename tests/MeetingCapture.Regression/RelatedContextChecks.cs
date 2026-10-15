@@ -11,7 +11,7 @@ internal static class RelatedContextChecks
         yield return ("related context caches stable topics and supports explicit refresh", CacheAndRefresh);
         yield return ("related context source synchronous setup does not block the UI context", SourceStartsOffUiThread);
         yield return ("related context invalidation cancels a fetch before its worker starts", InvalidationBeforeFetchStarts);
-        yield return ("related context hands the latest topic off after one slow request", TopicVariationPacing);
+        yield return ("related context queues every topic and publishes each result after a slow request", TopicVariationPacing);
         yield return ("related context accepts only the latest source revision completion", SourceRevisionPacing);
         yield return ("related context never publishes stale loading after a fast result", EventOrdering);
         yield return ("related context singleflight survives caller cancellation", SingleflightAndCancellation);
@@ -202,9 +202,9 @@ internal static class RelatedContextChecks
         gate.Release();
         var firstResult = await first;
         var latest = await third;
-        Check.Equal(2, source.Calls);
-        Check.Equal("topic-a,topic-c", string.Join(",", source.Queries.Select(query => query.TopicId)));
-        Check.Equal("1,3", string.Join(",", source.Queries.Select(query => query.TranscriptRevision)));
+        Check.Equal(3, source.Calls);
+        Check.Equal("topic-a,topic-b,topic-c", string.Join(",", source.Queries.Select(query => query.TopicId)));
+        Check.Equal("1,2,3", string.Join(",", source.Queries.Select(query => query.TranscriptRevision)));
         Check.Equal("Initial topic", firstResult.Topic);
         Check.Equal("Newest phrasing", latest.Topic);
         Check.Equal(RelatedContextState.Available, coordinator.Status.State);
@@ -213,8 +213,9 @@ internal static class RelatedContextChecks
         Check.Equal(3L, coordinator.Status.TranscriptRevision);
         Check.True(coordinator.Status.Snapshot!.Items.Single().Title.Contains(
             "Newest phrasing", StringComparison.Ordinal));
-        Check.True(!events.Any(status =>
-            status.State == RelatedContextState.Available && status.Topic == "Initial topic"));
+        Check.Equal("topic-a,topic-b,topic-c", string.Join(",", events
+            .Where(status => status.State == RelatedContextState.Available)
+            .Select(status => status.TopicId)));
         Check.Equal("Newest phrasing", events[^1].Topic);
     }
 

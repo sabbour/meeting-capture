@@ -115,7 +115,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         // YAML frontmatter for machine-queryability.
         sb.AppendLine("---");
         sb.AppendLine($"session_id: {YamlString(notes.SessionId)}");
-        sb.AppendLine($"title: {YamlString(notes.MeetingTitle)}");
+        sb.AppendLine($"title: {YamlString(MeetingNotesText.WithoutSegmentOrdinals(notes.MeetingTitle))}");
         sb.AppendLine($"date: {notes.CreatedAt.LocalDateTime:yyyy-MM-dd}");
         sb.AppendLine($"duration_minutes: {notes.EstimatedDurationMinutes}");
         sb.AppendLine($"meeting_type: {YamlString(notes.MeetingType)}");
@@ -138,12 +138,12 @@ public sealed class MarkdownNotesStorage : INotesStorage
             sb.AppendLine("participants: []");
         }
 
-        sb.AppendLine($"topics: [{string.Join(", ", notes.Topics.Select(YamlString))}]");
+        sb.AppendLine($"topics: [{string.Join(", ", notes.Topics.Select(MeetingNotesText.WithoutSegmentOrdinals).Select(YamlString))}]");
         sb.AppendLine($"has_open_actions: {(notes.ActionItems.Count > 0 ? "true" : "false")}");
         sb.AppendLine($"has_decisions: {(notes.Decisions.Count > 0 ? "true" : "false")}");
         sb.AppendLine("---");
         sb.AppendLine();
-        sb.AppendLine($"# {notes.MeetingTitle.Replace("\r", " ").Replace("\n", " ")}");
+        sb.AppendLine($"# {MeetingNotesText.WithoutSegmentOrdinals(notes.MeetingTitle).Replace("\r", " ").Replace("\n", " ")}");
         sb.AppendLine();
         sb.AppendLine("## Intelligence Status");
         sb.AppendLine();
@@ -158,19 +158,40 @@ public sealed class MarkdownNotesStorage : INotesStorage
 
         sb.AppendLine("## Summary");
         sb.AppendLine();
-        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Summary) ? "_No summary._" : notes.Summary);
+        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Summary) ? "_No summary._" : MeetingNotesText.WithoutSegmentOrdinals(notes.Summary));
         sb.AppendLine();
 
         sb.AppendLine("## Nuances and Context");
         sb.AppendLine();
-        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Nuances) ? "_None noted._" : notes.Nuances);
+        sb.AppendLine(string.IsNullOrWhiteSpace(notes.Nuances) ? "_None noted._" : MeetingNotesText.WithoutSegmentOrdinals(notes.Nuances));
+        sb.AppendLine();
+
+        sb.AppendLine("## Meeting Notes");
+        sb.AppendLine();
+        if (notes.TopicNotes.Count > 0)
+        {
+            foreach (var topic in notes.TopicNotes)
+            {
+                sb.AppendLine($"### {MeetingNotesText.WithoutSegmentOrdinals(topic.Topic)}");
+                sb.AppendLine();
+                if (topic.Bullets.Count > 0)
+                    foreach (var bullet in topic.Bullets)
+                        sb.AppendLine($"- {MeetingNotesText.WithoutSegmentOrdinals(bullet)}");
+                else
+                    sb.AppendLine("_No transcript-grounded summary is available yet._");
+                sb.AppendLine();
+            }
+        }
+        else
+            sb.AppendLine("_No accepted topics were recorded._");
         sb.AppendLine();
 
         sb.AppendLine("## Topic-by-Topic Narrative");
         sb.AppendLine();
         if (notes.KeyDiscussionPoints.Count > 0)
-            foreach (var point in notes.KeyDiscussionPoints)
+            foreach (var discussionPoint in notes.KeyDiscussionPoints)
             {
+                var point = MeetingNotesText.WithoutSegmentOrdinals(discussionPoint);
                 var separator = point.IndexOf(" — ", StringComparison.Ordinal);
                 if (separator > 0 && separator + 3 < point.Length)
                 {
@@ -190,7 +211,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine();
         if (notes.Decisions.Count > 0)
             foreach (var decision in notes.Decisions)
-                sb.AppendLine($"- {decision}");
+                sb.AppendLine($"- {MeetingNotesText.WithoutSegmentOrdinals(decision)}");
         else
             sb.AppendLine("_No decisions recorded._");
         sb.AppendLine();
@@ -202,7 +223,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
             {
                 var owner = string.IsNullOrWhiteSpace(item.Owner) ? "unspecified" : item.Owner;
                 var due = string.IsNullOrWhiteSpace(item.DueDate) ? "unspecified" : item.DueDate;
-                sb.AppendLine($"- [ ] {item.Description} — **Owner:** {owner} — **Due:** {due}");
+                sb.AppendLine($"- [ ] {MeetingNotesText.WithoutSegmentOrdinals(item.Description)} — **Owner:** {owner} — **Due:** {due}");
             }
         else
             sb.AppendLine("_None._");
@@ -212,7 +233,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine();
         if (notes.OpenQuestions.Count > 0)
             foreach (var q in notes.OpenQuestions)
-                sb.AppendLine($"- {q}");
+                sb.AppendLine($"- {MeetingNotesText.WithoutSegmentOrdinals(q)}");
         else
             sb.AppendLine("_None._");
         sb.AppendLine();
@@ -221,7 +242,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine();
         if (notes.NotableQuotes.Count > 0)
             foreach (var quote in notes.NotableQuotes)
-                sb.AppendLine($"> {quote}");
+                sb.AppendLine($"> {MeetingNotesText.WithoutSegmentOrdinals(quote)}");
         else
             sb.AppendLine("_None._");
         sb.AppendLine();
@@ -230,7 +251,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine();
         if (notes.FollowUpMeetings.Count > 0)
             foreach (var f in notes.FollowUpMeetings)
-                sb.AppendLine($"- {f}");
+                sb.AppendLine($"- {MeetingNotesText.WithoutSegmentOrdinals(f)}");
         else
             sb.AppendLine("_None mentioned._");
 

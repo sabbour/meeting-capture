@@ -32,13 +32,29 @@ internal static class AiUsagePresentation
         var capability = latest is null ? string.Empty : CapabilityLabel(latest.Capability);
         var headerCapability = latest is null ? string.Empty : HeaderCapabilityLabel(latest.Capability);
         var header = Header(state, headerCapability, active?.Elapsed);
-        var status = Status(state, capability, latest);
+        var announcement = Status(state, capability, latest);
+        var input = TokenMetric(snapshot.Capabilities.Select(item => item.InputTokens));
+        var output = TokenMetric(snapshot.Capabilities.Select(item => item.OutputTokens));
+        var total = TokenMetric(snapshot.Capabilities.SelectMany(item =>
+            new[] { item.InputTokens, item.OutputTokens }));
+        var status = $"{announcement} Total tokens: {total}. Input tokens: {input}. Output tokens: {output}.";
         return new(
             state,
             header,
             status,
-            status,
+            announcement,
             $"{state}:{latest?.Capability}:{latest?.Failure}");
+    }
+
+    private static string TokenMetric(IEnumerable<AiReportedLong> metrics)
+    {
+        var values = metrics.ToArray();
+        if (!values.Any(value => value.IsReported))
+            return "Not reported";
+        var total = values.Sum(value => value.Total).ToString("N0", CultureInfo.CurrentCulture);
+        return values.Any(value => value.UnreportedCalls > 0)
+            ? $"{total} (partial; some calls did not report usage)"
+            : total;
     }
 
     private static AiActivityVisualState State(

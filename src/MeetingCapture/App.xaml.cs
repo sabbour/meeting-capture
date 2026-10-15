@@ -1,5 +1,6 @@
 using MeetingCapture.AudioCapture;
 using MeetingCapture.Configuration;
+using MeetingCapture.Diagnostics;
 using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
 using MeetingCapture.Pipeline;
@@ -26,6 +27,7 @@ namespace MeetingCapture;
 /// </summary>
 public partial class App : Application
 {
+    private readonly ResponsivenessDiagnostics _responsiveness;
     private IServiceProvider _services = null!;
     private DispatcherQueue _dispatcherQueue = null!;
 
@@ -36,6 +38,7 @@ public partial class App : Application
 
     private TaskbarIcon? _trayIcon;
     private MenuFlyout _contextMenu = null!;
+    private TrayContextMenuHost? _trayMenuHost;
     private MenuFlyoutItem _statusItem = null!;
     private MenuFlyoutItem _startManualItem = null!;
     private MenuFlyoutItem _stopManualItem = null!;
@@ -54,23 +57,36 @@ public partial class App : Application
     /// <summary>Convenience accessor for the running application's service provider.</summary>
     public static IServiceProvider Services => ((App)Current)._services;
 
-    public App()
+    public App(ResponsivenessDiagnostics responsiveness)
     {
+        _responsiveness = responsiveness;
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.AppInitialize);
         InitializeComponent();
+        // Record type and stack only. Not marking the event handled keeps real failures fatal.
+        UnhandledException += (_, e) => CrashDiagnostics.Record("Application.UnhandledException", e.Exception);
+        AppDomain.CurrentDomain.UnhandledException += (_, e) =>
+            CrashDiagnostics.Record("AppDomain.UnhandledException", e.ExceptionObject as Exception);
     }
 
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.Startup);
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
 
         _services = BuildServiceProvider();
 
-        _pipeline = _services.GetRequiredService<MeetingPipeline>();
-        _logger = _services.GetRequiredService<ILogger<App>>();
-        _settings = _services.GetRequiredService<IOptions<AppSettings>>().Value;
-        _meetingIdentity = _services.GetRequiredService<IActiveMeetingIdentityProvider>();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.ServiceResolution))
+        {
+            _pipeline = _services.GetRequiredService<MeetingPipeline>();
+            _logger = _services.GetRequiredService<ILogger<App>>();
+            _settings = _services.GetRequiredService<IOptions<AppSettings>>().Value;
+            _meetingIdentity = _services.GetRequiredService<IActiveMeetingIdentityProvider>();
+        }
+        _responsiveness.SetFailureReporter(type =>
+            _logger.LogWarning("Cannot write the window-response log ({Type}).", type));
 
-        ValidateAndWarnSettings(_settings, _services.GetRequiredService<ILogger<App>>());
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.SettingsValidation))
+            ValidateAndWarnSettings(_settings, _services.GetRequiredService<ILogger<App>>());
 
         // MainWindow: create without hiding. The tray icon is published only after the
         // first view load so its callbacks never compete with WinUI startup.
@@ -78,7 +94,8 @@ public partial class App : Application
         // WinUI 3 / DirectComposition compositor; the subsequent AppWindow.Show() call
         // in ShowFromTray() resumes it cleanly. Never use SetWindowPos-only to show a
         // window that was hidden via AppWindow.Hide().
-        _mainWindow = _services.GetRequiredService<MainWindow>();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowConstruction))
+            _mainWindow = _services.GetRequiredService<MainWindow>();
         _mainWindow.MeetingConfirmRequested += (_, session) => ConfirmPendingSession(session);
         _mainWindow.MeetingDismissRequested += (_, _) => DismissPendingSession();
         _mainWindow.MeetingSnoozeRequested += (_, _) => SnoozeDetection();
@@ -112,6 +129,7 @@ public partial class App : Application
         var storage = _services.GetRequiredService<IMeetingVisualizationStorage>();
         _ = Task.Run(async () =>
         {
+            using var phase = _responsiveness.BeginBackgroundPhase(ResponsivenessPhase.VisualizationRecovery);
             try
             {
                 var recovered = await journal.DrainAsync(storage, CancellationToken.None);
@@ -122,6 +140,7 @@ public partial class App : Application
             }
             catch (Exception ex)
             {
+                phase.Fail(ex);
                 _logger.LogWarning(
                     "Deferred meeting visualization recovery did not finish ({Type}); it will be retried later.",
                     ex.GetType().Name);
@@ -135,31 +154,38 @@ public partial class App : Application
     {
         _ = Task.Run(async () =>
         {
+            using var phase = _responsiveness.BeginBackgroundPhase(ResponsivenessPhase.DetectorStart);
             try
             {
                 await _pipeline.StartDetectorAsync(CancellationToken.None);
             }
             catch (Exception ex)
             {
+                phase.Fail(ex);
                 _logger.LogError("Meeting detector startup failed ({Type}).", ex.GetType().Name);
                 InvokeOnUi(() => UpdateStatus("Meeting detector failed. Manual recording is still available."));
             }
         });
     }
 
-    private static IServiceProvider BuildServiceProvider()
+    private IServiceProvider BuildServiceProvider()
     {
-        var userSettingsPath = UserSettingsManager.SettingsFilePath;
+        IConfigurationRoot config;
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.ConfigurationRead))
+        {
+            var userSettingsPath = UserSettingsManager.SettingsFilePath;
+            config = new ConfigurationBuilder()
+                .SetBasePath(AppContext.BaseDirectory)
+                .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+                .AddJsonFile(userSettingsPath, optional: true, reloadOnChange: false)
+                .AddUserSecrets<App>(optional: true)
+                .AddEnvironmentVariables()
+                .Build();
+        }
 
-        var config = new ConfigurationBuilder()
-            .SetBasePath(AppContext.BaseDirectory)
-            .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
-            .AddJsonFile(userSettingsPath, optional: true, reloadOnChange: false)
-            .AddUserSecrets<App>(optional: true)
-            .AddEnvironmentVariables()
-            .Build();
-
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.ServiceRegistration);
         var services = new ServiceCollection();
+        services.AddSingleton(_responsiveness);
         services.AddSingleton<IConfiguration>(config);
         services.AddSingleton<IConfigurationRoot>(config);
 
@@ -225,7 +251,8 @@ public partial class App : Application
             sp.GetRequiredService<IActiveRosterProvider>(),
             sp.GetRequiredService<MeetingVisualizationSession>(),
             sp.GetRequiredService<IMeetingVisualizationStorage>(),
-            sp.GetRequiredService<CopilotModelCatalog>()));
+            sp.GetRequiredService<CopilotModelCatalog>(),
+            sp.GetRequiredService<ResponsivenessDiagnostics>()));
 
         return services.BuildServiceProvider();
     }
@@ -234,6 +261,7 @@ public partial class App : Application
 
     private void BuildTrayIcon()
     {
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.TrayCreate);
         System.Windows.Input.ICommand Command(Action action) => new RelayCommand(() => InvokeOnUi(action));
         _statusItem = new MenuFlyoutItem { Text = "Watching for meetings...", IsEnabled = false };
 
@@ -264,11 +292,17 @@ public partial class App : Application
         var settingsItem = new MenuFlyoutItem { Text = "Settings" };
         settingsItem.Command = Command(ShowMainWindowThenSettings);
 
+        var aboutItem = new MenuFlyoutItem { Text = "About" };
+        aboutItem.Command = Command(ShowAbout);
+
         var exitItem = new MenuFlyoutItem { Text = "Exit" };
         exitItem.Command = Command(OnExit);
 
         var presenterStyle = new Style(typeof(MenuFlyoutPresenter));
-        presenterStyle.Setters.Add(new Setter(FrameworkElement.MinWidthProperty, 280d));
+        presenterStyle.Setters.Add(new Setter(FrameworkElement.WidthProperty, 360d));
+        presenterStyle.Setters.Add(new Setter(FrameworkElement.MinWidthProperty, 360d));
+        presenterStyle.Setters.Add(new Setter(FrameworkElement.MaxWidthProperty, 360d));
+        presenterStyle.Setters.Add(new Setter(FrameworkElement.MaxHeightProperty, 480d));
         _contextMenu = new MenuFlyout
         {
             AreOpenCloseAnimationsEnabled = false,
@@ -292,15 +326,18 @@ public partial class App : Application
         _contextMenu.Items.Add(new MenuFlyoutSeparator());
         _contextMenu.Items.Add(openNotesItem);
         _contextMenu.Items.Add(settingsItem);
+        _contextMenu.Items.Add(aboutItem);
         _contextMenu.Items.Add(new MenuFlyoutSeparator());
         _contextMenu.Items.Add(exitItem);
 
+        var openMainWindowCommand = new TrayApp.RelayCommand(() => ShowMainWindow(fromTray: true));
+        _trayMenuHost = new TrayContextMenuHost(_contextMenu);
         _trayIcon = new TaskbarIcon
         {
             ToolTipText = "Meeting Capture \u2014 Watching...",
-            ContextMenuMode = ContextMenuMode.SecondWindow,
-            ContextFlyout = _contextMenu,
-            LeftClickCommand = new TrayApp.RelayCommand(() => ShowMainWindow(fromTray: true)),
+            LeftClickCommand = openMainWindowCommand,
+            DoubleClickCommand = openMainWindowCommand,
+            RightClickCommand = new TrayApp.RelayCommand(() => InvokeOnUi(() => _trayMenuHost?.Show())),
         };
 
         TrySetTrayIconSource();
@@ -347,7 +384,7 @@ public partial class App : Application
 
     public void ShowMainWindow(bool fromTray = false)
     {
-        if (_mainWindow is null) return;
+        if (_mainWindow is null || _mainWindow.IsClosing) return;
         void Show()
         {
             if (fromTray)
@@ -355,10 +392,14 @@ public partial class App : Application
             else
             {
                 _mainWindow.PositionFlyout();
-                _mainWindow.AppWindow.Show();
-                _mainWindow.Activate();
+                using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+                    _mainWindow.AppWindow.Show();
+                _responsiveness.SetWindowState(visible: _mainWindow.AppWindow.IsVisible);
+                using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowActivate))
+                    _mainWindow.Activate();
                 var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_mainWindow);
-                NativeMethods.SetForegroundWindow(hwnd);
+                using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowForeground))
+                    NativeMethods.SetForegroundWindow(hwnd);
                 _mainWindow.RefreshTodaysMeetings();
             }
         }
@@ -369,16 +410,36 @@ public partial class App : Application
             _logger.LogWarning("Window activation could not be queued.");
     }
 
+    private void ShowAbout()
+    {
+        if (_mainWindow is null || _mainWindow.IsClosing) return;
+        ShowMainWindow();
+        InvokeOnUi(async () =>
+        {
+            try
+            {
+                if (_mainWindow.IsClosing || _mainWindow.Content?.XamlRoot is not { } root) return;
+                await TrayApp.AboutDialog.ShowAsync(root);
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "About dialog failed."); }
+        });
+    }
+
     private void ShowMainWindowThenSettings()
     {
         if (_mainWindow is null) return;
         InvokeOnUi(() =>
         {
+            if (_mainWindow.IsClosing) return;
             _mainWindow.PositionFlyout();
-            _mainWindow.AppWindow.Show();
-            _mainWindow.Activate();
+            using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+                _mainWindow.AppWindow.Show();
+            _responsiveness.SetWindowState(visible: _mainWindow.AppWindow.IsVisible);
+            using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowActivate))
+                _mainWindow.Activate();
             var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_mainWindow);
-            NativeMethods.SetForegroundWindow(hwnd);
+            using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowForeground))
+                NativeMethods.SetForegroundWindow(hwnd);
             _mainWindow.ShowSettings();
         });
     }
@@ -641,28 +702,48 @@ public partial class App : Application
         UpdateStatus("Finishing capture before exit...");
         _ = Task.Run(async () =>
         {
+            ExitReadiness readiness;
             try
             {
-                var readiness = await _pipeline.PrepareForExitAsync();
-                if (readiness.HasDeferredWork)
-                {
-                    _logger.LogWarning(
-                        "Exit completed with deferred visualization work ({Deferral}, {ErrorType}).",
-                        readiness.Deferral, readiness.ErrorType ?? "unknown");
-                    InvokeOnUi(() => _trayIcon?.ShowNotification("Meeting Capture", readiness.Message!));
-                }
+                readiness = await _pipeline.PrepareForExitAsync();
             }
             catch (Exception ex)
             {
-                ReportActionFailure("Shutdown", ex);
-                InvokeOnUi(() =>
+                var confirmed = false;
+                if (_pipeline.CanForceCloseAfterSavedPartial)
                 {
-                    _exiting = false;
-                    _mainWindow?.ExitFailed();
-                    _startManualItem.IsEnabled = _pipeline.CanStart;
-                    _stopManualItem.IsEnabled = _pipeline.CanStop;
-                });
-                return;
+                    try { confirmed = await ConfirmCloseAfterSavedPartialAsync(); }
+                    catch (Exception dialogError) { ReportActionFailure("Shutdown confirmation", dialogError); }
+                }
+                if (ExitReadiness.ShouldCloseAfterSavedPartial(
+                        _pipeline.CanForceCloseAfterSavedPartial, confirmed))
+                {
+                    _logger.LogWarning(
+                        "User confirmed app close with an owned Speech operation after the partial transcript was saved.");
+                    InvokeOnUi(CloseApplication);
+                    return;
+                }
+                if (confirmed)
+                {
+                    try { readiness = await _pipeline.PrepareForExitAsync(); }
+                    catch (Exception retryError)
+                    {
+                        RestoreAfterExitFailure(retryError);
+                        return;
+                    }
+                }
+                else
+                {
+                    RestoreAfterExitFailure(ex);
+                    return;
+                }
+            }
+            if (readiness.HasDeferredWork)
+            {
+                _logger.LogWarning(
+                    "Exit completed with deferred visualization work ({Deferral}, {ErrorType}).",
+                    readiness.Deferral, readiness.ErrorType ?? "unknown");
+                InvokeOnUi(() => _trayIcon?.ShowNotification("Meeting Capture", readiness.Message!));
             }
             try
             {
@@ -681,18 +762,50 @@ public partial class App : Application
                 InvokeOnUi(() => _trayIcon?.ShowNotification("Meeting Capture",
                     "Transcript saved. Background cleanup did not finish; closing the app."));
             }
-            InvokeOnUi(() =>
-            {
-                _pipeline.StateChanged -= OnPipelineStatusChanged;
-                _pipeline.NotesSaved -= OnNotesSaved;
-                _pipeline.MeetingDetected -= OnMeetingDetected;
-                _pipeline.PendingMeetingCancelled -= OnPendingMeetingCancelled;
-                _trayIcon?.Dispose();
-                _trayIcon = null;
-                _mainWindow?.CloseForReal();
-                Current.Exit();
-            });
+            InvokeOnUi(CloseApplication);
         });
+    }
+
+    private Task<bool> ConfirmCloseAfterSavedPartialAsync()
+    {
+        var window = _mainWindow;
+        if (window is null || !_pipeline.CanForceCloseAfterSavedPartial)
+            return Task.FromResult(false);
+        var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_dispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, async () =>
+            {
+                try { decision.TrySetResult(await window.ConfirmCloseAfterSavedPartialAsync()); }
+                catch (Exception ex) { decision.TrySetException(ex); }
+            }))
+            decision.TrySetResult(false);
+        return decision.Task;
+    }
+
+    private void RestoreAfterExitFailure(Exception error)
+    {
+        ReportActionFailure("Shutdown", error);
+        InvokeOnUi(() =>
+        {
+            _exiting = false;
+            _mainWindow?.ExitFailed();
+            _startManualItem.IsEnabled = _pipeline.CanStart;
+            _stopManualItem.IsEnabled = _pipeline.CanStop;
+        });
+    }
+
+    private void CloseApplication()
+    {
+        _pipeline.StateChanged -= OnPipelineStatusChanged;
+        _pipeline.NotesSaved -= OnNotesSaved;
+        _pipeline.MeetingDetected -= OnMeetingDetected;
+        _pipeline.PendingMeetingCancelled -= OnPendingMeetingCancelled;
+        _trayIcon?.Dispose();
+        _trayIcon = null;
+        _trayMenuHost?.Dispose();
+        _trayMenuHost = null;
+        _mainWindow?.CloseForReal();
+        _responsiveness.Dispose();
+        Current.Exit();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -730,7 +843,7 @@ public partial class App : Application
         InvokeOnUi(() => _trayIcon?.ShowNotification("Meeting Capture", $"{action} failed. Check the recording status and settings."));
     }
 
-    private static void ValidateAndWarnSettings(AppSettings settings, ILogger logger)
+    private void ValidateAndWarnSettings(AppSettings settings, ILogger logger)
     {
         if (string.IsNullOrWhiteSpace(settings.Transcription.ApiKey)
             && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_SPEECH_KEY")))
@@ -763,6 +876,7 @@ public partial class App : Application
                 "Set Intelligence:Endpoint in appsettings.json.");
         }
 
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.NotesDirectoryCheck);
         if (!Directory.Exists(settings.Storage.NotesPath))
         {
             try

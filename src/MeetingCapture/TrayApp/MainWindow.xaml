@@ -955,11 +955,19 @@
         <!-- ════════════════ STATE 2: RECORDING ════════════════ -->
         <Grid x:Name="RecordingPanel" Grid.Row="1" Visibility="Collapsed">
             <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <ScrollViewer x:Name="RecordingBodyScroll"
+                          Grid.Row="0"
+                          VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+            <Grid x:Name="RecordingBody">
+            <Grid.RowDefinitions>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
                 <RowDefinition Height="Auto"/>
-                <RowDefinition x:Name="RecordingTranscriptRow" Height="*"/>
                 <RowDefinition Height="Auto"/>
             </Grid.RowDefinitions>
             <ScrollViewer x:Name="RecordingOverviewScroll"
@@ -1261,90 +1269,6 @@
                 <Button x:Name="CancelRetryButton" Content="Cancel AI retry" Click="OnCancelRetryClick" Visibility="Collapsed"/>
             </StackPanel>
 
-            <!-- Stop + re-entry buttons -->
-            <Grid x:Name="RecordingFooter" Grid.Row="5" Padding="16,10,16,8" ColumnSpacing="8">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <Button x:Name="StopButton"
-                        Grid.Column="0"
-                        HorizontalAlignment="Stretch"
-                        Padding="12,8"
-                        Click="OnStopClick">
-                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
-                        <FontIcon FontFamily="{StaticResource SymbolThemeFontFamily}" Glyph="&#xE71A;" FontSize="14"/>
-                        <TextBlock Text="Stop" Style="{StaticResource BodyStrongTextBlockStyle}"/>
-                    </StackPanel>
-                </Button>
-                <Button x:Name="NewRecordingButton" Grid.Column="0" Content="New recording" Click="OnStartClick"
-                        Visibility="Collapsed" IsEnabled="False" HorizontalAlignment="Stretch"/>
-                <Button x:Name="BackToMeetingsButton" Grid.Column="1" Content="Back to meetings"
-                        Click="OnBackToMeetingsClick" Visibility="Collapsed"/>
-                <Button x:Name="WhatDidIMissButton"
-                        Grid.Column="1"
-                        Visibility="Collapsed"
-                        HorizontalAlignment="Stretch"
-                        Padding="12,8"
-                        ToolTipService.ToolTip="Open a catch-up recap of this recording"
-                        AutomationProperties.Name="Catch me up on this recording"
-                        Click="OnWhatDidIMissClick">
-                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
-                        <FontIcon FontFamily="{StaticResource SymbolThemeFontFamily}" Glyph="&#xE8BD;" FontSize="14"/>
-                        <TextBlock Text="Catch me up" Style="{StaticResource BodyStrongTextBlockStyle}"/>
-                    </StackPanel>
-                </Button>
-                <Border x:Name="SaveDecisionPanel"
-                        Grid.ColumnSpan="2"
-                        Visibility="Collapsed"
-                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
-                        BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
-                        BorderThickness="1"
-                        CornerRadius="8"
-                        Padding="12">
-                    <Grid ColumnSpacing="8">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
-                        <Button x:Name="DiscardRecordingButton"
-                                Content="Discard"
-                                AccessKey="D"
-                                Click="OnDiscardRecordingClick"
-                                AutomationProperties.Name="Discard recording and transcript"/>
-                        <Button x:Name="SaveRecordingNowButton"
-                                Grid.Column="1"
-                                MinWidth="180"
-                                Padding="0"
-                                HorizontalAlignment="Stretch"
-                                HorizontalContentAlignment="Stretch"
-                                AccessKey="S"
-                                Click="OnSaveRecordingNowClick"
-                                AutomationProperties.Name="Save recording now"
-                                ToolTipService.ToolTip="Save immediately instead of waiting for automatic save">
-                            <Grid Height="36">
-                                <Border x:Name="SaveCountdownFill"
-                                        Background="{ThemeResource AccentFillColorTertiaryBrush}"
-                                        CornerRadius="3"
-                                        IsHitTestVisible="False"
-                                        RenderTransformOrigin="0,0.5">
-                                    <Border.RenderTransform>
-                                        <ScaleTransform x:Name="SaveCountdownFillTransform" ScaleX="0"/>
-                                    </Border.RenderTransform>
-                                </Border>
-                                <TextBlock x:Name="SaveCountdownButtonLabel"
-                                           Text="Save now"
-                                           Margin="12,0"
-                                           HorizontalAlignment="Center"
-                                           VerticalAlignment="Center"
-                                           Style="{StaticResource BodyStrongTextBlockStyle}"/>
-                            </Grid>
-                        </Button>
-                    </Grid>
-                </Border>
-            </Grid>
-
-            <!-- The transcript owns the remaining height; details never displace Stop. -->
             <Expander x:Name="TranscriptExpander"
                       Grid.Row="4"
                       Margin="16,4,16,12"
@@ -1389,7 +1313,7 @@
                                Margin="16"
                                FontSize="14"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-                        <ListView x:Name="TranscriptList" Grid.Row="1" Visibility="Collapsed"
+                        <ListView x:Name="TranscriptList" Grid.Row="1" Visibility="Collapsed" MaxHeight="180"
                                   SelectionMode="None" IsItemClickEnabled="False"
                                   Loaded="OnTranscriptLoaded" ScrollViewer.VerticalScrollBarVisibility="Auto">
                             <ListView.ItemContainerStyle>
@@ -1470,11 +1394,112 @@
                     </Grid>
                 </Border>
             </Expander>
+            </Grid>
+            </ScrollViewer>
+
+            <!-- Keep recording controls outside the scrollable body. -->
+            <Grid x:Name="RecordingFooter" Grid.Row="1" Padding="16,10,16,8" ColumnSpacing="8">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="Auto"/>
+                </Grid.RowDefinitions>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Button x:Name="StopButton"
+                        Grid.Column="0"
+                        Grid.ColumnSpan="2"
+                        Grid.Row="0"
+                        HorizontalAlignment="Stretch"
+                        Padding="12,8"
+                        Click="OnStopClick">
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                        <FontIcon FontFamily="{StaticResource SymbolThemeFontFamily}" Glyph="&#xE71A;" FontSize="14"/>
+                        <TextBlock Text="Stop" Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                    </StackPanel>
+                </Button>
+                <Button x:Name="NewRecordingButton" Grid.Column="0" Grid.Row="0" Content="New recording" Click="OnStartClick"
+                        Visibility="Collapsed" IsEnabled="False" HorizontalAlignment="Stretch"
+                        Style="{StaticResource AccentButtonStyle}"
+                        AutomationProperties.Name="Start a new recording"/>
+                <Button x:Name="BackToMeetingsButton" Grid.Column="1" Grid.Row="0" Content="Back to meetings"
+                        Click="OnBackToMeetingsClick" Visibility="Collapsed"/>
+                <TextBlock x:Name="NewRecordingHint" Grid.Row="2" Grid.ColumnSpan="2"
+                           Margin="0,6,0,0" TextWrapping="Wrap" Visibility="Collapsed"
+                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                           AutomationProperties.LiveSetting="Polite"/>
+                <Button x:Name="WhatDidIMissButton"
+                        Grid.Row="1"
+                        Grid.ColumnSpan="2"
+                        Visibility="Collapsed"
+                        HorizontalAlignment="Stretch"
+                        MinHeight="40"
+                        Padding="12,8"
+                        ToolTipService.ToolTip="Open a catch-up recap of this recording"
+                        AutomationProperties.Name="Catch me up on this recording"
+                        Click="OnWhatDidIMissClick">
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Center">
+                        <FontIcon FontFamily="{StaticResource SymbolThemeFontFamily}" Glyph="&#xE8BD;" FontSize="14"/>
+                        <TextBlock Text="Catch me up" Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                    </StackPanel>
+                </Button>
+                <Border x:Name="SaveDecisionPanel"
+                        Grid.Row="0"
+                        Grid.ColumnSpan="2"
+                        Grid.RowSpan="2"
+                        Visibility="Collapsed"
+                        Background="{ThemeResource CardBackgroundFillColorDefaultBrush}"
+                        BorderBrush="{ThemeResource AccentFillColorDefaultBrush}"
+                        BorderThickness="1"
+                        CornerRadius="8"
+                        Padding="12">
+                    <Grid ColumnSpacing="8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="DiscardRecordingButton"
+                                Content="Discard"
+                                AccessKey="D"
+                                Click="OnDiscardRecordingClick"
+                                AutomationProperties.Name="Discard recording and transcript"/>
+                        <Button x:Name="SaveRecordingNowButton"
+                                Grid.Column="1"
+                                MinWidth="180"
+                                Padding="0"
+                                HorizontalAlignment="Stretch"
+                                HorizontalContentAlignment="Stretch"
+                                AccessKey="S"
+                                Click="OnSaveRecordingNowClick"
+                                AutomationProperties.Name="Save recording now"
+                                ToolTipService.ToolTip="Save immediately instead of waiting for automatic save">
+                            <Grid Height="36">
+                                <Border x:Name="SaveCountdownFill"
+                                        Background="{ThemeResource AccentFillColorTertiaryBrush}"
+                                        CornerRadius="3"
+                                        IsHitTestVisible="False"
+                                        RenderTransformOrigin="0,0.5">
+                                    <Border.RenderTransform>
+                                        <ScaleTransform x:Name="SaveCountdownFillTransform" ScaleX="0"/>
+                                    </Border.RenderTransform>
+                                </Border>
+                                <TextBlock x:Name="SaveCountdownButtonLabel"
+                                           Text="Save now"
+                                           Margin="12,0"
+                                           HorizontalAlignment="Center"
+                                           VerticalAlignment="Center"
+                                           Style="{StaticResource BodyStrongTextBlockStyle}"/>
+                            </Grid>
+                        </Button>
+                    </Grid>
+                </Border>
+            </Grid>
 
             <!-- Catch me up owns a visible result surface; it never overwrites Current topic. -->
             <Border x:Name="CatchUpPanel"
                     Grid.Row="0"
-                    Grid.RowSpan="5"
                     Visibility="Collapsed"
                     Margin="12,8,12,8"
                     Padding="16,14"
@@ -1671,7 +1696,11 @@
                     </Button>
                 </Grid>
                 <Grid Grid.Row="1" Margin="0,10,0,6" ColumnSpacing="8" RowSpacing="6">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*"/>
+                    </Grid.ColumnDefinitions>
                     <Button x:Name="GoToCurrentTopicButton"
+                            Grid.Column="0"
                             HorizontalAlignment="Left"
                             Content="Go to current topic"
                             ToolTipService.ToolTip="Select the live topic and bring it into view"
@@ -1685,33 +1714,38 @@
                            Style="{StaticResource CaptionTextBlockStyle}"
                            Foreground="{ThemeResource TextFillColorSecondaryBrush}"
                            AutomationProperties.LiveSetting="Polite"/>
-                <Grid Grid.Row="3">
+                <Grid x:Name="TopicMapBodyGrid" Grid.Row="3" SizeChanged="OnTopicMapBodySizeChanged">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition x:Name="TopicMapMainColumn" Width="3*"/>
+                        <ColumnDefinition x:Name="TopicNotesColumn" Width="2*" MinWidth="260"/>
+                    </Grid.ColumnDefinitions>
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto"/>
-                        <RowDefinition Height="*"/>
+                        <RowDefinition x:Name="TopicMapMainRow" Height="*"/>
+                        <RowDefinition x:Name="TopicNotesRow" Height="0"/>
                     </Grid.RowDefinitions>
                     <TextBlock x:Name="TopicTimelineGuideText"
                                Margin="0,0,0,6"
-                               Text="Choose a topic from the chronological strip to center its grounded map. Returned marks a revisit; Now marks the live topic. Go to current topic selects the latest event."
+                               Visibility="Collapsed"
+                               Text="The meeting title branches to every topic, with grounded points, decisions, open questions and actions."
                                TextWrapping="Wrap"
                                Style="{StaticResource CaptionTextBlockStyle}"
                                Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
                     <Grid x:Name="TopicMapCombinedView"
-                          Grid.Row="1"
+                          Grid.Row="0"
+                          Grid.Column="0"
                           RowSpacing="8"
-                          AutomationProperties.Name="Topic timeline and grounded mind map">
+                          AutomationProperties.Name="Whole-meeting topic map">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="*"/>
                             <ColumnDefinition x:Name="TopicDetailColumn" Width="0"/>
                         </Grid.ColumnDefinitions>
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="106"/>
                             <RowDefinition Height="*"/>
-                            <RowDefinition x:Name="TopicDetailRow" Height="Auto"/>
                         </Grid.RowDefinitions>
                     <TextBlock x:Name="TimelineEmptyText"
                                   Grid.Row="0"
                                   Grid.ColumnSpan="2"
+                                  Visibility="Collapsed"
                                   Text="No topics yet. As topics are accepted, they will appear here in meeting order."
                                   TextWrapping="Wrap"
                                   MaxWidth="380"
@@ -1719,22 +1753,24 @@
                                   VerticalAlignment="Center"
                                   Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
                     <Grid x:Name="BrainMapView"
-                          Grid.Row="1"
+                          Grid.Row="0"
+                          Grid.Column="0"
                           SizeChanged="OnBrainMapViewSizeChanged"
-                          AutomationProperties.Name="Grounded spatial brain map">
+                          AutomationProperties.Name="Whole-meeting topic map">
                         <ScrollViewer HorizontalScrollBarVisibility="Auto"
                                       VerticalScrollBarVisibility="Auto"
                                       HorizontalScrollMode="Enabled"
-                                      VerticalScrollMode="Enabled">
+                                      VerticalScrollMode="Enabled"
+                                      x:Name="BrainMapScrollViewer">
                             <Grid>
                                 <Canvas x:Name="BrainMapCanvas"
                                         MinWidth="320"
                                         MinHeight="280"
-                                        AutomationProperties.Name="Grounded topic branches"/>
+                                        AutomationProperties.Name="Whole-meeting topic branches and grounded details"/>
                                 <TextBlock x:Name="BrainMapEmptyText"
                                            MaxWidth="420"
                                            Margin="24"
-                                           Text="No connected topics yet. Grounded relationships and meeting details will appear here."
+                                           Text="No connected topics yet. Grounded points and meeting details will appear here."
                                            TextWrapping="Wrap"
                                            TextAlignment="Center"
                                            HorizontalAlignment="Center"
@@ -1766,7 +1802,7 @@
                                   HorizontalScrollMode="Enabled"
                                   VerticalScrollMode="Disabled"
                                   Visibility="Collapsed"
-                                  AutomationProperties.Name="Chronological topic selector. Select a topic to center its mind map.">
+                                  AutomationProperties.Name="Topic selector">
                         <ItemsControl x:Name="TrailList">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
@@ -1867,8 +1903,9 @@
                         </ItemsControl>
                     </ScrollViewer>
                     <Border x:Name="TopicDetailPanel"
-                            Grid.Row="1"
+                            Grid.Row="0"
                             Grid.Column="1"
+                            Visibility="Collapsed"
                             Margin="8,0,0,0"
                             Padding="12"
                             CornerRadius="10"
@@ -2092,6 +2129,135 @@
                     </ScrollViewer>
                     </Border>
                     </Grid>
+                    <ScrollViewer x:Name="MeetingNotesView"
+                                  Grid.Row="0"
+                                  Grid.Column="1"
+                                  VerticalScrollBarVisibility="Auto"
+                                  Padding="12,12,18,12"
+                                  AutomationProperties.Name="Meeting notes by topic">
+                        <StackPanel Spacing="12">
+                            <TextBlock Text="Meeting notes"
+                                       Style="{StaticResource SubtitleTextBlockStyle}"/>
+                            <TextBlock x:Name="MeetingNotesWorkIqStatusText"
+                                       TextWrapping="Wrap"
+                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       Visibility="Collapsed"
+                                       AutomationProperties.LiveSetting="Polite"/>
+                            <Button x:Name="MeetingNotesWorkIqSignInButton"
+                                    Content="Sign in to Work IQ"
+                                    Click="OnWorkIqSignInClick"
+                                    Visibility="Collapsed"/>
+                            <TextBlock x:Name="MeetingNotesEmptyText"
+                                       Text="No accepted topics yet. Meeting notes will appear as topics are accepted."
+                                       TextWrapping="Wrap"
+                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                       Visibility="Collapsed"/>
+                            <ItemsControl x:Name="MeetingNotesList">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate>
+                                        <StackPanel Spacing="7" Margin="0,0,0,14">
+                                            <Border x:Name="MeetingNotesHeading"
+                                                    Tag="{Binding Id}"
+                                                    Padding="8,6"
+                                                    CornerRadius="8"
+                                                    Background="{ThemeResource CardBackgroundFillColorSecondaryBrush}"
+                                                    BorderBrush="{ThemeResource CardStrokeColorDefaultBrush}"
+                                                    BorderThickness="1">
+                                                <Grid ColumnSpacing="8">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="*"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                        <ColumnDefinition Width="Auto"/>
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding Heading}"
+                                                               VerticalAlignment="Center"
+                                                               Style="{StaticResource BodyStrongTextBlockStyle}"
+                                                               TextWrapping="Wrap"/>
+                                                    <Border Grid.Column="1"
+                                                            Background="{ThemeResource AccentFillColorSecondaryBrush}"
+                                                            CornerRadius="8"
+                                                            Padding="6,2"
+                                                            VerticalAlignment="Center"
+                                                            Visibility="{Binding IsCurrent, Converter={StaticResource BoolToVisibleConverter}}">
+                                                        <TextBlock Text="Now" FontSize="11" FontWeight="SemiBold"/>
+                                                    </Border>
+                                                    <Button Grid.Column="2"
+                                                            Tag="{Binding Id}"
+                                                            Width="28" Height="28" Padding="0"
+                                                            VerticalAlignment="Center"
+                                                            Click="OnNotesTopicToggleClick"
+                                                            AutomationProperties.AutomationId="NotesTopicToggle"
+                                                            AutomationProperties.Name="{Binding ToggleName}"
+                                                            ToolTipService.ToolTip="{Binding ToggleName}">
+                                                        <FontIcon FontFamily="{StaticResource SymbolThemeFontFamily}"
+                                                                  Glyph="{Binding ToggleGlyph}"
+                                                                  FontSize="12"/>
+                                                    </Button>
+                                                </Grid>
+                                            </Border>
+                                            <StackPanel Spacing="7"
+                                                        Visibility="{Binding IsExpanded, Converter={StaticResource BoolToVisibleConverter}}">
+                                            <ItemsControl ItemsSource="{Binding Bullets}"
+                                                          Visibility="{Binding HasBullets, Converter={StaticResource BoolToVisibleConverter}}">
+                                                <ItemsControl.ItemTemplate>
+                                                    <DataTemplate>
+                                                        <Grid ColumnSpacing="8" Margin="8,0,0,0">
+                                                            <Grid.ColumnDefinitions>
+                                                                <ColumnDefinition Width="12"/>
+                                                                <ColumnDefinition Width="*"/>
+                                                            </Grid.ColumnDefinitions>
+                                                            <TextBlock Text="•"
+                                                                       FontWeight="SemiBold"
+                                                                       Foreground="{ThemeResource AccentFillColorDefaultBrush}"/>
+                                                            <TextBlock Grid.Column="1"
+                                                                       Text="{Binding}"
+                                                                       TextWrapping="Wrap"
+                                                                       LineHeight="20"/>
+                                                        </Grid>
+                                                    </DataTemplate>
+                                                </ItemsControl.ItemTemplate>
+                                            </ItemsControl>
+                                            <TextBlock Text="No transcript-grounded summary is available for this topic."
+                                                       Margin="8,0,0,0"
+                                                       TextWrapping="Wrap"
+                                                       Style="{StaticResource CaptionTextBlockStyle}"
+                                                       Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                       Visibility="{Binding HasNoBullets, Converter={StaticResource BoolToVisibleConverter}}"/>
+                                            <StackPanel Spacing="5"
+                                                        Visibility="{Binding HasSuggestions, Converter={StaticResource BoolToVisibleConverter}}">
+                                                <TextBlock Text="Suggestions from Work IQ — not from this meeting"
+                                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                                                           TextWrapping="Wrap"/>
+                                                <ItemsControl ItemsSource="{Binding Suggestions}">
+                                                    <ItemsControl.ItemTemplate>
+                                                        <DataTemplate>
+                                                            <StackPanel Spacing="3" Margin="8,0,0,6">
+                                                                <TextBlock Text="{Binding SourceType}"
+                                                                           Style="{StaticResource CaptionTextBlockStyle}"
+                                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
+                                                                <TextBlock Text="{Binding Title}"
+                                                                           TextWrapping="Wrap"
+                                                                           FontWeight="SemiBold"/>
+                                                                <Button Content="Open source"
+                                                                        Tag="{Binding SourceUrl}"
+                                                                        Click="OnOpenContextSourceClick"
+                                                                        Visibility="{Binding CanOpen, Converter={StaticResource BoolToVisibleConverter}}"
+                                                                        HorizontalAlignment="Left"
+                                                                        AutomationProperties.Name="{Binding OpenActionName}"/>
+                                                            </StackPanel>
+                                                        </DataTemplate>
+                                                    </ItemsControl.ItemTemplate>
+                                                </ItemsControl>
+                                            </StackPanel>
+                                            </StackPanel>
+                                        </StackPanel>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
+                    </ScrollViewer>
                 </Grid>
             </Grid>
         </Border>

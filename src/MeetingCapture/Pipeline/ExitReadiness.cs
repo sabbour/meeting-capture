@@ -26,6 +26,9 @@ public sealed record ExitReadiness(
 
     public bool HasDeferredWork => Deferral != ExitDeferralKind.None;
 
+    public static bool ShouldCloseAfterSavedPartial(bool partialIsDurable, bool userConfirmed) =>
+        partialIsDurable && userConfirmed;
+
     /// <summary>Sanitized user guidance: never includes transcript or meeting content.</summary>
     public string? Message => Deferral switch
     {

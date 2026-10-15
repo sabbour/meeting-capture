@@ -6,13 +6,16 @@ internal static class Program
 {
     public static async Task<int> Main()
     {
+        using var diagnostics = new TemporaryDirectory();
+        MeetingCapture.Diagnostics.CrashDiagnostics.DirectoryOverride = diagnostics.Path;
         var tests = CoreChecks.Cases().Concat(DetectionChecks.Cases()).Concat(PipelineChecks.Cases())
             .Concat(UiStateChecks.Cases()).Concat(MeetingTitleChecks.Cases()).Concat(SignInChecks.Cases())
             .Concat(WorkIqChecks.Cases()).Concat(WorkIqAuthSnapshotChecks.Cases())
             .Concat(CallSignalChecks.Cases()).Concat(ShutdownChecks.Cases())
             .Concat(AudioMixingChecks.Cases()).Concat(RelatedContextChecks.Cases())
             .Concat(VisualizationChecks.Cases()).Concat(AiUsageChecks.Cases())
-            .Concat(AiDiagnosticsChecks.Cases()).Concat(StartupFailureChecks.Cases()).ToArray();
+            .Concat(AiDiagnosticsChecks.Cases()).Concat(StartupFailureChecks.Cases())
+            .Concat(ResponsivenessChecks.Cases()).Concat(StartupPriorityChecks.Cases()).Concat(AboutChecks.Cases()).ToArray();
         var failed = 0;
         foreach (var (name, run) in tests)
         {

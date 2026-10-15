@@ -1,4 +1,5 @@
 using MeetingCapture.Configuration;
+using MeetingCapture.Diagnostics;
 using MeetingCapture.Graph;
 using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
@@ -38,6 +39,7 @@ namespace MeetingCapture.TrayApp;
 public sealed partial class MainWindow : Window
 {
     private readonly MeetingPipeline _pipeline;
+    private readonly ResponsivenessDiagnostics _responsiveness;
     private readonly WorkIqService _workIq;
     private CancellationTokenSource? _workIqCts;
     private CancellationTokenSource? _calendarCts;
@@ -45,6 +47,7 @@ public sealed partial class MainWindow : Window
     private bool _calendarBusy;
     private long _calendarGeneration;
     private readonly WorkIqConnectionStatus _workIqConnection = new();
+    private WorkIqControlState? _renderedWorkIqControls;
     public long CalendarRevision => Interlocked.Read(ref _calendarGeneration);
     private readonly AppSettings _settings;
     private readonly ILogger<MainWindow> _logger;
@@ -111,11 +114,15 @@ public sealed partial class MainWindow : Window
     private bool _visualizationMaximizedWindow;
     private readonly bool _animationsEnabled;
     private readonly ObservableCollection<TrailItemViewModel> _visualizationTrail = new();
+    private readonly ObservableCollection<MeetingTopicNotesViewModel> _meetingNotes = new();
+    private readonly HashSet<string> _collapsedTopicIds = new(StringComparer.Ordinal);
     private Button? _brainMapRootButton;
     private readonly Dictionary<string, Button> _brainMapNodes = new(StringComparer.Ordinal);
     private readonly Dictionary<string, Microsoft.UI.Xaml.Shapes.Path> _brainMapConnectors =
         new(StringComparer.Ordinal);
     private bool _visualizationViewportSubscribed;
+    private int _meetingNotesProjectionRevision;
+    private string? _meetingNotesSessionId;
     private bool _initialViewReadyRaised;
     private readonly Dictionary<string, RelatedContextState> _relatedContextStatesByTopicId =
         new(StringComparer.Ordinal);
@@ -183,6 +190,9 @@ public sealed partial class MainWindow : Window
     private bool _suppressAutoDismiss;
     private bool _isPinned;
     private readonly Microsoft.UI.Windowing.OverlappedPresenter _presenter;
+    private static readonly UIntPtr WindowSubclassId = new(1);
+    // Kept in a field so the native callback is not garbage collected while the window lives.
+    private NativeMethods.SubclassProc? _windowMessageProc;
     private CancellationTokenSource? _suppressReleaseCts; // cancels stale suppress-release timers
 
     /// <summary>Raised when the user confirms the pending meeting prompt.</summary>
@@ -204,8 +214,10 @@ public sealed partial class MainWindow : Window
         IActiveRosterProvider activeRoster,
         MeetingVisualizationSession visualization,
         IMeetingVisualizationStorage visualizationStorage,
-        CopilotModelCatalog copilotModelCatalog)
+        CopilotModelCatalog copilotModelCatalog,
+        ResponsivenessDiagnostics responsiveness)
     {
+        _responsiveness = responsiveness;
         _pipeline = pipeline;
         _workIq = workIq;
         _settings = settings.Value;
@@ -220,9 +232,11 @@ public sealed partial class MainWindow : Window
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
         _animationsEnabled = new UISettings().AnimationsEnabled;
 
-        InitializeComponent();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowInitialize))
+            InitializeComponent();
         UpdateVisualizationViewVisibility();
-        InitializeSettingsEditor();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.SettingsInitialize))
+            InitializeSettingsEditor();
 
         TranscriptList.ItemsSource = _transcript;
         TranscriptList.AddHandler(UIElement.PointerPressedEvent,
@@ -249,6 +263,7 @@ public sealed partial class MainWindow : Window
         CatchUpSectionsList.ItemsSource = _catchUpSections;
         CatchUpSourcesList.ItemsSource = _catchUpSources;
         TrailList.ItemsSource = _visualizationTrail;
+        MeetingNotesList.ItemsSource = _meetingNotes;
 
         ConfigureVisualizationTransitions();
         RootLayout.Loaded += OnRootLayoutLoaded;
@@ -257,11 +272,11 @@ public sealed partial class MainWindow : Window
         _actions.CollectionChanged += (_, _) => UpdateExpanderHeaders();
         UpdateExpanderHeaders();
 
-        RecordingPanel.Loaded += (_, _) => UpdateRecordingLayout();
-        RecordingPanel.SizeChanged += (_, _) => UpdateRecordingLayout();
+        RecordingBodyScroll.Loaded += (_, _) => UpdateRecordingLayout();
+        RecordingBodyScroll.SizeChanged += (_, _) => UpdateRecordingLayout();
         InsightSections.SizeChanged += (_, _) => UpdateRecordingLayout();
         SpeakerSection.SizeChanged += (_, _) => UpdateRecordingLayout();
-        RecordingFooter.SizeChanged += (_, _) => UpdateRecordingLayout();
+        RecordingUtilityActions.SizeChanged += (_, _) => UpdateRecordingLayout();
         foreach (var expander in new[] { OpenQuestionsExpander, ActionsExpander })
             expander.RegisterPropertyChangedCallback(Expander.IsExpandedProperty,
                 (_, _) => _dispatcherQueue.TryEnqueue(UpdateRecordingLayout));
@@ -285,6 +300,9 @@ public sealed partial class MainWindow : Window
 
         // Set taskbar/titlebar icon for this window.
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        _windowMessageProc = OnWindowMessage;
+        if (!NativeMethods.SetWindowSubclass(hwnd, _windowMessageProc, WindowSubclassId, UIntPtr.Zero))
+            _windowMessageProc = null;
         AppWindow.Resize(CalculateDefaultSize(hwnd));
         NativeMethods.SetWindowIcon(hwnd, System.IO.Path.Combine(AppContext.BaseDirectory, "Resources", "tray.ico"));
 
@@ -311,12 +329,8 @@ public sealed partial class MainWindow : Window
         _healthTimer.Tick += (_, _) =>
         {
             if (PreferencesPanel.Visibility == Visibility.Visible)
-            {
                 UpdateDiagnostics();
-                UpdateWorkIqControls();
-            }
-            else if (_workIqCts is not null)
-                UpdateWorkIqControls();
+            UpdateWorkIqControls();
             if (_pipeline.AiUsage.GetSnapshot().HasActiveRequests)
                 RenderAiUsage(refreshDetails: false, announceTransition: false);
             if (IdlePanel.Visibility == Visibility.Visible &&
@@ -330,7 +344,6 @@ public sealed partial class MainWindow : Window
         SetChipStatus("Idle", false);
         ShowState(recording: false);
         InvalidatePanels();
-        _ = RestoreWorkIqAsync();
     }
 
     private void OnTitleBarSizeChanged(object sender, SizeChangedEventArgs e)
@@ -345,6 +358,8 @@ public sealed partial class MainWindow : Window
 
     private void UpdateTitleBarInteractiveRegions()
     {
+        // Layout still runs while the window closes; the pointer source is already closed then.
+        if (_allowClose) return;
         var scale = AppTitleBar.XamlRoot?.RasterizationScale ?? 1d;
         var interactiveRects = new List<RectInt32>();
         foreach (var control in new FrameworkElement[]
@@ -490,25 +505,31 @@ public sealed partial class MainWindow : Window
     /// </summary>
     public void ShowFromTray()
     {
+        if (_allowClose) return;
         // Cancel any previous release timer — rapid clicks must not clear suppress early.
         _suppressReleaseCts?.Cancel();
         _suppressReleaseCts?.Dispose();
         _suppressReleaseCts = new CancellationTokenSource();
         _suppressAutoDismiss = true;
 
-        AppWindow.MoveAndResize(CalculateFlyoutBounds());
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowPosition))
+            AppWindow.MoveAndResize(CalculateFlyoutBounds());
 
         // Use AppWindow.Show() so WinUI 3 properly resumes the compositor after Hide().
         // The previous SetWindowPos(SWP_SHOWWINDOW) approach only made the Win32 window
         // visible at the user32 level — it did NOT notify the WinUI 3 / DComp layer to
         // resume rendering. After AppWindow.Hide(), the compositor is paused; bypassing
         // AppWindow.Show() left it paused → black client area on every tray-icon click.
-        AppWindow.Show(activateWindow: true);
-        Activate();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+            AppWindow.Show(activateWindow: true);
+        _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowActivate))
+            Activate();
 
         // Best-effort foreground promotion after explicit WinUI activation.
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
-        NativeMethods.SetForegroundWindow(hwnd);
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowForeground))
+            NativeMethods.SetForegroundWindow(hwnd);
 
         if (!_dispatcherQueue.TryEnqueue(
                 DispatcherQueuePriority.Low,
@@ -646,33 +667,46 @@ public sealed partial class MainWindow : Window
         _appliedRelatedContextSnapshots.Clear();
         RefreshVisualization();
         RenderRelatedContext(_relatedContext.Status);
-        var topic = _acceptedRelatedContextTopic;
-        var normalizedTopic = NormalizeRelatedContextTopic(topic);
         var currentTopicId = ResolveLiveCanonicalTopicId(_currentVisualizationTopicId);
         if (_sessionId is not null && _contextCts is not null &&
-            _loadedVisualization is null &&
-            currentTopicId is not null &&
-            !string.IsNullOrWhiteSpace(topic) &&
-            IsRelatedContextTopicEligible(normalizedTopic))
-            _ = RefreshRelatedContextAsync(
-                new ContextQuery(
-                    _sessionId,
-                    topic,
-                    _transcriptRevision,
-                    ForceRefresh: auth.IsAuthenticated,
-                    TopicId: currentTopicId),
-                _contextCts.Token);
+            _loadedVisualization is null && auth.IsAuthenticated)
+        {
+            var topics = _visualization.Snapshot().TopicClusters
+                .OrderByDescending(topic => topic.Id == currentTopicId);
+            foreach (var topic in topics)
+                if (IsRelatedContextTopicEligible(NormalizeRelatedContextTopic(topic.Label)))
+                    _ = RefreshRelatedContextAsync(
+                        new ContextQuery(
+                            _sessionId,
+                            topic.Label,
+                            _transcriptRevision,
+                            ForceRefresh: auth.IsAuthenticated,
+                            TopicId: topic.Id),
+                        _contextCts.Token);
+        }
         _ = LoadTodaysMeetingsAsync(allowWhileRecording: true);
     });
 
     private async Task RestoreWorkIqAsync()
     {
+        if (_allowClose || _preparingExit || _workIqCts is not null ||
+            _workIq.IsSignInBusy || _workIq.IsAuthenticated) return;
         using var lifetime = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var token = lifetime.Token;
         _workIqCts = lifetime;
         _workIqRestoring = true;
         UpdateWorkIqControls();
-        try { await Task.Run(() => _workIq.RestoreAsync(lifetime.Token)); }
-        catch (OperationCanceledException) { SetWorkIqAuthFailure(lifetime, "WorkIQ restore cancelled or timed out. Sign in when ready."); }
+        var restore = Task.Run(() => _workIq.RestoreAsync(token), token);
+        try { await restore.WaitAsync(token); }
+        catch (OperationCanceledException)
+        {
+            _ = restore.ContinueWith(fault =>
+                _logger.LogWarning("WorkIQ restore finished after cancellation ({Type}).",
+                    fault.Exception!.GetBaseException().GetType().Name),
+                CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+            SetWorkIqAuthFailure(lifetime, "WorkIQ restore cancelled or timed out. Sign in when ready.");
+        }
         catch (WorkIqException ex) { SetWorkIqAuthFailure(lifetime, WorkIqMessage(ex)); }
         finally
         {
@@ -691,6 +725,14 @@ public sealed partial class MainWindow : Window
         UpdateWorkIqControls();
         try { await _workIq.SignInAsync(lifetime.Token); }
         catch (OperationCanceledException) { SetWorkIqAuthFailure(lifetime, "WorkIQ sign-in cancelled. You can close the browser tab."); }
+        catch (WorkIqException ex) when (ex.Kind is WorkIqFailure.ServiceUnavailable && _workIq.IsAuthenticated)
+        {
+            var message = "Signed in to WorkIQ, but the WorkIQ service is having a problem right now. " +
+                "Your connection is working; try again in a few minutes." +
+                (string.IsNullOrEmpty(ex.Code) ? string.Empty : $" ({ex.Code})");
+            _workIqConnection.SetMessage(message);
+            ShowStatusBar(message, InfoBarSeverity.Warning);
+        }
         catch (WorkIqException ex) { SetWorkIqAuthFailure(lifetime, WorkIqMessage(ex)); }
         finally
         {
@@ -730,21 +772,41 @@ public sealed partial class MainWindow : Window
     private void UpdateWorkIqControls()
     {
         if (_allowClose) return;
-        var busy = _workIqCts is not null || _workIq.IsSignInBusy;
-        var actions = WorkIqConnectionStatus.Actions(_workIq.IsAuthenticated, busy, _workIqCts is not null);
-        WorkIqSignInButton.Visibility = actions.SignIn ? Visibility.Visible : Visibility.Collapsed;
-        WorkIqSignOutButton.Visibility = actions.SignOut ? Visibility.Visible : Visibility.Collapsed;
-        WorkIqSignInButton.IsEnabled = actions.SignIn;
-        WorkIqSignOutButton.IsEnabled = actions.SignOut;
-        WorkIqCancelButton.Visibility = RecordingWorkIqCancelButton.Visibility =
-            actions.Cancel ? Visibility.Visible : Visibility.Collapsed;
-        WorkIqCancelButton.IsEnabled = RecordingWorkIqCancelButton.IsEnabled = _workIqCts is { IsCancellationRequested: false };
-        RecordingAuthProgress.Visibility = actions.Cancel ? Visibility.Visible : Visibility.Collapsed;
-        RecordingAuthProgressText.Text = _workIqRestoring ? "Restoring WorkIQ..."
-            : _workIqCts is { IsCancellationRequested: true } ? "Cancelling sign-in..." : "WorkIQ sign-in in progress";
-        WorkIqStateText.Text = _workIqRestoring ? "Restoring only this app's protected WorkIQ sign-in..."
-            : _workIq.IsSignInBusy && _workIqCts is null ? _workIqConnection.Message + " Waiting for browser cleanup; recording is available."
-            : _workIqConnection.Message;
+        var authenticated = _workIq.IsAuthenticated;
+        var signInBusy = _workIq.IsSignInBusy;
+        var pending = _workIqCts is not null;
+        _responsiveness.SetWorkIqState(authenticated, pending || signInBusy, _calendarBusy);
+        var state = _workIqConnection.Controls(authenticated, signInBusy, pending,
+            _workIqCts is { IsCancellationRequested: true }, _workIqRestoring);
+        if (_renderedWorkIqControls == state) return;
+        var previous = _renderedWorkIqControls;
+        var actions = state.Actions;
+        if (previous?.Actions.SignIn != actions.SignIn)
+        {
+            WorkIqSignInButton.Visibility = actions.SignIn ? Visibility.Visible : Visibility.Collapsed;
+            WorkIqSignInButton.IsEnabled = actions.SignIn;
+            MeetingNotesWorkIqSignInButton.Visibility = actions.SignIn
+                ? Visibility.Visible : Visibility.Collapsed;
+            MeetingNotesWorkIqSignInButton.IsEnabled = actions.SignIn;
+        }
+        if (previous?.Actions.SignOut != actions.SignOut)
+        {
+            WorkIqSignOutButton.Visibility = actions.SignOut ? Visibility.Visible : Visibility.Collapsed;
+            WorkIqSignOutButton.IsEnabled = actions.SignOut;
+        }
+        if (previous?.Actions.Cancel != actions.Cancel)
+        {
+            WorkIqCancelButton.Visibility = RecordingWorkIqCancelButton.Visibility =
+                actions.Cancel ? Visibility.Visible : Visibility.Collapsed;
+            RecordingAuthProgress.Visibility = actions.Cancel ? Visibility.Visible : Visibility.Collapsed;
+        }
+        if (previous?.CancelEnabled != state.CancelEnabled)
+            WorkIqCancelButton.IsEnabled = RecordingWorkIqCancelButton.IsEnabled = state.CancelEnabled;
+        if (previous?.ProgressText != state.ProgressText)
+            RecordingAuthProgressText.Text = state.ProgressText;
+        if (previous?.StateText != state.StateText)
+            WorkIqStateText.Text = state.StateText;
+        _renderedWorkIqControls = state;
     }
 
     public void ShowSettings()
@@ -840,9 +902,15 @@ public sealed partial class MainWindow : Window
         InvokeOnUi(() => MeetingPrompt.IsOpen = false);
     }
 
+    public bool IsClosing => _allowClose;
+
     public void CloseForReal()
     {
-        PrepareForExit();
+        if (!_preparingExit) PrepareForExit();
+        _allowClose = true;
+        AppTitleBar.SizeChanged -= OnTitleBarSizeChanged;
+        TitleBarActions.LayoutUpdated -= OnTitleBarActionsLayoutUpdated;
+        Activated -= OnWindowActivated;
         _workIq.AuthStateChanged -= OnWorkIqAuthStateChanged;
         _healthTimer?.Stop();
         StopSaveReview();
@@ -860,8 +928,29 @@ public sealed partial class MainWindow : Window
         _contextCts?.Cancel();
         _contextCts?.Dispose();
         _suppressReleaseCts?.Cancel();
-        _allowClose = true;
         Close();
+    }
+
+    public async Task<bool> ConfirmCloseAfterSavedPartialAsync()
+    {
+        if (RootLayout.XamlRoot is not { } xamlRoot) return false;
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+            AppWindow.Show(activateWindow: true);
+        _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowActivate))
+            Activate();
+        var dialog = new ContentDialog
+        {
+            XamlRoot = xamlRoot,
+            Title = "Speech transcription is still active",
+            Content = "The recognized transcript has been saved, but a Speech operation has not returned. " +
+                "Closing the app will end this session without disposing or reusing that Speech session. " +
+                "Audio that did not reach transcription is not available for recovery.",
+            PrimaryButtonText = "Close app",
+            CloseButtonText = "Keep app open",
+            DefaultButton = ContentDialogButton.Close
+        };
+        return await dialog.ShowAsync() == ContentDialogResult.Primary;
     }
 
     public void PrepareForExit()
@@ -876,7 +965,9 @@ public sealed partial class MainWindow : Window
         ShowStatusBar("Exiting: finishing capture and saving the transcript. Optional AI work is cancelled.",
             InfoBarSeverity.Informational);
         UpdateControlState();
-        AppWindow.Show();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+            AppWindow.Show();
+        _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
     }
 
     public void ExitFailed()
@@ -887,7 +978,9 @@ public sealed partial class MainWindow : Window
         UpdateControlState();
         ShowStatusBar("Exit could not safely save the transcript or release capture. The app remains open. Check the recording/storage error, then retry Exit.",
             InfoBarSeverity.Error);
-        AppWindow.Show();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
+            AppWindow.Show();
+        _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
     }
 
     // ── Window lifecycle ────────────────────────────────────────────────────────
@@ -898,6 +991,7 @@ public sealed partial class MainWindow : Window
     /// </summary>
     public void PositionFlyout()
     {
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.WindowPosition);
         AppWindow.MoveAndResize(CalculateFlyoutBounds());
     }
 
@@ -929,13 +1023,20 @@ public sealed partial class MainWindow : Window
 
     private void OnWindowActivated(object sender, WindowActivatedEventArgs e)
     {
+        _responsiveness.SetWindowState(
+            visible: AppWindow.IsVisible,
+            active: e.WindowActivationState != WindowActivationState.Deactivated);
         // Auto-dismiss only while idle; active capture must remain visible on focus loss.
         if (e.WindowActivationState == WindowActivationState.Deactivated
             && !_preparingExit
             && !_suppressAutoDismiss
             && !_isPinned
             && !_pipeline.CanStop)
-            AppWindow.Hide();
+        {
+            using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowHide))
+                AppWindow.Hide();
+            _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
+        }
     }
 
     private void OnPinClick(object sender, RoutedEventArgs e)
@@ -953,6 +1054,17 @@ public sealed partial class MainWindow : Window
         AutomationProperties.SetName(PinButton, label);
     }
 
+    private IntPtr OnWindowMessage(
+        IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, UIntPtr idSubclass, UIntPtr refData)
+    {
+        if (msg == NativeMethods.WmNcDestroy && _windowMessageProc is { } proc)
+            NativeMethods.RemoveWindowSubclass(hWnd, proc, idSubclass);
+        var result = NativeMethods.DefSubclassProc(hWnd, msg, wParam, lParam);
+        if (msg == NativeMethods.WmGetMinMaxInfo)
+            NativeMethods.ConstrainMaximizedBoundsToWorkArea(hWnd, lParam);
+        return result;
+    }
+
     private void OnAppWindowClosing(Microsoft.UI.Windowing.AppWindow sender, Microsoft.UI.Windowing.AppWindowClosingEventArgs args)
     {
         if (_allowClose)
@@ -962,7 +1074,9 @@ public sealed partial class MainWindow : Window
         }
 
         args.Cancel = true;
-        AppWindow.Hide();
+        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowHide))
+            AppWindow.Hide();
+        _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
     }
 
     // ── Button handlers ─────────────────────────────────────────────────────────
@@ -1019,7 +1133,13 @@ public sealed partial class MainWindow : Window
 
     private void OnStartClick(object sender, RoutedEventArgs e)
     {
-        if (!_pipeline.CanStart) return;
+        if (_preparingExit || _retryBusy || _previewBusy || !_pipeline.CanStart)
+        {
+            UpdateControlState();
+            ShowStatusBar(RecordingViewState.NewRecordingAction(_pipeline.Status, _pipeline.CanStart,
+                _preparingExit, _retryBusy, _previewBusy).Message, InfoBarSeverity.Informational);
+            return;
+        }
         StartButton.IsEnabled = NewRecordingButton.IsEnabled = false;
         var title = $"Manual Recording \u2014 {DateTime.Now:yyyy-MM-dd HH:mm}";
         _ = Task.Run(async () =>
@@ -1249,7 +1369,11 @@ public sealed partial class MainWindow : Window
 
     private void OnPipelineStatusChanged(object? sender, PipelineStatus status)
     {
-        InvokeOnUi(() => HandleStatusChange(status));
+        InvokeOnUi(() =>
+        {
+            _responsiveness.SetCaptureState(_pipeline.CanStop);
+            HandleStatusChange(status);
+        });
     }
 
     private void OnAiUsageChanged(object? sender, EventArgs e)
@@ -1545,18 +1669,18 @@ public sealed partial class MainWindow : Window
 
     private void UpdateRecordingLayout()
     {
-        if (RecordingPanel.ActualHeight <= 0) return;
+        if (RecordingBodyScroll.ActualHeight <= 0) return;
 
         var fixedHeight = InsightSections.ActualHeight + SpeakerSection.ActualHeight +
-            RecordingUtilityActions.ActualHeight + RecordingFooter.ActualHeight + 24;
+            RecordingUtilityActions.ActualHeight + 24;
         var allocation = RecordingLayout.Calculate(
-            RecordingPanel.ActualHeight,
+            RecordingBodyScroll.ActualHeight,
             fixedHeight);
 
         if (Math.Abs(RecordingOverviewScroll.MaxHeight - allocation.OverviewMaxHeight) > 1)
             RecordingOverviewScroll.MaxHeight = allocation.OverviewMaxHeight;
-        if (Math.Abs(RecordingTranscriptRow.MinHeight - allocation.TranscriptMinHeight) > 1)
-            RecordingTranscriptRow.MinHeight = allocation.TranscriptMinHeight;
+        if (Math.Abs(TranscriptList.MaxHeight - allocation.TranscriptMaxHeight) > 1)
+            TranscriptList.MaxHeight = allocation.TranscriptMaxHeight;
     }
 
     private void OnChecklistItemToggled(object sender, RoutedEventArgs e)
@@ -2408,7 +2532,9 @@ public sealed partial class MainWindow : Window
 
     private void UpdateControlState()
     {
-        StartButton.IsEnabled = NewRecordingButton.IsEnabled = !_preparingExit && _pipeline.CanStart && !_retryBusy && !_previewBusy;
+        var newRecording = RecordingViewState.NewRecordingAction(_pipeline.Status, _pipeline.CanStart,
+            _preparingExit, _retryBusy, _previewBusy);
+        StartButton.IsEnabled = NewRecordingButton.IsEnabled = newRecording.Enabled;
         BackToMeetingsButton.IsEnabled = StartButton.IsEnabled;
         StopButton.IsEnabled = PreferencesStopButton.IsEnabled = !_preparingExit && _pipeline.CanStop;
         PreferencesStopButton.Visibility = _pipeline.CanStop ? Visibility.Visible : Visibility.Collapsed;
@@ -2419,7 +2545,9 @@ public sealed partial class MainWindow : Window
         RetrySavedButton.IsEnabled = !_preparingExit && _pipeline.CanStart && !_retryBusy &&
             _pipeline.LastCompletedTranscript is { Segments.Count: > 0 } completed && completed.SessionId == _sessionId;
         RetrySavedButton.Visibility = RetrySavedButton.IsEnabled || _retryBusy ? Visibility.Visible : Visibility.Collapsed;
-        NewRecordingButton.Visibility = _pipeline.CanStart ? Visibility.Visible : Visibility.Collapsed;
+        NewRecordingButton.Visibility = NewRecordingHint.Visibility = newRecording.Visible ? Visibility.Visible : Visibility.Collapsed;
+        NewRecordingHint.Text = newRecording.Message;
+        AutomationProperties.SetHelpText(NewRecordingButton, newRecording.Message);
         BackToMeetingsButton.Visibility = _pipeline.CanStart ? Visibility.Visible : Visibility.Collapsed;
         StopButton.Visibility = _pipeline.CanStop ? Visibility.Visible : Visibility.Collapsed;
         CancelRetryButton.Visibility = _retryBusy ? Visibility.Visible : Visibility.Collapsed;
@@ -2648,7 +2776,6 @@ public sealed partial class MainWindow : Window
     {
         var wide = totalWidth >= 1380;
         TopicDetailColumn.Width = wide ? new GridLength(360) : new GridLength(0);
-        TopicDetailRow.Height = wide ? new GridLength(0) : GridLength.Auto;
         Grid.SetRow(TopicDetailPanel, wide ? 1 : 2);
         Grid.SetColumn(TopicDetailPanel, wide ? 1 : 0);
         Grid.SetColumnSpan(TopicDetailPanel, wide ? 1 : 2);
@@ -2669,6 +2796,7 @@ public sealed partial class MainWindow : Window
 
     private void OnRootLayoutLoaded(object sender, RoutedEventArgs e)
     {
+        using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.WindowLoad);
         if (!_visualizationViewportSubscribed && RootLayout.XamlRoot is { } xamlRoot)
         {
             xamlRoot.Changed += OnVisualizationViewportChanged;
@@ -2679,6 +2807,8 @@ public sealed partial class MainWindow : Window
         {
             _initialViewReadyRaised = true;
             InitialViewReady?.Invoke(this, EventArgs.Empty);
+            if (!_dispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () => _ = RestoreWorkIqAsync()))
+                _logger.LogWarning("WorkIQ startup restore could not be queued.");
         }
     }
 
@@ -2716,21 +2846,14 @@ public sealed partial class MainWindow : Window
 
     private void OnGoToCurrentTopicClick(object sender, RoutedEventArgs e)
     {
-        var currentTopicId = _visualizationProjection?.CurrentTopicId;
-        if (string.IsNullOrEmpty(currentTopicId))
+        var projection = _visualizationProjection;
+        if (projection is null ||
+            TopicMapState.CurrentTopicSelection(projection) is not { Length: > 0 } currentTopicId)
             return;
         _selectedVisualizationTopicId = currentTopicId;
         RefreshVisualization();
-        RevealTimelineTopic(currentTopicId);
-    }
-
-    private void RevealTimelineTopic(string topicId)
-    {
-        var occurrence = _visualizationTrail.LastOrDefault(item => item.TopicId == topicId);
-        if (occurrence is null ||
-            TrailList.ContainerFromItem(occurrence) is not FrameworkElement container)
-            return;
-        container.StartBringIntoView();
+        RevealMapTopic(currentTopicId);
+        ScrollNotesToTopic(currentTopicId);
     }
 
     private async void OnOpenVisualizationClick(object sender, RoutedEventArgs e)
@@ -2901,6 +3024,13 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        if (!StringComparer.Ordinal.Equals(_meetingNotesSessionId, document.SessionId) ||
+            document.TopicClusters.Count == 0)
+        {
+            _meetingNotesSessionId = document.SessionId;
+            _meetingNotes.Clear();
+        }
+
         _displayedVisualizationDocument = document;
         var persistSelection = TopicMapPanel.Visibility == Visibility.Visible ||
             _selectedVisualizationTopicId is not null;
@@ -2909,7 +3039,8 @@ public sealed partial class MainWindow : Window
             document.TopicTrail.LastOrDefault()?.TopicId;
         var projection = TopicMapState.Project(
             document, selectedTopicId, currentTopicId, _relatedContextStatesByTopicId,
-            _workIq.IsAuthenticated, _loadedVisualization is not null);
+            _workIq.IsAuthenticated, _loadedVisualization is not null,
+            buildMeetingNotes: false);
         var fingerprint =
             $"{projection.Fingerprint}|{projection.SelectedTopicId}|{projection.CurrentTopicId}";
         if (!force && fingerprint == _renderedVisualizationFingerprint)
@@ -2950,29 +3081,96 @@ public sealed partial class MainWindow : Window
         var canGoToCurrentTopic = projection.CurrentTopicId.Length > 0 &&
             !StringComparer.Ordinal.Equals(projection.CurrentTopicId, projection.SelectedTopicId);
         GoToCurrentTopicButton.IsEnabled = canGoToCurrentTopic;
-        GoToCurrentTopicButton.Visibility = canGoToCurrentTopic
-            ? Visibility.Visible
-            : Visibility.Collapsed;
-        var trailUpdate = VisualizationCollectionState.Reconcile(
-            _visualizationTrail, projection.Trail, item => item.Id, TrailFingerprint);
+        MeetingNotesEmptyText.Text = _meetingNotes.Count > 0
+            ? string.Empty
+            : projection.MeetingBrainMap?.Topics.Count > 0
+                ? "Preparing transcript-grounded meeting notes..."
+                : projection.MeetingNotes?.EmptyMessage ??
+                    projection.MeetingBrainMap?.EmptyMessage ??
+                    "Meeting notes are unavailable.";
+        var notesProjectionRevision = Interlocked.Increment(ref _meetingNotesProjectionRevision);
         UpdateVisualizationViewVisibility();
         RenderVisualizationSurface(projection);
-        AnimateChangedItems(TrailList, trailUpdate.Changed);
+        if (TopicMapPanel.Visibility == Visibility.Visible)
+            _ = PopulateMeetingNotesAsync(document, projection, notesProjectionRevision);
+        else
+            Interlocked.Increment(ref _meetingNotesProjectionRevision);
+    }
+
+    private async Task PopulateMeetingNotesAsync(
+        MeetingVisualizationDocument document,
+        VisualizationProjection projection,
+        int projectionRevision)
+    {
+        IReadOnlyList<MeetingTopicNotes> topicNotes;
+        try
+        {
+            topicNotes = await Task.Run(() => MeetingTopicNotesBuilder.Build(document))
+                .ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning("Meeting notes projection failed ({ErrorType}).", ex.GetType().Name);
+            _dispatcherQueue.TryEnqueue(() =>
+            {
+                if (projectionRevision == Volatile.Read(ref _meetingNotesProjectionRevision) &&
+                    StringComparer.Ordinal.Equals(
+                        _visualizationProjection?.Fingerprint,
+                        projection.Fingerprint) &&
+                    _meetingNotes.Count == 0)
+                    MeetingNotesEmptyText.Text = "Meeting notes could not be prepared.";
+            });
+            return;
+        }
+
+        _dispatcherQueue.TryEnqueue(() =>
+        {
+            if (projectionRevision != Volatile.Read(ref _meetingNotesProjectionRevision) ||
+                !StringComparer.Ordinal.Equals(
+                    _visualizationProjection?.Fingerprint,
+                    projection.Fingerprint))
+                return;
+            var notes = TopicMapState.BuildMeetingNotesViewModel(
+                topicNotes,
+                document,
+                projection.SelectedTopicId,
+                projection.CurrentTopicId);
+            notes = notes with { Topics = TopicCollapseState.Apply(notes.Topics, _collapsedTopicIds) };
+            _visualizationProjection = projection with { MeetingNotes = notes };
+            var notesUpdate = VisualizationCollectionState.Reconcile(
+                _meetingNotes,
+                notes.Topics,
+                item => item.Id,
+                item => $"{item.Heading}|{string.Join("|", item.Bullets)}|" +
+                    $"{item.IsCurrent}|{item.IsSelected}|{item.IsCollapsed}|" +
+                    string.Join("|", item.Suggestions.Select(source =>
+                        $"{source.Id}:{source.Title}:{source.SourceType}:{source.SourceUrl}")));
+            MeetingNotesEmptyText.Text = notes.EmptyMessage;
+            AnimateChangedItems(MeetingNotesList, notesUpdate.Changed);
+            UpdateVisualizationViewVisibility();
+            UpdateMeetingNotesHeadingStyles(notes.Topics);
+            ScrollNotesToTopic(projection.SelectedTopicId);
+        });
     }
 
     private void ClearVisualizationPresentation()
     {
+        Interlocked.Increment(ref _meetingNotesProjectionRevision);
         _visualizationProjection = null;
         _displayedVisualizationDocument = null;
         _selectedVisualizationTopicId = null;
         _currentVisualizationTopicId = null;
         _renderedVisualizationFingerprint = null;
+        _meetingNotesSessionId = null;
         VisualizationTitleText.Text = "Topic map";
         VisualizationSubtitleText.Text = "Live meeting · topics appear as they are accepted";
         TopicMapStatusText.Text = "No visualization data is available.";
+        MeetingNotesEmptyText.Text = "No visualization data is available.";
         GoToCurrentTopicButton.IsEnabled = false;
         GoToCurrentTopicButton.Visibility = Visibility.Collapsed;
         _visualizationTrail.Clear();
+        _meetingNotes.Clear();
+        _collapsedTopicIds.Clear();
         BrainMapCanvas.Children.Clear();
         _brainMapNodes.Clear();
         _brainMapConnectors.Clear();
@@ -2983,13 +3181,19 @@ public sealed partial class MainWindow : Window
 
     private void UpdateVisualizationViewVisibility()
     {
-        TopicTimelineGuideText.Visibility = Visibility.Visible;
+        TopicTimelineGuideText.Visibility = Visibility.Collapsed;
         TopicMapCombinedView.Visibility = Visibility.Visible;
+        MeetingNotesView.Visibility = Visibility.Visible;
+        TopicDetailPanel.Visibility = Visibility.Collapsed;
+        MeetingNotesEmptyText.Visibility = _meetingNotes.Count == 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
+        GoToCurrentTopicButton.Visibility = GoToCurrentTopicButton.IsEnabled
+            ? Visibility.Visible
+            : Visibility.Collapsed;
         BrainMapView.Visibility = Visibility.Visible;
-        TopicTimelineView.Visibility = _visualizationTrail.Count > 0
-            ? Visibility.Visible : Visibility.Collapsed;
-        TimelineEmptyText.Visibility = _visualizationTrail.Count == 0
-            ? Visibility.Visible : Visibility.Collapsed;
+        TopicTimelineView.Visibility = Visibility.Collapsed;
+        TimelineEmptyText.Visibility = Visibility.Collapsed;
     }
 
     private void RenderVisualizationSurface(VisualizationProjection projection)
@@ -2997,7 +3201,8 @@ public sealed partial class MainWindow : Window
         if (TopicMapPanel.Visibility != Visibility.Visible)
             return;
         RenderBrainMap(projection);
-        RenderTopicBrief(projection);
+        RenderMeetingNotesWorkIqStatus();
+        UpdateMeetingNotesHeadingStyles(_meetingNotes);
     }
 
     private void OnBrainMapViewSizeChanged(object sender, SizeChangedEventArgs e)
@@ -3013,30 +3218,33 @@ public sealed partial class MainWindow : Window
     private void RenderBrainMap(VisualizationProjection projection)
     {
         _brainMapRootButton = null;
-        if (projection.BrainMap is not { } map)
+        if (projection.MeetingBrainMap is not { } map)
         {
             BrainMapCanvas.Children.Clear();
             _brainMapNodes.Clear();
             _brainMapConnectors.Clear();
             BrainMapNowText.Text = "Now · waiting for a current topic";
-            BrainMapEmptyText.Text = "No connected topics yet. Accepted topics will appear here.";
+            BrainMapEmptyText.Text = "No accepted topics yet. The topic map will grow as topics are accepted.";
             BrainMapEmptyText.Visibility = Visibility.Visible;
             return;
         }
 
-        var layout = BrainMapLayout.Calculate(
+        var layout = MeetingBrainMapLayout.Calculate(
             Math.Max(0, BrainMapView.ActualWidth - 20),
-            map.Branches.Count);
+            TopicCollapseState.LeafCounts(map, _collapsedTopicIds));
         BrainMapCanvas.Width = layout.Width;
         BrainMapCanvas.Height = layout.Height;
-        BrainMapNowText.Text = map.CurrentTopicLabel.Length == 0
+        var currentTopic = map.Topics.FirstOrDefault(item => item.Id == map.CurrentTopicId);
+        BrainMapNowText.Text = currentTopic is null
             ? "Now · waiting for a current topic"
-            : $"Now · {map.CurrentTopicLabel}";
+            : $"Now · {currentTopic.Title}";
         BrainMapEmptyText.Text = map.EmptyMessage;
         BrainMapEmptyText.Visibility = map.EmptyMessage.Length > 0
             ? Visibility.Visible : Visibility.Collapsed;
 
-        var activeConnectorIds = map.Branches.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        var activeConnectorIds = layout.Connectors
+            .Select(item => item.Id)
+            .ToHashSet(StringComparer.Ordinal);
         foreach (var staleId in _brainMapConnectors.Keys
                      .Where(id => !activeConnectorIds.Contains(id)).ToArray())
         {
@@ -3044,52 +3252,21 @@ public sealed partial class MainWindow : Window
             _brainMapConnectors.Remove(staleId);
         }
 
-        for (var index = 0; index < layout.Branches.Count; index++)
-        {
-            var branch = map.Branches[index];
-            var branchRect = layout.Branches[index];
-            var rootCenterX = layout.Root.X + layout.Root.Width / 2;
-            var branchCenterX = branchRect.X + branchRect.Width / 2;
-            var columnIndex = layout.Branches
-                .Take(index)
-                .Count(item => Math.Abs(item.X - branchRect.X) <= 1);
-            var columnCount = layout.Branches.Count(item => Math.Abs(item.X - branchRect.X) <= 1);
-            var rootX = Math.Clamp(
-                rootCenterX + (branchCenterX - rootCenterX) * 0.28 +
-                (columnIndex - (columnCount - 1) / 2d) * 10,
-                layout.Root.X + 24,
-                layout.Root.X + layout.Root.Width - 24);
-            var rootY = layout.Root.Y + layout.Root.Height;
-            var branchY = branchRect.Y;
-            var bend = Math.Clamp((branchY - rootY) * 0.45, 36, 96);
-            if (!_brainMapConnectors.TryGetValue(branch.Id, out var connector))
-            {
-                connector = new Microsoft.UI.Xaml.Shapes.Path
-                {
-                    Stroke = new SolidColorBrush(Color.FromArgb(150, 150, 150, 150)),
-                    StrokeThickness = 2,
-                    StrokeLineJoin = PenLineJoin.Round,
-                    IsHitTestVisible = false,
-                };
-                Canvas.SetZIndex(connector, 0);
-                _brainMapConnectors.Add(branch.Id, connector);
-                BrainMapCanvas.Children.Add(connector);
-            }
-            var geometry = new PathGeometry();
-            var figure = new PathFigure { StartPoint = new(rootX, rootY) };
-            figure.Segments.Add(new BezierSegment
-            {
-                Point1 = new(rootX, rootY + bend),
-                Point2 = new(branchCenterX, branchY - bend),
-                Point3 = new(branchCenterX, branchY),
-            });
-            geometry.Figures.Add(figure);
-            connector.Data = geometry;
-        }
+        foreach (var connector in layout.Connectors)
+            UpdateBrainMapConnector(
+                connector.Id,
+                connector.Start.X,
+                connector.Start.Y,
+                connector.End.X,
+                connector.End.Y);
 
-        var activeNodeIds = map.Branches
-            .Select(item => $"branch:{item.Id}")
-            .Append($"root:{map.TopicId}")
+        var activeNodeIds = map.Topics
+            .Select(item => $"topic:{item.Id}")
+            .Concat(map.Topics.Select(item => $"toggle:{item.Id}"))
+            .Concat(map.Topics
+                .Where(topic => !_collapsedTopicIds.Contains(topic.Id))
+                .SelectMany(topic => topic.Leaves.Select(leaf => $"leaf:{topic.Id}:{leaf.Id}")))
+            .Append("root:meeting")
             .ToHashSet(StringComparer.Ordinal);
         foreach (var staleId in _brainMapNodes.Keys
                      .Where(id => !activeNodeIds.Contains(id)).ToArray())
@@ -3099,29 +3276,160 @@ public sealed partial class MainWindow : Window
         }
 
         _brainMapRootButton = UpsertBrainMapNode(
-            $"root:{map.TopicId}",
-            map.TopicId,
-            map.TopicId,
-            map.IsCurrent ? $"{map.Label}. Current topic." : map.Label,
+            "root:meeting",
+            "meeting",
+            string.Empty,
+            map.MeetingTitle,
             map.Detail,
-            map.IsCurrent ? "Current topic" : "Selected topic",
+            "Meeting",
             layout.Root,
-            accent: true);
+            accent: false,
+            selected: false,
+            accessibleName: map.CurrentTopicId.Length == 0
+                ? $"{map.MeetingTitle}. Whole-meeting topic map."
+                : $"{map.MeetingTitle}. Whole-meeting topic map. Select to view meeting notes.");
 
-        for (var index = 0; index < map.Branches.Count; index++)
+        for (var index = 0; index < map.Topics.Count; index++)
         {
-            var branch = map.Branches[index];
+            var topic = map.Topics[index];
             UpsertBrainMapNode(
-                $"branch:{branch.Id}",
-                branch.Id,
-                branch.TopicId,
-                branch.Title,
-                branch.Detail,
-                branch.Kind,
-                layout.Branches[index],
-                accent: false,
-                accessibleName: branch.AccessibleName);
+                $"topic:{topic.Id}",
+                topic.Id,
+                topic.Id,
+                topic.Title,
+                topic.Detail,
+                "Topic",
+                layout.Topics[index].Topic,
+                accent: topic.Id == map.CurrentTopicId,
+                selected: topic.Id == projection.SelectedTopicId,
+                accessibleName: $"Topic: {topic.Title}. {topic.Detail}. Select to view matching meeting notes.");
+            UpsertBrainMapToggle(topic, layout.Topics[index].Topic);
+            for (var leafIndex = 0;
+                 leafIndex < layout.Topics[index].Leaves.Count && leafIndex < topic.Leaves.Count;
+                 leafIndex++)
+            {
+                var leaf = topic.Leaves[leafIndex];
+                UpsertBrainMapNode(
+                    $"leaf:{topic.Id}:{leaf.Id}",
+                    leaf.Id,
+                    leaf.TopicId,
+                    leaf.Title,
+                    leaf.Detail,
+                    leaf.Kind,
+                    layout.Topics[index].Leaves[leafIndex],
+                    accent: false,
+                    selected: false,
+                    accessibleName: leaf.AccessibleName);
+            }
         }
+    }
+
+    private void UpsertBrainMapToggle(MeetingBrainMapTopicViewModel topic, BrainMapRect bounds)
+    {
+        var collapsed = _collapsedTopicIds.Contains(topic.Id);
+        var key = $"toggle:{topic.Id}";
+        if (!_brainMapNodes.TryGetValue(key, out var button))
+        {
+            button = new Button
+            {
+                Width = 28,
+                Height = 28,
+                Padding = new Thickness(0),
+                Content = new FontIcon
+                {
+                    FontFamily = (FontFamily)Application.Current.Resources["SymbolThemeFontFamily"],
+                    FontSize = 12,
+                },
+            };
+            button.Click += OnBrainMapToggleClick;
+            Canvas.SetZIndex(button, 2);
+            _brainMapNodes.Add(key, button);
+            BrainMapCanvas.Children.Add(button);
+        }
+
+        var name = collapsed ? $"Expand topic: {topic.Title}" : $"Collapse topic: {topic.Title}";
+        ((FontIcon)button.Content).Glyph = collapsed ? "\uE76C" : "\uE70D";
+        button.Tag = topic.Id;
+        AutomationProperties.SetName(button, name);
+        AutomationProperties.SetAutomationId(button, $"BrainMapToggle_{topic.Id}");
+        ToolTipService.SetToolTip(button, name);
+        Canvas.SetLeft(button, bounds.X + bounds.Width - 34);
+        Canvas.SetTop(button, bounds.Y + 6);
+    }
+
+    private void OnBrainMapToggleClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string topicId } && topicId.Length > 0)
+            ToggleTopicCollapsed(topicId);
+    }
+
+    private void OnNotesTopicToggleClick(object sender, RoutedEventArgs e)
+    {
+        if (sender is Button { Tag: string topicId } && topicId.Length > 0)
+            ToggleTopicCollapsed(topicId);
+    }
+
+    private void ToggleTopicCollapsed(string topicId)
+    {
+        TopicCollapseState.Toggle(_collapsedTopicIds, topicId);
+        if (_visualizationProjection is not { } projection)
+            return;
+        if (projection.MeetingNotes is { } notes)
+        {
+            var updated = notes with { Topics = TopicCollapseState.Apply(notes.Topics, _collapsedTopicIds) };
+            _visualizationProjection = projection = projection with { MeetingNotes = updated };
+            VisualizationCollectionState.Reconcile(
+                _meetingNotes,
+                updated.Topics,
+                item => item.Id,
+                item => $"{item.Heading}|{string.Join("|", item.Bullets)}|" +
+                    $"{item.IsCurrent}|{item.IsSelected}|{item.IsCollapsed}|" +
+                    string.Join("|", item.Suggestions.Select(source =>
+                        $"{source.Id}:{source.Title}:{source.SourceType}:{source.SourceUrl}")));
+            UpdateMeetingNotesHeadingStyles(updated.Topics);
+        }
+        RenderBrainMap(projection);
+    }
+
+    private void OnTopicMapBodySizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        var sideBySide = e.NewSize.Width >= 640;
+        TopicMapMainColumn.Width = new GridLength(sideBySide ? 3 : 1, GridUnitType.Star);
+        TopicNotesColumn.MinWidth = sideBySide ? 260 : 0;
+        TopicNotesColumn.Width = sideBySide ? new GridLength(2, GridUnitType.Star) : new GridLength(0);
+        TopicMapMainRow.Height = new GridLength(sideBySide ? 1 : 3, GridUnitType.Star);
+        TopicNotesRow.Height = sideBySide ? new GridLength(0) : new GridLength(2, GridUnitType.Star);
+        Grid.SetRow(MeetingNotesView, sideBySide ? 0 : 1);
+        Grid.SetColumn(MeetingNotesView, sideBySide ? 1 : 0);
+        MeetingNotesView.Margin = sideBySide ? new Thickness(8, 0, 0, 0) : new Thickness(0, 8, 0, 0);
+    }
+
+    private void UpdateBrainMapConnector(
+        string connectorId,
+        double startX,
+        double startY,
+        double endX,
+        double endY)
+    {
+        if (!_brainMapConnectors.TryGetValue(connectorId, out var connector))
+        {
+            connector = new Microsoft.UI.Xaml.Shapes.Path
+            {
+                Stroke = new SolidColorBrush(Color.FromArgb(150, 150, 150, 150)),
+                StrokeThickness = 2,
+                StrokeLineJoin = PenLineJoin.Round,
+                IsHitTestVisible = false,
+            };
+            Canvas.SetZIndex(connector, 0);
+            _brainMapConnectors.Add(connectorId, connector);
+            BrainMapCanvas.Children.Add(connector);
+        }
+
+        var geometry = new PathGeometry();
+        var figure = new PathFigure { StartPoint = new(startX, startY) };
+        figure.Segments.Add(new LineSegment { Point = new(endX, endY) });
+        geometry.Figures.Add(figure);
+        connector.Data = geometry;
     }
 
     private Button UpsertBrainMapNode(
@@ -3133,6 +3441,7 @@ public sealed partial class MainWindow : Window
         string kind,
         BrainMapRect bounds,
         bool accent,
+        bool selected,
         string? accessibleName = null)
     {
         if (!_brainMapNodes.TryGetValue(key, out var button))
@@ -3172,12 +3481,29 @@ public sealed partial class MainWindow : Window
 
         var labels = (StackPanel)button.Content;
         ((TextBlock)labels.Children[0]).Text = kind;
+        ((TextBlock)labels.Children[0]).Foreground = new SolidColorBrush(Color.FromArgb(255, 182, 192, 209));
         ((TextBlock)labels.Children[1]).Text = title;
+        var textColor = TopicMapState.NodeTextColor;
+        ((TextBlock)labels.Children[1]).Foreground = new SolidColorBrush(
+            Color.FromArgb(255, textColor.Red, textColor.Green, textColor.Blue));
         ((TextBlock)labels.Children[2]).Text = detail;
+        ((TextBlock)labels.Children[2]).Foreground = new SolidColorBrush(Color.FromArgb(255, 200, 207, 220));
         button.Tag = topicId;
         button.Width = bounds.Width;
         button.Height = bounds.Height;
-        button.BorderThickness = new Thickness(accent ? 2 : 1);
+        var background = kind == "Topic"
+            ? TopicMapState.TopicNodeBackground
+            : TopicMapState.LeafNodeBackground;
+        button.Background = new SolidColorBrush(
+            Color.FromArgb(255, background.Red, background.Green, background.Blue));
+        button.BorderBrush = new SolidColorBrush(accent
+            ? Color.FromArgb(255, 121, 190, 255)
+            : selected
+                ? Color.FromArgb(255, 94, 164, 235)
+                : Color.FromArgb(255, 89, 97, 113));
+        button.BorderThickness = new Thickness(accent || selected ? 2 : 1);
+        button.Shadow = accent ? new ThemeShadow() : null;
+        button.Translation = new System.Numerics.Vector3(0, 0, accent ? 8 : 0);
         AutomationProperties.SetName(
             button,
             accessibleName ?? $"{kind}: {title}. {detail}. Select to open topic details.");
@@ -3190,10 +3516,82 @@ public sealed partial class MainWindow : Window
 
     private void OnBrainMapNodeClick(object sender, RoutedEventArgs e)
     {
-        if (sender is not FrameworkElement { Tag: string topicId } || topicId.Length == 0)
+        if (sender is not Button button)
+            return;
+        if (AutomationProperties.GetAutomationId(button) == "BrainMapNode_meeting")
+        {
+            MeetingNotesView.ChangeView(null, 0, null);
+            return;
+        }
+        if (button.Tag is not string topicId || topicId.Length == 0)
             return;
         _selectedVisualizationTopicId = topicId;
         RefreshVisualization();
+        ScrollNotesToTopic(topicId);
+    }
+
+    private void RevealMapTopic(string topicId)
+    {
+        if (_brainMapNodes.TryGetValue($"topic:{topicId}", out var button))
+            button.StartBringIntoView();
+    }
+
+    private void ScrollNotesToTopic(string topicId)
+    {
+        _dispatcherQueue.TryEnqueue(() =>
+        {
+            var topic = _meetingNotes.FirstOrDefault(item => item.Id == topicId);
+            if (topic is not null &&
+                MeetingNotesList.ContainerFromItem(topic) is FrameworkElement container)
+                container.StartBringIntoView();
+        });
+    }
+
+    private void UpdateMeetingNotesHeadingStyles(
+        IEnumerable<MeetingTopicNotesViewModel> topics)
+    {
+        foreach (var topic in topics)
+        {
+            if (MeetingNotesList.ContainerFromItem(topic) is not DependencyObject container ||
+                FindTaggedBorder(container, topic.Id) is not { } heading)
+                continue;
+            heading.BorderBrush = new SolidColorBrush(topic.IsSelected
+                ? Color.FromArgb(255, 94, 164, 235)
+                : topic.IsCurrent
+                    ? Color.FromArgb(255, 121, 190, 255)
+                    : Color.FromArgb(255, 89, 97, 113));
+            heading.BorderThickness = new Thickness(topic.IsSelected ? 2 : 1);
+            heading.Background = new SolidColorBrush(topic.IsCurrent
+                ? Color.FromArgb(255, 39, 52, 69)
+                : Color.FromArgb(255, 38, 44, 58));
+            heading.Shadow = topic.IsCurrent ? new ThemeShadow() : null;
+            heading.Translation = new System.Numerics.Vector3(0, 0, topic.IsCurrent ? 8 : 0);
+        }
+    }
+
+    private static Border? FindTaggedBorder(DependencyObject root, string tag)
+    {
+        if (root is Border border && border.Tag is string value && value == tag)
+            return border;
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+            if (FindTaggedBorder(VisualTreeHelper.GetChild(root, index), tag) is { } match)
+                return match;
+        return null;
+    }
+
+    private void RenderMeetingNotesWorkIqStatus()
+    {
+        RelatedContextStatus? status = _relatedContext.Status;
+        if (_displayedVisualizationDocument is not { } document ||
+            status?.SessionId != document.SessionId)
+            status = null;
+        var message = _displayedVisualizationDocument is { TopicClusters.Count: > 0 }
+            ? RelatedContextPresentation.MeetingFailureMessage(status, _workIq.IsAuthenticated)
+            : string.Empty;
+        MeetingNotesWorkIqStatusText.Text = message;
+        MeetingNotesWorkIqStatusText.Visibility = message.Length > 0
+            ? Visibility.Visible
+            : Visibility.Collapsed;
     }
 
     private static string? FocusedAutomationIdWithin(FrameworkElement container)
@@ -3429,8 +3827,7 @@ public sealed partial class MainWindow : Window
 
     private bool IsCurrentRelatedContextStatus(RelatedContextStatus status)
     {
-        if (!ReferenceEquals(status, _relatedContext.Status) ||
-            status.SourceRevision != _workIq.Revision)
+        if (status.SourceRevision != _workIq.Revision)
             return false;
         return status.SessionId.Length == 0 || status.SessionId == _sessionId;
     }

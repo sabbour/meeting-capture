@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using MeetingCapture.Diagnostics;
 using MeetingCapture.Graph;
 using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
@@ -11,6 +12,7 @@ namespace MeetingCapture.WorkIq;
 public sealed class WorkIqService : IDisposable, IRelatedContextSource
 {
     public const string ClientId = "ba081686-5d24-4bc6-a0d6-d034ecffed87";
+    internal const string RedirectUri = "http://localhost";
     public static readonly string[] Scopes = ["fdcc1f02-fc51-4226-8753-f668596af7f7/WorkIQAgent.Ask"];
     internal static readonly string[] RelatedContextCapabilities =
         ["Meetings", "TeamsMessages", "Email"];
@@ -20,6 +22,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     private readonly ProtectedWorkIqCache _cache;
     private readonly AiUsageMonitor _usage;
     private readonly AiDiagnosticsStream _diagnostics;
+    private readonly ResponsivenessDiagnostics? _responsiveness;
     private readonly BoundedSignIn _signIn;
     private readonly SemaphoreSlim _requests = new(1, 1);
     private readonly SemaphoreSlim _contextRequests = new(1, 1);
@@ -49,19 +52,21 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         ILogger<WorkIqService> logger,
         ProtectedWorkIqCache? cache = null,
         AiUsageMonitor? usage = null,
-        AiDiagnosticsStream? diagnostics = null)
+        AiDiagnosticsStream? diagnostics = null,
+        ResponsivenessDiagnostics? responsiveness = null)
     {
         _logger = logger;
         _cache = cache ?? new ProtectedWorkIqCache();
         _usage = usage ?? new AiUsageMonitor();
         _diagnostics = diagnostics ?? new AiDiagnosticsStream();
+        _responsiveness = responsiveness;
         _signIn = new BoundedSignIn(TimeSpan.FromSeconds(90),
             error => _logger.LogWarning("WorkIQ sign-in cleanup: {Type}", error.GetType().Name));
     }
 
     private static IPublicClientApplication CreateApp() => PublicClientApplicationBuilder.Create(ClientId)
         .WithAuthority("https://login.microsoftonline.com/organizations")
-        .WithRedirectUri("http://localhost:12798")
+        .WithRedirectUri(RedirectUri)
         .Build();
 
     private static WorkIqMcpClient CreateClient(TimeSpan? requestTimeout = null) => new(
@@ -73,6 +78,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     public async Task SignInAsync(CancellationToken ct)
     {
         var revision = Revision;
+        WorkIqException? serviceProblem = null;
         try
         {
             await _signIn.RunAsync(async token =>
@@ -94,7 +100,13 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                         }
                     }).ExecuteAsync(token).ConfigureAwait(false);
                 using var client = CreateClient();
-                await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false);
+                try { await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false); }
+                catch (WorkIqException ex) when (ex.Kind is WorkIqFailure.ServiceUnavailable)
+                {
+                    // The account signed in; only the service check failed. Keep the sign-in so
+                    // later requests can succeed without another browser sign-in.
+                    serviceProblem = ex;
+                }
                 return new Prepared(app);
             }, prepared =>
             {
@@ -110,50 +122,103 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 }
             }, ct).ConfigureAwait(false);
             AuthStateChanged?.Invoke(this, EventArgs.Empty);
+            // Sign-in is saved; report the service problem so the window can explain it.
+            if (serviceProblem is not null) throw serviceProblem;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex) { throw Failure(ex); }
     }
 
     /// <summary>Restore only this application's DPAPI-protected cache; never opens a browser.</summary>
-    public async Task RestoreAsync(CancellationToken ct)
+    public Task RestoreAsync(CancellationToken ct) => RestoreAsync(RestoreApplicationAsync, ct);
+
+    internal async Task RestoreAsync(
+        Func<CancellationToken, Task<IPublicClientApplication?>> restoreApplication,
+        CancellationToken ct)
     {
+        using var phase = _responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqRestoreWait);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(30));
         var token = deadline.Token;
         var revision = Revision;
-        var entered = false;
+        var published = false;
         try
         {
-            await _requests.WaitAsync(token).ConfigureAwait(false);
-            entered = true;
-            var app = CreateApp();
-            _cache.Load(app);
-            var accounts = (await app.GetAccountsAsync().ConfigureAwait(false)).ToArray();
-            if (accounts.Length == 0) return;
-            if (accounts.Length != 1) throw new WorkIqException(WorkIqFailure.Authentication);
-            var auth = await app.AcquireTokenSilent(Scopes, accounts[0]).ExecuteAsync(token).ConfigureAwait(false);
-            using var client = CreateClient();
-            await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false);
-            lock (_gate)
+            await _signIn.RunAsync(async operationToken =>
             {
-                token.ThrowIfCancellationRequested();
-                CheckRevision(revision);
-                _cache.Save(app);
-                _app = app;
-                _photoCache.Clear();
-                Interlocked.Increment(ref _revision);
-                PublishAuthStateLocked();
-            }
-            AuthStateChanged?.Invoke(this, EventArgs.Empty);
+                using var workerPhase = _responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqRestore);
+                await _requests.WaitAsync(operationToken).ConfigureAwait(false);
+                try
+                {
+                    var app = await restoreApplication(operationToken).ConfigureAwait(false);
+                    if (app is not null)
+                    {
+                        // Cache I/O stays inside the owned worker, not the bounded caller's publication.
+                        lock (_gate)
+                        {
+                            operationToken.ThrowIfCancellationRequested();
+                            CheckRevision(revision);
+                            using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCacheSave))
+                                _cache.Save(app);
+                        }
+                    }
+                    return new Prepared(app);
+                }
+                finally { _requests.Release(); }
+            }, prepared =>
+            {
+                if (prepared.Application is not { } app) return;
+                lock (_gate)
+                {
+                    token.ThrowIfCancellationRequested();
+                    CheckRevision(revision);
+                    _app = app;
+                    _photoCache.Clear();
+                    Interlocked.Increment(ref _revision);
+                    PublishAuthStateLocked();
+                    published = true;
+                }
+            }, token).ConfigureAwait(false);
+            if (published) AuthStateChanged?.Invoke(this, EventArgs.Empty);
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
-        catch (Exception ex) { throw Failure(ex); }
-        finally { if (entered) _requests.Release(); }
+        catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+        {
+            phase?.Fail(ex);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            phase?.Fail(ex);
+            throw Failure(ex);
+        }
+    }
+
+    private async Task<IPublicClientApplication?> RestoreApplicationAsync(CancellationToken token)
+    {
+        var app = CreateApp();
+        using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCacheLoad))
+            _cache.Load(app);
+        IAccount[] accounts;
+        using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCachedAccounts))
+            accounts = (await app.GetAccountsAsync().ConfigureAwait(false)).ToArray();
+        if (accounts.Length == 0) return null;
+        if (accounts.Length != 1) throw new WorkIqException(WorkIqFailure.Authentication);
+        AuthenticationResult auth;
+        using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqSilentAuthentication))
+            auth = await app.AcquireTokenSilent(Scopes, accounts[0]).ExecuteAsync(token).ConfigureAwait(false);
+        using var client = CreateClient();
+        using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqConnect))
+        {
+            // The saved sign-in is still valid when only the service check fails; keep it.
+            try { await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false); }
+            catch (WorkIqException ex) when (ex.Kind is WorkIqFailure.ServiceUnavailable) { }
+        }
+        return app;
     }
 
     public async Task<List<MeetingTitleCandidate>> GetCalendarAsync(DateTimeOffset start, DateTimeOffset end, CancellationToken ct)
     {
+        using var phase = _responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCalendar);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(30));
         var token = deadline.Token;
@@ -169,24 +234,35 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 CheckRevision(revision);
                 app = _app ?? throw new WorkIqException(WorkIqFailure.SignedOut);
             }
-            var accounts = (await app.GetAccountsAsync().ConfigureAwait(false)).ToArray();
+            IAccount[] accounts;
+            using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCachedAccounts))
+                accounts = (await app.GetAccountsAsync().ConfigureAwait(false)).ToArray();
             if (accounts.Length != 1) throw new WorkIqException(WorkIqFailure.SignedOut);
-            var auth = await app.AcquireTokenSilent(Scopes, accounts[0]).ExecuteAsync(token).ConfigureAwait(false);
+            AuthenticationResult auth;
+            using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqSilentAuthentication))
+                auth = await app.AcquireTokenSilent(Scopes, accounts[0]).ExecuteAsync(token).ConfigureAwait(false);
             using var client = CreateClient();
-            await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false);
+            using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqConnect))
+                await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false);
             var response = await client.FetchCalendarResultAsync(auth.AccessToken, start, end, token).ConfigureAwait(false);
             var meetings = WorkIqMcpClient.ParseCalendar(response);
             lock (_gate)
             {
                 token.ThrowIfCancellationRequested();
                 CheckRevision(revision);
-                _cache.Save(app);
+                using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCacheSave))
+                    _cache.Save(app);
             }
             return meetings;
         }
-        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+        catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+        {
+            phase?.Fail(ex);
+            throw;
+        }
         catch (Exception ex)
         {
+            phase?.Fail(ex);
             var failure = Failure(ex);
             if (failure.Kind is WorkIqFailure.Authentication or WorkIqFailure.SignedOut)
             {
@@ -259,33 +335,36 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 client, auth.AccessToken, revision, token).ConfigureAwait(false);
             _logger.LogInformation("WorkIQ related-context query started.");
             var retrievedAt = DateTimeOffset.UtcNow;
-            var familySnapshots = new List<RelatedContextSnapshot>();
-            foreach (var capability in RelatedContextCapabilities)
+            foreach (var _ in RelatedContextCapabilities)
             {
-                try
-                {
-                    observation.CallStarted();
-                    diagnostic.CallStarted();
-                    var response = await client.RetrieveRelatedContextResultAsync(
-                        auth.AccessToken, query.Topic, [capability], token).ConfigureAwait(false);
-                    var family = WorkIqMcpClient.ParseRetrievedContext(
-                        response,
-                        retrievedAt,
-                        currentIdentity);
-                    familySnapshots.Add(family);
-                    _logger.LogInformation(
-                        "WorkIQ related-context family completed: {Capability} {Availability} {Count}.",
-                        capability, family.Availability, family.Items.Count);
-                }
-                catch (Exception ex)
-                {
-                    var familyFailure = Failure(ex);
-                    if (familyFailure.Kind != WorkIqFailure.Unsupported)
-                        throw familyFailure;
-                    familySnapshots.Add(new RelatedContextSnapshot(retrievedAt, [],
-                        RelatedContextAvailability.Unavailable));
-                }
+                observation.CallStarted();
+                diagnostic.CallStarted();
             }
+            var familySnapshots = await RetrieveFamiliesAsync(
+                RelatedContextCapabilities,
+                async (capability, familyToken) =>
+                {
+                    using var familyPhase = _responsiveness?.BeginBackgroundPhase(FamilyPhase(capability));
+                    try
+                    {
+                        var response = await client.RetrieveRelatedContextResultAsync(
+                            auth.AccessToken, query.Topic, [capability], familyToken).ConfigureAwait(false);
+                        var family = WorkIqMcpClient.ParseRetrievedContext(response, retrievedAt, currentIdentity);
+                        _logger.LogInformation(
+                            "WorkIQ related-context family completed: {Capability} {Availability} {Count}.",
+                            capability, family.Availability, family.Items.Count);
+                        return family;
+                    }
+                    catch (Exception ex) when (!token.IsCancellationRequested)
+                    {
+                        var familyFailure = Failure(ex);
+                        familyPhase?.Fail(familyFailure, DiagnosticFailureReason(familyFailure));
+                        throw familyFailure;
+                    }
+                },
+                RelatedContextFamilyTimeout,
+                retrievedAt,
+                token).ConfigureAwait(false);
             var snapshot = WorkIqMcpClient.MergeRetrievedContexts(familySnapshots, retrievedAt);
             _logger.LogInformation(
                 "WorkIQ related-context query completed: {Availability} {Count}.",
@@ -343,6 +422,16 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             };
             observation.Fail(diagnosticFailure);
             diagnostic.Fail(diagnosticFailure);
+            if (failure.Kind is WorkIqFailure.ServiceDeclined or WorkIqFailure.Network or
+                WorkIqFailure.ServiceUnavailable or
+                WorkIqFailure.Timeout or WorkIqFailure.Malformed or WorkIqFailure.Unknown)
+            {
+                return new RelatedContextSnapshot(
+                    DateTimeOffset.UtcNow,
+                    [],
+                    RelatedContextAvailability.Unavailable,
+                    RelatedContextUnavailableMessage(failure));
+            }
             if (failure.Kind is WorkIqFailure.Authentication or WorkIqFailure.SignedOut)
             {
                 var changed = false;
@@ -362,6 +451,100 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             throw failure;
         }
         finally { if (entered) _contextRequests.Release(); }
+    }
+
+    internal static readonly TimeSpan RelatedContextFamilyTimeout = TimeSpan.FromSeconds(60);
+
+    private static ResponsivenessPhase FamilyPhase(string capability) => capability switch
+    {
+        "Meetings" => ResponsivenessPhase.WorkIqRelatedMeetings,
+        "TeamsMessages" => ResponsivenessPhase.WorkIqRelatedTeamsMessages,
+        "Email" => ResponsivenessPhase.WorkIqRelatedEmail,
+        _ => ResponsivenessPhase.WorkIqRelatedOther
+    };
+
+    internal static string DiagnosticFailureReason(WorkIqException failure)
+        => string.IsNullOrWhiteSpace(failure.Code)
+            ? failure.Kind.ToString()
+            : $"{failure.Kind}:{failure.Code}";
+
+    internal static string RelatedContextUnavailableMessage(WorkIqException failure) => failure.Kind switch
+    {
+        WorkIqFailure.ServiceDeclined => "Work IQ declined the related-sources request.",
+        WorkIqFailure.Network =>
+            "Work IQ could not be reached.",
+        WorkIqFailure.ServiceUnavailable =>
+            "The Work IQ service is having a problem right now.",
+        WorkIqFailure.Timeout => "Work IQ timed out while finding related suggestions.",
+        WorkIqFailure.Authentication or WorkIqFailure.SignedOut => "Work IQ is not signed in.",
+        WorkIqFailure.Malformed =>
+            "Work IQ sent a reply this app could not read.",
+        WorkIqFailure.Denied =>
+            "Your Work IQ account cannot access related suggestions.",
+        WorkIqFailure.Unsupported =>
+            "Work IQ does not support related suggestions.",
+        _ => "Work IQ request failed. See Diagnostics/related.log for the error type.",
+    };
+
+    /// <summary>
+    /// Queries every source family at the same time, each with its own time limit. One slow,
+    /// denied or malformed family no longer discards the others: it only fails the whole
+    /// query when no family returned a result. Sign-in failures still fail the query so the
+    /// caller can publish the signed-out state.
+    /// </summary>
+    internal static async Task<List<RelatedContextSnapshot>> RetrieveFamiliesAsync(
+        IReadOnlyList<string> capabilities,
+        Func<string, CancellationToken, Task<RelatedContextSnapshot>> retrieveFamily,
+        TimeSpan familyTimeout,
+        DateTimeOffset retrievedAt,
+        CancellationToken cancellationToken)
+    {
+        var attempts = capabilities.Select(async capability =>
+        {
+            using var familyDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            familyDeadline.CancelAfter(familyTimeout);
+            try
+            {
+                return (Snapshot: await retrieveFamily(capability, familyDeadline.Token).ConfigureAwait(false),
+                    Error: (Exception?)null);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                return (Snapshot: (RelatedContextSnapshot?)null, Error: ex);
+            }
+        }).ToArray();
+        var results = await Task.WhenAll(attempts).ConfigureAwait(false);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var snapshots = new List<RelatedContextSnapshot>();
+        Exception? firstFailure = null;
+        foreach (var (snapshot, error) in results)
+        {
+            if (snapshot is not null) { snapshots.Add(snapshot); continue; }
+            if (error is WorkIqException { Kind: WorkIqFailure.Unsupported })
+            {
+                snapshots.Add(new RelatedContextSnapshot(
+                    retrievedAt,
+                    [],
+                    RelatedContextAvailability.Unavailable,
+                    "Work IQ does not support related suggestions."));
+                continue;
+            }
+            if (error is WorkIqException { Kind: WorkIqFailure.Authentication or WorkIqFailure.SignedOut })
+                throw error;
+            firstFailure ??= error;
+            snapshots.Add(new RelatedContextSnapshot(
+                retrievedAt,
+                [],
+                RelatedContextAvailability.Unavailable,
+                error is WorkIqException failure
+                    ? RelatedContextUnavailableMessage(failure)
+                    : "Work IQ could not be reached."));
+        }
+        if (firstFailure is not null &&
+            !snapshots.Any(item => item.Availability != RelatedContextAvailability.Unavailable))
+            throw firstFailure!;
+        return snapshots;
     }
 
     /// <summary>Resolves the signed-in tenant identity (object ID plus verified mail/UPN aliases)
@@ -506,10 +689,11 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             _ => new WorkIqException(WorkIqFailure.Unknown)
         };
         _logger.LogWarning("WorkIQ request failed: {Kind} {Code} ({Type})", failure.Kind, failure.Code, error.GetType().Name);
+        MeetingCapture.Diagnostics.RelatedDiagnostics.Record("related", IsAuthenticated, failure);
         return failure;
     }
 
-    private sealed class Prepared(IPublicClientApplication app) : IDisposable
+    private sealed class Prepared(IPublicClientApplication? app) : IDisposable
     {
         public IPublicClientApplication? Application { get; private set; } = app;
         public void Dispose() => Application = null;

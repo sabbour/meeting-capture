@@ -1,3 +1,5 @@
+using System.Runtime.InteropServices;
+using MeetingCapture.Diagnostics;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Xaml;
 using Microsoft.Windows.AppLifecycle;
@@ -15,6 +17,9 @@ internal static class Program
 {
     private static readonly TimeSpan ActivationRedirectTimeout = TimeSpan.FromSeconds(3);
 
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
     [STAThread]
     static void Main(string[] args)
     {
@@ -24,6 +29,7 @@ internal static class Program
             return;
         }
 
+        StartupPriority.StartKeepingNormalScheduling();
         WinRT.ComWrappersSupport.InitializeComWrappers();
 
         var mainInstance = AppInstance.FindOrRegisterForKey("meeting-capture-main");
@@ -50,12 +56,18 @@ internal static class Program
         // We are the main instance. Listen for re-activation by subsequent instances.
         mainInstance.Activated += OnReactivated;
 
+        using var responsiveness = new ResponsivenessDiagnostics(GetCurrentThreadId());
+        using var startup = responsiveness.BeginUiPhase(ResponsivenessPhase.ApplicationStart);
         Application.Start(p =>
         {
+            startup.Dispose();
+            var dispatcher = DispatcherQueue.GetForCurrentThread();
+            responsiveness.StartMonitor(action =>
+                dispatcher.TryEnqueue(DispatcherQueuePriority.Normal, action.Invoke));
             var ctx = new DispatcherQueueSynchronizationContext(
-                DispatcherQueue.GetForCurrentThread());
+                dispatcher);
             SynchronizationContext.SetSynchronizationContext(ctx);
-            _ = new App();
+            _ = new App(responsiveness);
         });
     }
 

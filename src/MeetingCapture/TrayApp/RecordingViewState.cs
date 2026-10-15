@@ -26,4 +26,17 @@ public sealed record RecordingViewState(
 
     public static bool ShouldShowNotice(PipelineState state, string? sessionId, string? shownSessionId) =>
         state == PipelineState.Recording && sessionId is not null && sessionId != shownSessionId;
+
+    public static (bool Visible, bool Enabled, string Message) NewRecordingAction(
+        PipelineStatus status, bool canStart, bool preparingExit, bool retryBusy, bool previewBusy)
+    {
+        var visible = canStart || status.State is PipelineState.Saved or PipelineState.Discarded or PipelineState.Failed;
+        var enabled = canStart && !preparingExit && !retryBusy && !previewBusy;
+        var message = preparingExit ? "The app is exiting. Reopen it to start a new recording."
+            : retryBusy ? "Wait for the AI retry to finish, or cancel it, before starting a new recording."
+            : previewBusy ? "Wait for the audio preview to finish before starting a new recording."
+            : !canStart ? "New recording is unavailable. " + (status.Error ?? status.Message)
+            : "Start a separate recording. Saved notes stay unchanged.";
+        return (visible, enabled, message);
+    }
 }

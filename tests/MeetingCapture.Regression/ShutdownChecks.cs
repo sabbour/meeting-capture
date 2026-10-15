@@ -15,6 +15,9 @@ internal static class ShutdownChecks
         yield return ("exit abandons uncooperative optional synthesis without late writes", UncooperativeSynthesis);
         yield return ("exit cancels externally requested AI retry without replaying cancellation", CancelRetry);
         yield return ("exit refuses remaining capture ownership without disposing recovery", CaptureOwnership);
+        yield return ("window close stops layout callbacks and never re-shows a closing window", ClosingWindowGuards);
+        yield return ("crash log keeps exception types and stacks but no message text", CrashLogMetadataOnly);
+        yield return ("saved partial Speech exit requires explicit confirmation", SavedPartialClosePolicy);
         yield return ("exit completes when only the optional visualization sidecar cannot be saved",
             PendingSidecarNeverBlocksExit);
         yield return ("exit still refuses capture ownership when a visualization sidecar is pending",
@@ -22,6 +25,40 @@ internal static class ShutdownChecks
         yield return ("deferred visualization retries survive until they succeed or lose their transcript",
             DeferredVisualizationJournalRecovery);
         yield return ("shutdown deadline includes synchronously blocked disposal and reports errors", CleanupDeadline);
+    }
+
+    private static Task ClosingWindowGuards()
+    {
+        var window = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        var app = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "App.xaml.cs.txt"));
+        var update = window[window.IndexOf("private void UpdateTitleBarInteractiveRegions()", StringComparison.Ordinal)..];
+        Check.True(update[..update.IndexOf("SetRegionRects", StringComparison.Ordinal)].Contains("if (_allowClose) return;"));
+        var close = window[window.IndexOf("public void CloseForReal()", StringComparison.Ordinal)..];
+        close = close[..close.IndexOf("Close();", StringComparison.Ordinal)];
+        Check.True(close.Contains("if (!_preparingExit) PrepareForExit();"));
+        Check.True(close.Contains("AppTitleBar.SizeChanged -= OnTitleBarSizeChanged;"));
+        Check.True(close.Contains("TitleBarActions.LayoutUpdated -= OnTitleBarActionsLayoutUpdated;"));
+        Check.True(close.Contains("Activated -= OnWindowActivated;"));
+        Check.True(window.Contains("public void ShowFromTray()\r\n    {\r\n        if (_allowClose) return;")
+            || window.Contains("public void ShowFromTray()\n    {\n        if (_allowClose) return;"));
+        Check.True(app.Contains("_mainWindow.IsClosing"));
+        Check.True(app.Contains("UnhandledException += (_, e) => CrashDiagnostics.Record"));
+        return Task.CompletedTask;
+    }
+
+    private static Task CrashLogMetadataOnly()
+    {
+        using var temp = new TemporaryDirectory();
+        Exception error;
+        try { throw new InvalidOperationException("PRIVATE-MESSAGE-TEXT", new IOException("PRIVATE-INNER-TEXT")); }
+        catch (Exception ex) { error = ex; }
+        Check.True(MeetingCapture.Diagnostics.CrashDiagnostics.Record("test", error, temp.Path));
+        var text = File.ReadAllText(Path.Combine(temp.Path, MeetingCapture.Diagnostics.CrashDiagnostics.FileName));
+        Check.True(text.Contains("type=System.InvalidOperationException"));
+        Check.True(text.Contains("type=System.IO.IOException"));
+        Check.True(text.Contains(nameof(CrashLogMetadataOnly)));
+        Check.True(!text.Contains("PRIVATE"));
+        return Task.CompletedTask;
     }
 
     private static async Task SuccessfulExit()
@@ -141,6 +178,63 @@ internal static class ShutdownChecks
         Check.True(f.Capture.IsCapturing && !f.Pipeline.CanStart);
         Check.Equal(0, f.Capture.Disposals);
         Check.True(File.Exists(f.Storage.Paths.Single()));
+    }
+
+    private static async Task SavedPartialClosePolicy()
+    {
+        await using var f = new PipelineFixture(transcriptionTimeout: TimeSpan.FromMilliseconds(80));
+        var pushGate = new AsyncGate();
+        var review = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var ownershipReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Transcription.OnPushAudio = pushGate.WaitAsync;
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave)
+            {
+                Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+                f.Pipeline.SaveNow(status.SessionId!);
+                review.TrySetResult();
+            }
+            if (f.Pipeline.CanStart)
+                ownershipReleased.TrySetResult();
+        };
+        await f.Pipeline.StartManualAsync("Synthetic saved-partial close", CancellationToken.None);
+        f.Transcription.Emit("Recognized before the stalled write");
+        var emit = Task.Run(() => f.Capture.EmitAudio([1, 2]));
+        try
+        {
+            await pushGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+            await emit.WaitAsync(TimeSpan.FromSeconds(1));
+            await review.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await f.Pipeline.StopManualAsync().WaitAsync(TimeSpan.FromSeconds(2));
+
+            Check.True(File.Exists(f.Pipeline.Status.NotesPath));
+            Check.True(!f.Capture.IsCapturing);
+            Check.True(f.Pipeline.CanForceCloseAfterSavedPartial);
+            Check.True(!ExitReadiness.ShouldCloseAfterSavedPartial(false, true));
+            Check.True(!ExitReadiness.ShouldCloseAfterSavedPartial(true, false));
+            Check.True(ExitReadiness.ShouldCloseAfterSavedPartial(true, true));
+
+            pushGate.Release();
+            await f.Transcription.PushesSettled.WaitAsync(TimeSpan.FromSeconds(2));
+            await ownershipReleased.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+            var retryGate = new AsyncGate();
+            f.Intelligence.OnSynthesize = retryGate.WaitAsync;
+            var retry = f.Pipeline.RetryIntelligenceAsync(
+                f.Pipeline.LastCompletedTranscript!.SessionId, CancellationToken.None);
+            await retryGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+            Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+            retryGate.Release();
+            await retry.WaitAsync(TimeSpan.FromSeconds(2));
+
+            await f.Pipeline.PrepareForExitAsync().WaitAsync(TimeSpan.FromSeconds(2));
+            Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+        }
+        finally
+        {
+            pushGate.Release();
+        }
     }
 
     /// <summary>

@@ -55,6 +55,14 @@ public sealed class MeetingVisualizationSession
     }
 
     public void AppendOrUpdateSegment(int ordinal, TranscriptionSegment segment)
+        => UpdateSegment(null, ordinal, segment, null);
+
+    internal bool TryAppendOrUpdateSegment(
+        string sessionId, int ordinal, TranscriptionSegment segment, Func<bool> isCurrent)
+        => UpdateSegment(sessionId, ordinal, segment, isCurrent);
+
+    private bool UpdateSegment(
+        string? expectedSessionId, int ordinal, TranscriptionSegment segment, Func<bool>? isCurrent)
     {
         ArgumentNullException.ThrowIfNull(segment);
         if (ordinal < 1 || string.IsNullOrWhiteSpace(segment.Text))
@@ -62,7 +70,10 @@ public sealed class MeetingVisualizationSession
         bool publish;
         lock (_gate)
         {
-            RequireMutable();
+            if (expectedSessionId is null)
+                RequireMutable();
+            else if (_closed || _sessionId != expectedSessionId || isCurrent is null || !isCurrent())
+                return false;
             var value = new VisualizationSegment($"seg-{ordinal:D6}", ordinal, segment.Text,
                 segment.Timestamp, segment.SpeakerId, segment.ConfidenceScore);
             var index = _segments.FindIndex(item => item.Ordinal == ordinal);
@@ -87,6 +98,7 @@ public sealed class MeetingVisualizationSession
             publish = ChangedLocked();
         }
         PublishChanged(publish);
+        return true;
     }
 
     public void ApplySpeakerAssignment(string speakerId, string displayName, bool isConfirmed = true)

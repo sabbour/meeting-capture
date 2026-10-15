@@ -1,4 +1,5 @@
 using MeetingCapture.Intelligence;
+using MeetingCapture.Diagnostics;
 
 namespace MeetingCapture.Regression;
 
@@ -6,6 +7,7 @@ internal static class AiDiagnosticsChecks
 {
     public static IEnumerable<(string, Func<Task>)> Cases()
     {
+        yield return ("regression diagnostics use temporary files instead of the user's logs", IsolatedDiagnosticFiles);
         yield return ("AI diagnostics redact content by default", DefaultRedaction);
         yield return ("AI diagnostics capture raw session content only when enabled", OptInCapture);
         yield return ("AI diagnostics always remove secrets and auth headers", SecretExclusion);
@@ -14,6 +16,50 @@ internal static class AiDiagnosticsChecks
         yield return ("AI diagnostics clear reset and reject stale completion", ClearAndReset);
         yield return ("AI diagnostics complete concurrent requests safely", ConcurrentCompletion);
         yield return ("AI diagnostics classify persistence failures without retaining error text", PersistenceFailureMetadata);
+        yield return ("AI diagnostics retain late usage without reopening completed requests", LateUsage);
+    }
+
+    private static Task IsolatedDiagnosticFiles()
+    {
+        var directory = CrashDiagnostics.DirectoryOverride;
+        Check.True(directory is not null);
+        Check.Equal(directory, CrashDiagnostics.DefaultDirectory);
+        var realDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "MeetingCapture", "Diagnostics");
+        Check.True(!Path.GetFullPath(directory).Equals(
+            Path.GetFullPath(realDirectory), StringComparison.OrdinalIgnoreCase));
+        Check.True(Path.GetFullPath(directory).StartsWith(
+            Path.TrimEndingDirectorySeparator(Path.GetTempPath()) + Path.DirectorySeparatorChar,
+            StringComparison.OrdinalIgnoreCase));
+
+        const string marker = "regression-isolation";
+        Check.True(CrashDiagnostics.Record(marker, new InvalidOperationException()));
+        RelatedDiagnostics.Record("related", false, new InvalidOperationException());
+        AiFinalizationDiagnostics.Record("final-notes", "failed", new InvalidOperationException(), 0);
+        Check.True(File.ReadAllText(Path.Combine(directory, CrashDiagnostics.FileName)).Contains(marker));
+        Check.True(File.ReadAllText(Path.Combine(directory, "related.log")).Contains("operation=related"));
+        Check.True(File.ReadAllText(Path.Combine(directory, AiFinalizationDiagnostics.FileName))
+            .Contains("stage=final-notes"));
+        return Task.CompletedTask;
+    }
+
+    private static Task LateUsage()
+    {
+        var stream = new AiDiagnosticsStream();
+        stream.Reset("session-a");
+        var request = stream.Begin(AiCapability.Visualization, "GitHub Copilot", "test-model");
+        request.CallStarted();
+        request.Fail(AiRequestFailure.RateLimited, TimeSpan.FromSeconds(30));
+        request.ReportUsage(120, 30, null, null, null);
+        var latest = stream.GetSnapshot().Events[^1];
+        Check.Equal(AiDiagnosticEventKind.UsageReported, latest.Kind);
+        Check.Equal(AiRequestState.RateLimited, latest.State);
+        Check.Equal(AiRequestFailure.RateLimited, latest.Failure);
+        Check.Equal(TimeSpan.FromSeconds(30), latest.RetryAfter);
+        Check.Equal(120L, latest.InputTokens);
+        Check.Equal(30L, latest.OutputTokens);
+        return Task.CompletedTask;
     }
 
     private static Task DefaultRedaction()

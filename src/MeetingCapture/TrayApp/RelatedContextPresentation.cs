@@ -26,6 +26,40 @@ internal sealed record TopicContextStatusViewModel(
 
 internal static class RelatedContextPresentation
 {
+    internal static string MeetingFailureMessage(
+        RelatedContextStatus? status,
+        bool workIqAuthenticated)
+    {
+        if (!workIqAuthenticated)
+            return "Workplace suggestions are unavailable: not signed in to Work IQ.";
+        if (status is null ||
+            status.State is not (RelatedContextState.Unavailable or RelatedContextState.Failed))
+            return string.Empty;
+
+        var detail = status.Snapshot?.Detail ?? status.Detail ?? string.Empty;
+        var reason = detail.Contains("timed out", StringComparison.OrdinalIgnoreCase)
+            ? "Work IQ timed out"
+            : detail.Contains("not signed in", StringComparison.OrdinalIgnoreCase)
+                ? "sign in to Work IQ again"
+            : detail.Contains("declined", StringComparison.OrdinalIgnoreCase)
+            ? "Work IQ declined the related-sources request"
+            : detail.Contains("could not be read", StringComparison.OrdinalIgnoreCase) ||
+              detail.Contains("could not read", StringComparison.OrdinalIgnoreCase) ||
+              detail.Contains("malformed", StringComparison.OrdinalIgnoreCase)
+                ? "Work IQ sent a reply this app could not read"
+                : detail.Contains("not support", StringComparison.OrdinalIgnoreCase)
+                    ? "Work IQ does not support related suggestions"
+                    : detail.Contains("access", StringComparison.OrdinalIgnoreCase) ||
+                      detail.Contains("denied", StringComparison.OrdinalIgnoreCase)
+                        ? "your Work IQ account cannot access related suggestions"
+                        : detail.Contains("could not be reached", StringComparison.OrdinalIgnoreCase)
+                            ? "Work IQ could not be reached"
+                            : detail.Contains("having a problem", StringComparison.OrdinalIgnoreCase)
+                                ? "the Work IQ service is having a problem right now; try again in a few minutes"
+                            : "the Work IQ request failed; check Diagnostics/related.log for the error type";
+        return $"Workplace suggestions are unavailable: {reason}.";
+    }
+
     internal static TopicContextStatusViewModel TopicStatus(RelatedContextState state) => state switch
     {
         RelatedContextState.Pending => new(

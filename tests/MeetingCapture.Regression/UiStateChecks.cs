@@ -20,7 +20,9 @@ internal static class UiStateChecks
         yield return ("repeated partial transcript refreshes preserve rows avatars and follow only structural progress", () => Run(TranscriptRefreshPattern));
         yield return ("window placement scales defaults, preserves user size and clamps to work area", () => Run(WindowBounds));
         yield return ("single-instance activation cannot leave a headless process waiting on a stale registration", () => Run(SingleInstanceActivation));
+        yield return ("stalled Speech exit requires saved-data confirmation and skips SDK disposal", () => Run(PartialSpeechExit));
         yield return ("high-rate transcript and AI events coalesce before entering the UI dispatcher", () => Run(DispatcherCoalescing));
+        yield return ("WorkIQ controls skip unchanged refreshes and retain authentication transitions", () => Run(WorkIqControls));
         yield return ("visualization expansion is responsive and stable updates animate only once", () => Run(VisualizationExpansion));
         yield return ("desktop manifest enables per-monitor native rendering without elevation", () => Run(() =>
         {
@@ -61,7 +63,8 @@ internal static class UiStateChecks
         yield return ("focus loss keeps active capture visible unless explicitly closed", () => Run(PinBehavior));
         yield return ("title header is draggable without intercepting header controls", () => Run(DraggableTitleBar));
         yield return ("speaker avatar fallback uses initials only after explicit resolution", () => Run(SpeakerAvatarFallback));
-        yield return ("tray context menu keeps its labels readable", () => Run(TrayMenuWidth));
+        yield return ("tray context menu keeps its labels readable and fits screen bounds", () => Run(TrayMenuWidth));
+        yield return ("tray menu window is sized per open from the cursor monitor DPI and never opens undersized", () => Run(TrayMenuLayoutMath));
         yield return ("context suggestions expose freshness and one-action external source affordances", () => Run(ContextFlyout));
         yield return ("AI activity shows typed states reported metrics and quiet accessible transitions", () => Run(AiActivity));
         yield return ("meeting context participants stay a bounded preview separated by verification", () => Run(ParticipantsPreview));
@@ -70,8 +73,11 @@ internal static class UiStateChecks
         yield return ("AI diagnostics defaults to metadata and gates session-only payload details", () => Run(AiDiagnostics));
         yield return ("related context labels the actual queried topic after a live reword", () => Run(RelatedContextTopicLabel));
         yield return ("long summaries still update visualization while related context stays bounded", () => Run(LongVisualizationTopic));
-        yield return ("topic timeline preserves relations chronology selection navigation and scroll", () => Run(TopicTimeline));
-        yield return ("brain map nodes own Canvas insertion without re-adding the root", () => Run(BrainMapCanvasOwnership));
+        yield return ("topic map preserves relations selection navigation and scroll", () => Run(TopicTimeline));
+        yield return ("whole-meeting topic map lays out 8-15 topic branches and grounded leaves", () => Run(WholeMeetingBrainMapLayout));
+        yield return ("topic collapse frees layout space and persists across live updates", () => Run(TopicCollapseFreesSpaceAndPersists));
+        yield return ("whole-meeting topic map assigns uncategorized items from cited transcript evidence", () => Run(UnassignedMeetingItemsUseCitations));
+        yield return ("topic map nodes own Canvas insertion without re-adding the root", () => Run(BrainMapCanvasOwnership));
         yield return ("topic timeline projects confirmed speaker corrections without changing canonical topics", () => Run(TopicTimelineSpeakerProjection));
         yield return ("checklist completion is reversible and retained items are not reopened", () => Run(ChecklistCompletion));
         yield return ("recording view hides AI retries and pagination before finalized speech", () => Run(() =>
@@ -110,6 +116,44 @@ internal static class UiStateChecks
             Check.True(RecordingViewState.ShouldShowNotice(PipelineState.Recording, "session-b", "session-a"));
             Check.True(!RecordingViewState.ShouldShowNotice(PipelineState.Saved, "session-b", "session-a"));
         }));
+        yield return ("completed recording keeps new action visible without bypassing ownership or save gates", () => Run(() =>
+        {
+            PipelineStatus Status(PipelineState state, string? error = null) =>
+                new(1, "synthetic-session", state, "Finishing the previous recording.", null, error, null);
+            foreach (var state in new[] { PipelineState.Saved, PipelineState.Discarded, PipelineState.Failed })
+            {
+                var ready = RecordingViewState.NewRecordingAction(Status(state), true, false, false, false);
+                Check.True(ready.Visible && ready.Enabled);
+                var owned = RecordingViewState.NewRecordingAction(
+                    Status(state, "Capture resources could not be released."), false, false, false, false);
+                Check.True(owned.Visible && !owned.Enabled);
+                Check.True(owned.Message.Contains("Capture resources could not be released.", StringComparison.Ordinal));
+            }
+            foreach (var state in new[] { PipelineState.Starting, PipelineState.Recording,
+                PipelineState.Stopping, PipelineState.ReviewingSave, PipelineState.Finalizing, PipelineState.Generating })
+                Check.True(!RecordingViewState.NewRecordingAction(Status(state), false, false, false, false).Enabled);
+            Check.True(!RecordingViewState.NewRecordingAction(Status(PipelineState.Saved), true, true, false, false).Enabled);
+            Check.True(!RecordingViewState.NewRecordingAction(Status(PipelineState.Saved), true, false, true, false).Enabled);
+            Check.True(!RecordingViewState.NewRecordingAction(Status(PipelineState.Saved), true, false, false, true).Enabled);
+
+            var document = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+            XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+            XElement Control(string name) => document.Descendants().Single(e => (string?)e.Attribute(x + "Name") == name);
+            Check.Equal("OnStartClick", (string?)Control("NewRecordingButton").Attribute("Click"));
+            Check.Equal("Start a new recording", (string?)Control("NewRecordingButton").Attribute("AutomationProperties.Name"));
+            Check.True(Control("NewRecordingButton").Ancestors().Contains(Control("RecordingFooter")));
+            Check.True(!Control("NewRecordingButton").Ancestors().Any(e => e.Name.LocalName == "ScrollViewer"));
+            Check.Equal("Wrap", (string?)Control("NewRecordingHint").Attribute("TextWrapping"));
+            var source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+            var start = source.IndexOf("private void OnStartClick", StringComparison.Ordinal);
+            var end = source.IndexOf("private void OnMeetingEndedWhileRecording", start, StringComparison.Ordinal);
+            var handler = source[start..end];
+            Check.True(handler.Contains("_pipeline.StartManualAsync(title, CancellationToken.None)", StringComparison.Ordinal));
+            Check.True(!handler.Contains("Reset(", StringComparison.Ordinal) && !handler.Contains("Clear(", StringComparison.Ordinal));
+            Check.True(!handler.Contains("_workIq", StringComparison.Ordinal));
+            Check.True(source.Contains("NewRecordingButton.Visibility = NewRecordingHint.Visibility = newRecording.Visible",
+                StringComparison.Ordinal));
+        }));
         yield return ("rolling questions and actions retain prior snapshots without duplicates", () => Run(() =>
         {
             var retained = new List<string> { "First item" };
@@ -128,14 +172,15 @@ internal static class UiStateChecks
             XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
             XElement Control(string name) => document.Descendants().Single(e => (string?)e.Attribute(x + "Name") == name);
             var panel = Control("RecordingPanel");
+            var body = Control("RecordingBody");
             string? RowOf(string name) => (string?)Control(name).AncestorsAndSelf()
-                .First(e => e.Parent == panel).Attribute("Grid.Row");
+                .First(e => e.Parent == body || e.Parent == panel).Attribute("Grid.Row");
             Check.Equal("0", RowOf("RecordingTitleText"));
             Check.Equal("1", RowOf("InsightSections"));
             Check.Equal("2", RowOf("SpeakerBalancePanel"));
             Check.Equal("4", RowOf("TranscriptList"));
             Check.Equal("3", RowOf("RecordingUtilityActions"));
-            Check.Equal("5", RowOf("StopButton"));
+            Check.Equal("1", RowOf("StopButton"));
             Check.True(!Control("StopButton").Ancestors().Any(e => e.Name.LocalName == "ScrollViewer"));
             Check.True(Control("TranscriptList").Ancestors().Contains(Control("TranscriptExpander")));
             Check.Equal("True", (string?)Control("TranscriptExpander").Attribute("IsExpanded"));
@@ -243,9 +288,7 @@ internal static class UiStateChecks
             Check.Equal("False", (string?)Control("OpenQuestionsExpander").Attribute("IsExpanded"));
             Check.Equal("False", (string?)Control("ActionsExpander").Attribute("IsExpanded"));
             Check.Equal("320", (string?)Control("RecordingOverviewScroll").Attribute("MaxHeight"));
-            var transcriptRow = Control("RecordingTranscriptRow");
-            Check.Equal("*", (string?)transcriptRow.Attribute("Height"));
-            Check.True(transcriptRow.Attribute("MinHeight") is null);
+            Check.Equal("180", (string?)Control("TranscriptList").Attribute("MaxHeight"));
             var transcriptSurface = Control("TranscriptList").Ancestors()
                 .First(e => e.Name.LocalName == "Border");
             Check.Equal("{ThemeResource AccentFillColorDefaultBrush}",
@@ -283,7 +326,7 @@ internal static class UiStateChecks
             Check.True(mainSource.Contains(
                 "WhatDidIMissButton.Visibility = state.ShowCatchUp ? Visibility.Visible : Visibility.Collapsed;",
                 StringComparison.Ordinal));
-            Check.Equal("5", RowOf("SaveDecisionPanel"));
+            Check.Equal("1", RowOf("SaveDecisionPanel"));
             Check.Equal("Collapsed", (string?)Control("SaveDecisionPanel").Attribute("Visibility"));
             Check.True(!Control("SaveDecisionPanel").Ancestors().Any(e => e.Name.LocalName == "ScrollViewer"));
             Check.Equal("OnDiscardRecordingClick", (string?)Control("DiscardRecordingButton").Attribute("Click"));
@@ -336,6 +379,90 @@ internal static class UiStateChecks
 
     private static Task Run(Action action) { action(); return Task.CompletedTask; }
 
+    private static void WorkIqControls()
+    {
+        var connection = new WorkIqConnectionStatus();
+        var idle = connection.Controls(false, false, false, false, false);
+        Check.Equal((true, false, false), idle.Actions);
+        Check.True(!idle.CancelEnabled);
+        Check.Equal(connection.Message, idle.StateText);
+        WorkIqControlState? rendered = null;
+        Check.True(rendered != idle);
+        rendered = idle;
+        for (var tick = 0; tick < 600; tick++)
+            Check.Equal(rendered.Value, connection.Controls(false, false, false, false, false));
+
+        var restoring = connection.Controls(false, false, true, false, true);
+        Check.True(restoring != idle);
+        Check.Equal((false, false, true), restoring.Actions);
+        Check.True(restoring.CancelEnabled);
+        Check.Equal("Restoring WorkIQ...", restoring.ProgressText);
+        Check.Equal("Restoring only this app's protected WorkIQ sign-in...", restoring.StateText);
+
+        var signingIn = connection.Controls(false, true, true, false, false);
+        Check.True(signingIn != restoring);
+        Check.Equal((false, false, true), signingIn.Actions);
+        Check.True(signingIn.CancelEnabled);
+        Check.Equal("WorkIQ sign-in in progress", signingIn.ProgressText);
+        var cancelling = connection.Controls(false, true, true, true, false);
+        Check.True(cancelling != signingIn);
+        Check.Equal((false, false, true), cancelling.Actions);
+        Check.True(!cancelling.CancelEnabled);
+        Check.Equal("Cancelling sign-in...", cancelling.ProgressText);
+        var cleanup = connection.Controls(false, true, false, false, false);
+        Check.Equal((false, false, false), cleanup.Actions);
+        Check.True(!cleanup.CancelEnabled);
+        Check.True(cleanup.StateText.EndsWith(
+            " Waiting for authentication cleanup; recording is available.", StringComparison.Ordinal));
+
+        connection.AuthenticationChanged(true, 1);
+        var authenticated = connection.Controls(true, false, false, false, false);
+        Check.True(authenticated != cleanup);
+        Check.Equal((false, true, false), authenticated.Actions);
+        connection.CalendarSucceeded(3, new DateTimeOffset(2026, 10, 13, 18, 0, 0, TimeSpan.Zero));
+        var calendar = connection.Controls(true, false, false, false, false);
+        Check.True(calendar != authenticated);
+        Check.Equal(authenticated.Actions, calendar.Actions);
+        Check.True(calendar.StateText.Contains("3 calendar events", StringComparison.Ordinal));
+        var authDuringCleanup = connection.Controls(true, true, true, true, false);
+        Check.Equal((false, false, true), authDuringCleanup.Actions);
+        Check.True(!authDuringCleanup.CancelEnabled);
+        connection.AuthenticationChanged(false, 2);
+        Check.Equal(idle, connection.Controls(false, false, false, false, false));
+
+        var source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        var start = source.IndexOf("private void UpdateWorkIqControls()", StringComparison.Ordinal);
+        var end = source.IndexOf("public void ShowSettings()", start, StringComparison.Ordinal);
+        Check.True(start >= 0 && end > start);
+        var method = source[start..end];
+        var diagnostics = method.IndexOf("_responsiveness.SetWorkIqState(", StringComparison.Ordinal);
+        var guard = method.IndexOf("if (_renderedWorkIqControls == state) return;", StringComparison.Ordinal);
+        var firstSetter = method.IndexOf("WorkIqSignInButton.Visibility =", StringComparison.Ordinal);
+        var lastSetter = method.IndexOf("WorkIqStateText.Text = state.StateText;", StringComparison.Ordinal);
+        var applied = method.IndexOf("_renderedWorkIqControls = state;", StringComparison.Ordinal);
+        Check.True(diagnostics >= 0 && guard > diagnostics && firstSetter > guard);
+        Check.True(lastSetter > firstSetter && applied > lastSetter);
+        Check.True(method.Contains("previous?.Actions.SignIn != actions.SignIn", StringComparison.Ordinal));
+        Check.True(method.Replace("\r\n", "\n").Contains(
+            "MeetingNotesWorkIqSignInButton.Visibility = actions.SignIn\n                ? Visibility.Visible : Visibility.Collapsed;",
+            StringComparison.Ordinal));
+        Check.True(method.Contains("MeetingNotesWorkIqSignInButton.IsEnabled = actions.SignIn;",
+            StringComparison.Ordinal));
+        var notesSignIn = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"))
+            .Descendants().Single(element =>
+                (string?)element.Attribute(XName.Get("Name", "http://schemas.microsoft.com/winfx/2006/xaml"))
+                    == "MeetingNotesWorkIqSignInButton");
+        Check.Equal("Sign in to Work IQ", (string?)notesSignIn.Attribute("Content"));
+        Check.Equal("OnWorkIqSignInClick", (string?)notesSignIn.Attribute("Click"));
+        Check.True(method.Contains("previous?.Actions.SignOut != actions.SignOut", StringComparison.Ordinal));
+        Check.True(method.Contains("previous?.Actions.Cancel != actions.Cancel", StringComparison.Ordinal));
+        Check.True(method.Contains("previous?.CancelEnabled != state.CancelEnabled", StringComparison.Ordinal));
+        Check.True(method.Contains("previous?.ProgressText != state.ProgressText", StringComparison.Ordinal));
+        Check.True(method.Contains("previous?.StateText != state.StateText", StringComparison.Ordinal));
+        Check.True(method.Contains("RecordingWorkIqCancelButton.IsEnabled = state.CancelEnabled", StringComparison.Ordinal));
+        Check.True(method.Contains("RecordingAuthProgressText.Text = state.ProgressText;", StringComparison.Ordinal));
+    }
+
     private static void SaveReviewCountdown()
     {
         var now = new DateTimeOffset(2026, 9, 23, 17, 51, 0, TimeSpan.Zero);
@@ -385,9 +512,14 @@ internal static class UiStateChecks
         Check.True(source.Contains("_isPinned = _presenter.IsAlwaysOnTop;", StringComparison.Ordinal));
         Check.True(source.Contains("PinButton.IsChecked = _isPinned;", StringComparison.Ordinal));
         Check.True(source.Contains(
-            "&& !_isPinned\n            && !_pipeline.CanStop)\n            AppWindow.Hide();",
+            "&& !_isPinned\n            && !_pipeline.CanStop)\n        {\n" +
+            "            using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowHide))\n" +
+            "                AppWindow.Hide();",
             StringComparison.Ordinal));
-        Check.True(source.Contains("args.Cancel = true;\n        AppWindow.Hide();",
+        Check.True(source.Contains(
+            "args.Cancel = true;\n" +
+            "        using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowHide))\n" +
+            "            AppWindow.Hide();",
             StringComparison.Ordinal));
         Check.True(source.Contains("_presenter.IsResizable = true;", StringComparison.Ordinal));
         Check.True(source.Contains("_presenter.SetBorderAndTitleBar(true, false);", StringComparison.Ordinal));
@@ -460,10 +592,64 @@ internal static class UiStateChecks
             .Replace("\r\n", "\n", StringComparison.Ordinal);
         Check.True(source.Contains("new Style(typeof(MenuFlyoutPresenter))", StringComparison.Ordinal));
         Check.True(source.Contains(
-            "new Setter(FrameworkElement.MinWidthProperty, 280d)",
+            "new Setter(FrameworkElement.WidthProperty, 360d)",
+            StringComparison.Ordinal));
+        Check.True(source.Contains(
+            "new Setter(FrameworkElement.MinWidthProperty, 360d)",
+            StringComparison.Ordinal));
+        Check.True(source.Contains(
+            "new Setter(FrameworkElement.MaxHeightProperty, 480d)",
             StringComparison.Ordinal));
         Check.True(source.Contains("MenuFlyoutPresenterStyle = presenterStyle", StringComparison.Ordinal));
-        Check.True(source.Contains("ContextMenuMode = ContextMenuMode.SecondWindow", StringComparison.Ordinal));
+        Check.True(source.Contains("new TrayContextMenuHost(_contextMenu)", StringComparison.Ordinal));
+        Check.True(source.Contains("RightClickCommand = ", StringComparison.Ordinal));
+        Check.True(!source.Contains("ContextMenuMode = ContextMenuMode.SecondWindow", StringComparison.Ordinal));
+        Check.True(!source.Contains("ContextFlyout = _contextMenu", StringComparison.Ordinal));
+    }
+
+    private static void TrayMenuLayoutMath()
+    {
+        var rows = new[] { 32d, 32d, 32d, 16d };
+        var work = new WindowBounds(0, 0, 3000, 2000);
+        Check.Equal((364, 124), TrayMenuLayout.MenuSize(rows, 96, work));
+        Check.Equal((454, 154), TrayMenuLayout.MenuSize(rows, 120, work));
+        Check.Equal((544, 184), TrayMenuLayout.MenuSize(rows, 144, work));
+        Check.Equal((724, 244), TrayMenuLayout.MenuSize(rows, 192, work));
+        // An unknown DPI must fall back to 100% rather than collapsing the menu.
+        Check.Equal((364, 124), TrayMenuLayout.MenuSize(rows, 0, work));
+
+        // The same menu is bigger in pixels on a higher-DPI monitor, so one monitor's scale cannot be reused.
+        Check.True(TrayMenuLayout.MenuSize(rows, 192, work).Width > TrayMenuLayout.MenuSize(rows, 96, work).Width);
+
+        var tall = Enumerable.Repeat(32d, 20);
+        Check.Equal((364, 484), TrayMenuLayout.MenuSize(tall, 96, work));
+        Check.Equal((300, 200), TrayMenuLayout.MenuSize(rows, 192, new WindowBounds(0, 0, 300, 200)));
+
+        Check.Equal(32d, TrayMenuLayout.RowHeightDip(0, isSeparator: false));
+        Check.Equal(32d, TrayMenuLayout.RowHeightDip(-1, isSeparator: false));
+        Check.Equal(9d, TrayMenuLayout.RowHeightDip(double.NaN, isSeparator: true));
+        Check.Equal(5d, TrayMenuLayout.RowHeightDip(5, isSeparator: true));
+
+        var bottomTaskbar = new WindowBounds(0, 0, 2560, 1392);
+        Check.Equal(new WindowBounds(2016, 1208, 544, 184),
+            TrayMenuLayout.Place(2500, 1410, 544, 184, bottomTaskbar));
+        Check.Equal(new WindowBounds(1000, 1208, 544, 184),
+            TrayMenuLayout.Place(1000, 1410, 544, 184, bottomTaskbar));
+        Check.Equal(new WindowBounds(1556, 48, 364, 124),
+            TrayMenuLayout.Place(1900, 20, 364, 124, new WindowBounds(0, 48, 1920, 1032)));
+        Check.Equal(new WindowBounds(-364, 916, 364, 124),
+            TrayMenuLayout.Place(-30, 1050, 364, 124, new WindowBounds(-1920, 0, 1920, 1040)));
+
+        Check.True(TrayMenuLayout.SizeMatches(new WindowBounds(0, 0, 544, 184), 544, 184));
+        Check.True(!TrayMenuLayout.SizeMatches(new WindowBounds(0, 0, 544, 184), 364, 124));
+
+        var host = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "TrayContextMenuHost.cs.txt"));
+        Check.True(host.Contains("GetDpiForMonitor", StringComparison.Ordinal));
+        Check.True(host.Contains("MonitorFromPoint", StringComparison.Ordinal));
+        Check.True(!host.Contains("RasterizationScale", StringComparison.Ordinal));
+        Check.True(host.Contains("TrayMenuLayout.MenuSize(", StringComparison.Ordinal));
+        Check.True(host.IndexOf("ApplyBounds(bounds);", StringComparison.Ordinal) <
+            host.IndexOf("WindowUtilities.ShowWindow(_hwnd);", StringComparison.Ordinal));
     }
 
     private static void ContextFlyout()
@@ -563,7 +749,10 @@ internal static class UiStateChecks
             source.Contains(
                 "snapshot.Availability == ActiveRosterAvailability.VerifiedLive",
                 StringComparison.Ordinal));
-        Check.True(source.Contains("if (!ReferenceEquals(status, _relatedContext.Status) ||",
+        Check.True(!source.Contains("ReferenceEquals(status, _relatedContext.Status)",
+            StringComparison.Ordinal));
+        Check.True(source.Contains("foreach (var topic in topics)", StringComparison.Ordinal));
+        Check.True(source.Contains("MeetingNotesWorkIqSignInButton.IsEnabled = actions.SignIn;",
             StringComparison.Ordinal));
         Check.True(source.Contains("status.SourceRevision != _workIq.Revision",
             StringComparison.Ordinal));
@@ -650,7 +839,7 @@ internal static class UiStateChecks
         var panel = Control("CatchUpPanel");
         Check.Equal("RecordingPanel", (string?)panel.Parent!.Attribute(x + "Name"));
         Check.Equal("0", (string?)panel.Attribute("Grid.Row"));
-        Check.Equal("5", (string?)panel.Attribute("Grid.RowSpan"));
+        Check.True(panel.Attribute("Grid.RowSpan") is null);
         Check.Equal("Collapsed", (string?)panel.Attribute("Visibility"));
         Check.True(!Control("RecordingFooter").Ancestors().Contains(panel));
         Check.Equal("Polite", (string?)Control("CatchUpStatusText").Attribute("AutomationProperties.LiveSetting"));
@@ -775,7 +964,9 @@ internal static class UiStateChecks
         Check.True(authHandler.Contains(
             "var currentTopicId = ResolveLiveCanonicalTopicId(_currentVisualizationTopicId);",
             StringComparison.Ordinal));
-        Check.True(authHandler.Contains("TopicId: currentTopicId", StringComparison.Ordinal));
+        Check.True(authHandler.Contains("TopicId: topic.Id", StringComparison.Ordinal));
+        Check.True(authHandler.Contains("_visualization.Snapshot().TopicClusters", StringComparison.Ordinal));
+        Check.True(authHandler.Contains("foreach (var topic in topics)", StringComparison.Ordinal));
         Check.True(authHandler.Contains("RefreshRelatedContextAsync(", StringComparison.Ordinal));
     }
 
@@ -797,6 +988,36 @@ internal static class UiStateChecks
 
         var empty = RelatedContextPresentation.Topic(null, "Current");
         Check.Equal(string.Empty, empty.Label);
+
+        Check.Equal(
+            "Workplace suggestions are unavailable: not signed in to Work IQ.",
+            RelatedContextPresentation.MeetingFailureMessage(null, workIqAuthenticated: false));
+        static RelatedContextStatus Failure(string detail) => new(
+            RelatedContextState.Unavailable,
+            "session",
+            "Release readiness",
+            1,
+            1,
+            new RelatedContextSnapshot(
+                DateTimeOffset.UtcNow, [], RelatedContextAvailability.Unavailable, detail),
+            detail);
+        Check.Equal(
+            "Workplace suggestions are unavailable: Work IQ declined the related-sources request.",
+            RelatedContextPresentation.MeetingFailureMessage(
+                Failure("Work IQ declined the related-sources request."), workIqAuthenticated: true));
+        Check.Equal(
+            "Workplace suggestions are unavailable: Work IQ could not be reached.",
+            RelatedContextPresentation.MeetingFailureMessage(
+                Failure("Work IQ could not be reached."), workIqAuthenticated: true));
+        Check.Equal(
+            "Workplace suggestions are unavailable: Work IQ sent a reply this app could not read.",
+            RelatedContextPresentation.MeetingFailureMessage(
+                Failure("Work IQ sent a reply this app could not read."), workIqAuthenticated: true));
+        Check.Equal(string.Empty, RelatedContextPresentation.MeetingFailureMessage(
+            new(RelatedContextState.NoEvidence, "session", "Release readiness", 1, 1,
+                new RelatedContextSnapshot(
+                    DateTimeOffset.UtcNow, [], RelatedContextAvailability.NoEvidence), null),
+            workIqAuthenticated: true));
 
         var waiting = RelatedContextPresentation.Status(
             null, null, topicEligible: false, workIqAuthenticated: false, itemCount: 0);
@@ -918,6 +1139,7 @@ internal static class UiStateChecks
         var projection = TopicMapState.Project(document, "topic-0001", "topic-0002");
         Check.Equal("topic-0001", projection.SelectedTopicId);
         Check.Equal("topic-0002", projection.CurrentTopicId);
+        Check.Equal("topic-0002", TopicMapState.CurrentTopicSelection(projection));
         Check.Equal(2, projection.Trail.Count);
         Check.Equal("Avery release readiness", projection.Trail[0].Label);
         Check.True(projection.Trail[0].IsSelected && !projection.Trail[0].IsCurrent);
@@ -925,7 +1147,7 @@ internal static class UiStateChecks
         Check.Equal("topic-0001", projection.TopicBrief!.TopicId);
         Check.Equal("Avery release readiness", projection.TopicBrief.Label);
         Check.Equal("Earlier topic you selected", projection.TopicBrief.Status);
-        Check.True(projection.TopicBrief.DiscussedAt.Contains("segment 1", StringComparison.Ordinal));
+        Check.Equal("Discussed around 18:00:10.", projection.TopicBrief.DiscussedAt);
         Check.True(projection.Trail[0].HasNext && !projection.Trail[1].HasNext);
         Check.True(projection.Trail[1].AccessibleName.Contains("Current topic", StringComparison.Ordinal));
         Check.True(projection.Trail[0].AccessibleName.Contains("Selected", StringComparison.Ordinal));
@@ -966,6 +1188,62 @@ internal static class UiStateChecks
             item.Id is "action-ungrounded" or "decision-ungrounded"));
         Check.Equal(projection.BrainMap.Branches.Count,
             projection.BrainMap.Branches.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count());
+        Check.Equal("Review", projection.MeetingBrainMap!.MeetingTitle);
+        Check.Equal(2, projection.MeetingBrainMap.Topics.Count);
+        Check.Equal("topic-0001", projection.MeetingBrainMap.Topics[0].Id);
+        Check.Equal(4, projection.MeetingBrainMap.Topics[0].Leaves.Count);
+        Check.True(projection.MeetingBrainMap.Topics[0].Leaves.Any(item => item.Kind == "Key point"));
+        Check.True(projection.MeetingBrainMap.Topics[0].Leaves.Any(item => item.Kind == "Decision"));
+        Check.True(projection.MeetingBrainMap.Topics[0].Leaves.Any(item => item.Kind == "Open question"));
+        Check.True(projection.MeetingBrainMap.Topics[0].Leaves.Any(item => item.Kind == "Action"));
+        Check.True(!projection.MeetingBrainMap.Topics.SelectMany(item => item.Leaves).Any(item =>
+            item.Title.Contains("Review notes", StringComparison.Ordinal)));
+        Check.Equal(2, projection.MeetingNotes!.Topics.Count);
+        Check.Equal("Avery release readiness", projection.MeetingNotes.Topics[0].Heading);
+        Check.True(projection.MeetingNotes.Topics[0].IsSelected);
+        Check.True(projection.MeetingNotes.Topics[1].IsCurrent);
+        Check.Equal("Review notes", projection.MeetingNotes.Topics[0].Suggestions.Single().Title);
+        Check.Equal("Document", projection.MeetingNotes.Topics[0].Suggestions.Single().SourceType);
+        Check.True(projection.MeetingNotes.Topics[0].Suggestions.Single().CanOpen);
+        Check.True(projection.MeetingNotes.Topics[0].Bullets.Contains(
+            "Avery: Release readiness supports customer follow-up.", StringComparer.Ordinal));
+        Check.True(projection.MeetingNotes.Topics[1].HasNoBullets);
+        Check.True(TopicMapState.LeafNodeBackground.RelativeLuminance >
+            TopicMapState.TopicNodeBackground.RelativeLuminance);
+        Check.True(TopicMapState.NodeTextColor.ContrastRatio(TopicMapState.TopicNodeBackground) >= 4.5);
+        Check.True(TopicMapState.NodeTextColor.ContrastRatio(TopicMapState.LeafNodeBackground) >= 4.5);
+        var ordinalDocument = document with
+        {
+            TopicClusters = document.TopicClusters.Select(topic => topic with
+            {
+                Label = $"{topic.Label} segment 34",
+                Aliases = [$"{topic.Label} segment 34"],
+            }).ToArray(),
+            Evidence = document.Evidence.Select(item => item.Id == "evidence-link"
+                ? item with
+                {
+                    PresentationLabel = "Grounded in segment 34",
+                    Summary = "Discussed around segments 34–37",
+                }
+                : item).ToArray(),
+        };
+        var ordinalProjection = TopicMapState.Project(ordinalDocument, "topic-0001", "topic-0002");
+        var visibleOrdinalText = string.Join(
+            " ",
+            ordinalProjection.MeetingBrainMap!.MeetingTitle,
+            ordinalProjection.MeetingBrainMap.Detail,
+            string.Join(" ", ordinalProjection.MeetingBrainMap.Topics.SelectMany(topic =>
+                new[] { topic.Title, topic.Detail }.Concat(topic.Leaves.SelectMany(leaf =>
+                    new[] { leaf.Title, leaf.Detail, leaf.AccessibleName })))),
+            string.Join(" ", ordinalProjection.MeetingNotes!.Topics.SelectMany(topic =>
+                new[] { topic.Heading }.Concat(topic.Bullets))),
+            string.Join(" ", ordinalProjection.TopicBrief!.Facts.SelectMany(fact =>
+                new[] { fact.Title, fact.EvidenceText, fact.Metadata })),
+            ordinalProjection.TopicBrief.DiscussedAt,
+            string.Join(" ", ordinalProjection.TopicBrief.Relationships.Select(item => item.Detail)));
+        Check.True(!System.Text.RegularExpressions.Regex.IsMatch(
+            visibleOrdinalText, @"\bsegments?\s+\d+(?:\s*[–-]\s*\d+)?\b",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase));
 
         var loadingContext = TopicMapState.Project(
             document,
@@ -1066,11 +1344,11 @@ internal static class UiStateChecks
         Check.Equal("Customer follow-up link", projection.TopicBrief.Facts.Single().Title);
         Check.Equal("Release readiness supports customer follow-up.",
             projection.TopicBrief.Facts.Single().EvidenceText);
-        Check.True(projection.TopicBrief.Facts.Single().Metadata.StartsWith(
-            "Segment 1 · ", StringComparison.Ordinal));
+        Check.Equal("18:00:10", projection.TopicBrief.Facts.Single().Metadata);
         Check.Equal(4, projection.TopicBrief.Relationships.Count);
         Check.True(projection.TopicBrief.Relationships.All(item =>
-            item.Detail.Contains("segment 1", StringComparison.Ordinal)));
+            item.Detail.Contains("18:00:10", StringComparison.Ordinal) &&
+            !item.Detail.Contains("segment", StringComparison.OrdinalIgnoreCase)));
         Check.True(projection.TopicBrief.Questions.Single() is { Id: "question-1", Answered: false });
 
         var repeatedCurrentDocument = document with
@@ -1325,21 +1603,6 @@ internal static class UiStateChecks
         Check.True(noBranches.BrainMap.EmptyMessage.StartsWith(
             "No connected topics yet", StringComparison.Ordinal));
 
-        var compactMap = BrainMapLayout.Calculate(420, 5);
-        Check.Equal(5, compactMap.Branches.Count);
-        Check.True(compactMap.Branches.Select(item => item.X).Distinct().Count() == 1);
-        Check.True(compactMap.Branches.All(item => item.Y > compactMap.Root.Y + compactMap.Root.Height));
-        var mediumMap = BrainMapLayout.Calculate(700, 5);
-        Check.Equal(2, mediumMap.Branches.Select(item => item.X).Distinct().Count());
-        Check.True(mediumMap.Branches.All(item => item.Width >= 300));
-        Check.True(mediumMap.Branches.All(item => item.Y > mediumMap.Root.Y + mediumMap.Root.Height));
-        var wideMap = BrainMapLayout.Calculate(1200, 5);
-        Check.Equal(3, wideMap.Branches.Select(item => item.X).Distinct().Count());
-        Check.True(wideMap.Branches.All(item => item.Width >= 300));
-        Check.True(wideMap.Branches.All(item => item.Y > wideMap.Root.Y + wideMap.Root.Height));
-        Check.True(wideMap.Branches.Min(item => item.X) > 0);
-        Check.True(wideMap.Branches.Max(item => item.X + item.Width) < wideMap.Width);
-
         var changedDecision = TopicMapState.Project(document with
         {
             Decisions = [new("decision-1", "topic-0001", "Ship it", [])],
@@ -1371,12 +1634,16 @@ internal static class UiStateChecks
         Check.True(!xamlNames.Contains("VisualizationViewSelector"));
         Check.True(!xamlDocument.Descendants().Any(element =>
             element.Name.LocalName == "SelectorBarItem"));
+        Check.True(!xamlNames.Contains("BrainMapTabButton"));
+        Check.True(!xamlNames.Contains("MeetingNotesTabButton"));
+        Check.True(xamlNames.Contains("MeetingNotesView"));
+        Check.True(xamlNames.Contains("MeetingNotesList"));
         Check.True(xamlNames.Contains("BrainMapCanvas"));
         Check.True(xamlNames.Contains("BrainMapEmptyText"));
         Check.True(xamlNames.Contains("BrainMapNowText"));
-        Check.Equal("Grounded spatial brain map",
+        Check.Equal("Whole-meeting topic map",
             (string?)Control("BrainMapView").Attribute("AutomationProperties.Name"));
-        Check.Equal("Grounded topic branches",
+        Check.Equal("Whole-meeting topic branches and grounded details",
             (string?)Control("BrainMapCanvas").Attribute("AutomationProperties.Name"));
         Check.True(Control("BrainMapCanvas").Ancestors().Contains(Control("TopicMapCombinedView")));
 
@@ -1391,12 +1658,16 @@ internal static class UiStateChecks
             .Single(element => element.Name.LocalName == "Grid.RowDefinitions").Elements().ToArray();
         var combinedColumns = Control("TopicMapCombinedView").Elements()
             .Single(element => element.Name.LocalName == "Grid.ColumnDefinitions").Elements().ToArray();
-        Check.Equal("106", (string?)combinedRows[0].Attribute("Height"));
-        Check.Equal("*", (string?)combinedRows[1].Attribute("Height"));
-        Check.Equal("Auto", (string?)combinedRows[2].Attribute("Height"));
+        Check.Equal(1, combinedRows.Length);
+        Check.Equal("*", (string?)combinedRows[0].Attribute("Height"));
         Check.Equal("*", (string?)combinedColumns[0].Attribute("Width"));
         Check.Equal("0", (string?)combinedColumns[1].Attribute("Width"));
-        Check.Equal("1", (string?)Control("BrainMapView").Attribute("Grid.Row"));
+        Check.Equal("0", (string?)Control("BrainMapView").Attribute("Grid.Row"));
+        Check.Equal("1", (string?)Control("MeetingNotesView").Attribute("Grid.Column"));
+        Check.Equal("2*", (string?)Control("MeetingNotesView").Ancestors()
+            .First(element => element.Name.LocalName == "Grid")
+            .Elements().Single(element => element.Name.LocalName == "Grid.ColumnDefinitions")
+            .Elements().Last().Attribute("Width"));
         var timelinePanel = Control("TrailList").Descendants()
             .Single(element =>
                 element.Name.LocalName == "StackPanel" &&
@@ -1431,9 +1702,21 @@ internal static class UiStateChecks
             (string?)element.Attribute("Visibility") ==
             "{Binding IsSelected, Converter={StaticResource BoolToVisibleConverter}}"));
         var guide = (string?)Control("TopicTimelineGuideText").Attribute("Text");
-        foreach (var phrase in new[]
-                 { "chronological strip", "Returned", "center", "Now", "Go to current topic" })
-            Check.True(guide?.Contains(phrase, StringComparison.OrdinalIgnoreCase) == true);
+        Check.True(!guide?.Contains("chronological strip", StringComparison.OrdinalIgnoreCase) == true);
+        Check.Equal("Collapsed", (string?)Control("TopicTimelineGuideText").Attribute("Visibility"));
+        Check.Equal("Collapsed", (string?)timeline.Attribute("Visibility"));
+        Check.Equal("Collapsed", (string?)Control("TopicDetailPanel").Attribute("Visibility"));
+        Check.True(xamlNames.Contains("MeetingNotesWorkIqStatusText"));
+        Check.Equal("Meeting notes by topic",
+            (string?)Control("MeetingNotesView").Attribute("AutomationProperties.Name"));
+        Check.True(Control("MeetingNotesList").Descendants().Any(element =>
+            (string?)element.Attribute("Text") ==
+            "Suggestions from Work IQ — not from this meeting"));
+        Check.True(!Control("MeetingNotesList").Descendants().Any(element =>
+            (string?)element.Attribute("Text") == "{Binding Sequence}"));
+        Check.True(!Control("MeetingNotesList").Descendants().Any(element =>
+            ((string?)element.Attribute("Text"))?.Contains(
+                "Related workplace context could not be loaded", StringComparison.OrdinalIgnoreCase) == true));
         Check.True(!xamlNames.Contains("TrailEmptyText"));
         Check.Equal("Show meeting visualization", (string?)Control("TopicMapToggleButton")
             .Attribute("ToolTipService.ToolTip"));
@@ -1548,19 +1831,19 @@ internal static class UiStateChecks
         Check.True(!clickHandler.Contains("_currentVisualizationTopicId =", StringComparison.Ordinal));
         Check.True(!clickHandler.Contains("TopicMapState.LayoutBandedMap", StringComparison.Ordinal));
         var currentHandlerStart = currentStart;
-        var revealStart = source.IndexOf("private void RevealTimelineTopic(", currentStart);
+        var revealStart = source.IndexOf("private void RevealMapTopic(", currentStart);
         Check.True(revealStart > currentHandlerStart);
         var currentHandler = source[currentHandlerStart..revealStart];
         Check.True(currentHandler.Contains("_selectedVisualizationTopicId = currentTopicId;",
             StringComparison.Ordinal));
-        Check.True(currentHandler.Contains("RevealTimelineTopic(currentTopicId);", StringComparison.Ordinal));
+        Check.True(currentHandler.Contains("RevealMapTopic(currentTopicId);", StringComparison.Ordinal));
         Check.True(!currentHandler.Contains("Focus(FocusState.Programmatic)", StringComparison.Ordinal));
-        Check.Equal(2, source.Split("RevealTimelineTopic(", StringSplitOptions.None).Length - 1);
-        var revealEnd = source.IndexOf("private async void OnOpenVisualizationClick(", revealStart,
+        Check.Equal(2, source.Split("RevealMapTopic(", StringSplitOptions.None).Length - 1);
+        var revealEnd = source.IndexOf("private void ScrollNotesToTopic(", revealStart,
             StringComparison.Ordinal);
         Check.True(revealEnd > revealStart);
         var revealHandler = source[revealStart..revealEnd];
-        Check.True(revealHandler.Contains("container.StartBringIntoView();", StringComparison.Ordinal));
+        Check.True(revealHandler.Contains("button.StartBringIntoView();", StringComparison.Ordinal));
         Check.True(!revealHandler.Contains("ScrollTo", StringComparison.Ordinal));
         Check.True(!source.Contains("OnTopicBriefBackToTimelineClick", StringComparison.Ordinal));
         Check.True(!source.Contains("VisualizationSelectedViewIndex", StringComparison.Ordinal));
@@ -1569,7 +1852,7 @@ internal static class UiStateChecks
         var clearStart = source.IndexOf("private void ClearVisualizationPresentation(", refreshStart, StringComparison.Ordinal);
         Check.True(refreshStart >= 0 && clearStart > refreshStart);
         var refreshPath = source[refreshStart..clearStart];
-        Check.True(refreshPath.Contains("VisualizationCollectionState.Reconcile(", StringComparison.Ordinal));
+        Check.True(refreshPath.Contains("RenderVisualizationSurface(projection);", StringComparison.Ordinal));
         Check.True(refreshPath.Contains(
             "var persistSelection = TopicMapPanel.Visibility == Visibility.Visible ||",
             StringComparison.Ordinal));
@@ -1593,18 +1876,20 @@ internal static class UiStateChecks
         Check.True(!source.Contains("FocusTimelineTopic(", StringComparison.Ordinal));
         Check.True(!source.Contains("_selectedVisualizationTopicId ??= accepted.Id;",
             StringComparison.Ordinal));
+        Check.True(source.Contains("MeetingNotesView.Visibility = Visibility.Visible",
+            StringComparison.Ordinal));
         Check.True(source.Contains("TopicMapCombinedView.Visibility = Visibility.Visible",
             StringComparison.Ordinal));
         Check.True(source.Contains(
             "status.State is PipelineState.Saved or PipelineState.Failed &&",
             StringComparison.Ordinal));
         Check.True(source.Contains(
-            "_workIq.IsAuthenticated, _loadedVisualization is not null)",
+            "_workIq.IsAuthenticated, _loadedVisualization is not null,\n            buildMeetingNotes: false)",
             StringComparison.Ordinal));
         Check.True(source.Contains(
             "var currentTopicId = ResolveLiveCanonicalTopicId(_currentVisualizationTopicId);",
             StringComparison.Ordinal));
-        Check.True(source.Contains("TopicId: currentTopicId)", StringComparison.Ordinal));
+        Check.True(source.Contains("TopicId: topic.Id)", StringComparison.Ordinal));
         Check.True(source.Contains(
             "if (_sessionId is null || _contextCts is null || _loadedVisualization is not null)",
             StringComparison.Ordinal));
@@ -1613,24 +1898,49 @@ internal static class UiStateChecks
             StringComparison.Ordinal));
         Check.True(source.Contains("? \"Saved meeting\"", StringComparison.Ordinal));
         Check.True(source.Contains("? \"Retained meeting\"", StringComparison.Ordinal));
-        Check.True(source.Contains("TimelineEmptyText.Visibility = _visualizationTrail.Count == 0",
+        Check.True(source.Contains("TimelineEmptyText.Visibility = Visibility.Collapsed",
             StringComparison.Ordinal));
-        Check.True(source.Contains("TopicTimelineView.Visibility = _visualizationTrail.Count > 0",
-            StringComparison.Ordinal));
-        Check.True(source.Contains("GoToCurrentTopicButton.Visibility = canGoToCurrentTopic",
+        Check.True(source.Contains("TopicTimelineView.Visibility = Visibility.Collapsed",
             StringComparison.Ordinal));
         Check.True(source.Contains(
-            "GoToCurrentTopicButton.Visibility = canGoToCurrentTopic\n            ? Visibility.Visible\n            : Visibility.Collapsed;",
+            "GoToCurrentTopicButton.Visibility = GoToCurrentTopicButton.IsEnabled",
             StringComparison.Ordinal));
         Check.True(source.Contains("private void RenderBrainMap(", StringComparison.Ordinal));
-        Check.True(source.Contains("BrainMapLayout.Calculate(", StringComparison.Ordinal));
-        Check.True(source.Contains("_brainMapConnectors.TryGetValue(branch.Id, out var connector)",
+        Check.True(source.Contains("MeetingBrainMapLayout.Calculate(", StringComparison.Ordinal));
+        var notesProjectionStart = source.IndexOf(
+            "private async Task PopulateMeetingNotesAsync(", StringComparison.Ordinal);
+        var notesProjectionEnd = source.IndexOf(
+            "private void ClearVisualizationPresentation",
+            notesProjectionStart,
+            StringComparison.Ordinal);
+        Check.True(notesProjectionStart >= 0 && notesProjectionEnd > notesProjectionStart);
+        var notesProjection = source[notesProjectionStart..notesProjectionEnd];
+        Check.True(notesProjection.Contains(
+            "Task.Run(() => MeetingTopicNotesBuilder.Build(document))",
+            StringComparison.Ordinal));
+        Check.True(notesProjection.Contains("ConfigureAwait(false)", StringComparison.Ordinal));
+        Check.True(notesProjection.Contains("_dispatcherQueue.TryEnqueue(", StringComparison.Ordinal));
+        Check.True(!notesProjection.Contains(".Wait(", StringComparison.Ordinal));
+        Check.True(!notesProjection.Contains("GetAwaiter().GetResult()", StringComparison.Ordinal));
+        Check.True(notesProjection.Contains(
+            "Meeting notes could not be prepared.",
+            StringComparison.Ordinal));
+        var notesRefreshStart = source.IndexOf("private void RefreshVisualization(", StringComparison.Ordinal);
+        Check.True(notesRefreshStart >= 0 && notesProjectionStart > notesRefreshStart);
+        var notesRefreshPath = source[notesRefreshStart..notesProjectionStart];
+        Check.True(notesRefreshPath.Contains("_meetingNotesSessionId, document.SessionId",
+            StringComparison.Ordinal));
+        Check.True(!notesRefreshPath.Contains(
+            "VisualizationCollectionState.Reconcile(\n            _meetingNotes,",
+            StringComparison.Ordinal));
+        Check.True(source.Contains("UpdateBrainMapConnector(", StringComparison.Ordinal));
+        Check.True(source.Contains("_brainMapConnectors.TryGetValue(connectorId, out var connector)",
             StringComparison.Ordinal));
         Check.True(source.Contains(
-            "figure.Segments.Add(new BezierSegment",
+            "figure.Segments.Add(new LineSegment",
             StringComparison.Ordinal));
         Check.True(source.Contains(
-            "Point3 = new(branchCenterX, branchY)",
+            "Point = new(endX, endY)",
             StringComparison.Ordinal));
         Check.True(source.Contains("_brainMapNodes.TryGetValue(key, out var button)",
             StringComparison.Ordinal));
@@ -1656,6 +1966,179 @@ internal static class UiStateChecks
             StringComparison.Ordinal));
         Check.True(source.Contains("_visualizationStorage.LoadAsync(file.Path", StringComparison.Ordinal));
         Check.True(source.Contains("_visualization.ResolveCanonicalTopicId(topicId)", StringComparison.Ordinal));
+    }
+
+    private static void WholeMeetingBrainMapLayout()
+    {
+        static bool CrossesRectangleInterior(
+            BrainMapPoint start,
+            BrainMapPoint end,
+            BrainMapRect rect)
+        {
+            if (Math.Abs(start.X - end.X) < 0.001)
+            {
+                var top = Math.Min(start.Y, end.Y);
+                var bottom = Math.Max(start.Y, end.Y);
+                return start.X > rect.X && start.X < rect.X + rect.Width &&
+                    top < rect.Y + rect.Height && bottom > rect.Y;
+            }
+
+            if (Math.Abs(start.Y - end.Y) < 0.001)
+            {
+                var left = Math.Min(start.X, end.X);
+                var right = Math.Max(start.X, end.X);
+                return start.Y > rect.Y && start.Y < rect.Y + rect.Height &&
+                    left < rect.X + rect.Width && right > rect.X;
+            }
+
+            return true;
+        }
+
+        static void AssertConnectorsAvoidNodes(MeetingBrainMapLayout layout)
+        {
+            var nodes = new[] { layout.Root }
+                .Concat(layout.Topics.Select(item => item.Topic))
+                .Concat(layout.Topics.SelectMany(item => item.Leaves))
+                .ToArray();
+            foreach (var connector in layout.Connectors)
+                Check.True(nodes.All(node =>
+                    !CrossesRectangleInterior(connector.Start, connector.End, node)));
+        }
+
+        var eightLeaves = Enumerable.Repeat(3, 8).ToArray();
+        var compact = MeetingBrainMapLayout.Calculate(420, eightLeaves);
+        Check.Equal(8, compact.Topics.Count);
+        Check.True(compact.Topics.Select(item => item.Topic.X).Distinct().Count() == 1);
+        Check.True(compact.Topics.All(item =>
+            item.Topic.Y > compact.Root.Y + compact.Root.Height &&
+            item.Leaves.Count == 3 &&
+            item.Leaves.All(leaf => leaf.Y > item.Topic.Y + item.Topic.Height)));
+        Check.True(compact.Height > compact.Topics[^1].Leaves[^1].Y);
+        AssertConnectorsAvoidNodes(compact);
+
+        var fifteenLeaves = Enumerable.Range(0, 15).Select(index => index % 4).ToArray();
+        var wide = MeetingBrainMapLayout.Calculate(1200, fifteenLeaves);
+        Check.Equal(15, wide.Topics.Count);
+        Check.Equal(3, wide.Topics.Select(item => item.Topic.X).Distinct().Count());
+        Check.True(wide.Topics.All(item =>
+            item.Topic.Y > wide.Root.Y + wide.Root.Height &&
+            item.Leaves.All(leaf =>
+                leaf.Y > item.Topic.Y + item.Topic.Height &&
+                leaf.X >= item.Topic.X &&
+                leaf.X + leaf.Width <= item.Topic.X + item.Topic.Width)));
+        Check.True(wide.Topics.Max(item => item.Topic.X + item.Topic.Width) < wide.Width);
+        Check.True(wide.Topics.SelectMany(item => item.Leaves)
+            .All(item => item.X > 0 && item.X + item.Width < wide.Width));
+        AssertConnectorsAvoidNodes(wide);
+        Check.Throws<ArgumentOutOfRangeException>(() =>
+            MeetingBrainMapLayout.Calculate(420, [1, -1]));
+
+        var mid = MeetingBrainMapLayout.Calculate(700, Enumerable.Repeat(2, 6).ToArray());
+        Check.Equal(2, mid.Topics.Select(item => item.Topic.X).Distinct().Count());
+        var huge = MeetingBrainMapLayout.Calculate(1500, Enumerable.Repeat(2, 8).ToArray());
+        Check.Equal(4, huge.Topics.Select(item => item.Topic.X).Distinct().Count());
+    }
+
+    private static void TopicCollapseFreesSpaceAndPersists()
+    {
+        var map = new MeetingBrainMapViewModel(
+            "Meeting", "detail", "t1",
+            [
+                new("t1", "One", "d", [new("l1", "t1", "Key point", "A", "d"), new("l2", "t1", "Key point", "B", "d")]),
+                new("t2", "Two", "d", [new("l3", "t2", "Key point", "C", "d")]),
+            ],
+            string.Empty);
+        var collapsed = new HashSet<string>(StringComparer.Ordinal);
+        var open = MeetingBrainMapLayout.Calculate(420, TopicCollapseState.LeafCounts(map, collapsed));
+        Check.True(TopicCollapseState.Toggle(collapsed, "t1"));
+        var counts = TopicCollapseState.LeafCounts(map, collapsed);
+        Check.Equal(0, counts[0]);
+        Check.Equal(1, counts[1]);
+        var closed = MeetingBrainMapLayout.Calculate(420, counts);
+        Check.True(closed.Height < open.Height);
+        Check.Equal(0, closed.Topics[0].Leaves.Count);
+        Check.True(closed.Topics[1].Topic.Y < open.Topics[1].Topic.Y);
+
+        var notes = new[]
+        {
+            new MeetingTopicNotesViewModel("t1", "One", ["a"], [], true, false),
+            new MeetingTopicNotesViewModel("t2", "Two", ["b"], [], false, false),
+        };
+        var applied = TopicCollapseState.Apply(notes, collapsed);
+        Check.True(applied[0].IsCollapsed && !applied[0].IsExpanded && applied[0].IsCurrent);
+        Check.True(!applied[1].IsCollapsed);
+        Check.Equal("Expand topic: One", applied[0].ToggleName);
+        Check.Equal("Collapse topic: Two", applied[1].ToggleName);
+        // A live update rebuilds the notes from scratch; the stored choice is reapplied.
+        var rebuilt = TopicCollapseState.Apply(
+            TopicMapState.BuildMeetingNotesViewModel(
+                [new MeetingTopicNotes("t1", "One", ["a", "c"]), new MeetingTopicNotes("t2", "Two", ["b"])])
+                .Topics,
+            collapsed);
+        Check.True(rebuilt[0].IsCollapsed && !rebuilt[1].IsCollapsed);
+        Check.True(!TopicCollapseState.Toggle(collapsed, "t1"));
+        Check.True(!TopicCollapseState.Apply(notes, collapsed)[0].IsCollapsed);
+
+        var xaml = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        var source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        Check.True(xaml.Contains("OnNotesTopicToggleClick", StringComparison.Ordinal));
+        Check.True(xaml.Contains("{Binding IsExpanded, Converter", StringComparison.Ordinal));
+        Check.True(!xaml.Contains("<ColumnDefinition Width=\"340\"/>", StringComparison.Ordinal));
+        Check.True(xaml.Contains("TopicNotesColumn", StringComparison.Ordinal));
+        Check.True(xaml.Contains("BodyStrongTextBlockStyle", StringComparison.Ordinal));
+        Check.True(source.Contains("TopicCollapseState.LeafCounts(map, _collapsedTopicIds)", StringComparison.Ordinal));
+        Check.True(source.Contains("TopicCollapseState.Apply(notes.Topics, _collapsedTopicIds)", StringComparison.Ordinal));
+        Check.True(source.Contains("OnTopicMapBodySizeChanged", StringComparison.Ordinal));
+    }
+
+    private static void UnassignedMeetingItemsUseCitations()
+    {
+        var startedAt = DateTimeOffset.Parse("2026-10-14T10:00:00-07:00");
+        var document = new MeetingVisualizationDocument(
+            1,
+            "unassigned-topic-items",
+            "Rollout review",
+            startedAt,
+            startedAt.AddMinutes(1),
+            1,
+            true,
+            [
+                new("seg-000001", 1, "Rollout remains pending confirmation.",
+                    startedAt, "Guest-1", 0.99),
+            ],
+            [new("Guest-1", "Avery", true)],
+            [new("topic-0001", "Regional rollout", [], 1, 1)],
+            [new("occ-000001", "topic-0001", 1, 1, "Regional rollout")],
+            [
+                new("question-unassigned", null, "Is the rollout confirmed?",
+                    QuestionState.Open, ["evidence-unassigned"]),
+            ],
+            [
+                new("evidence-unassigned", EvidenceOrigin.Analysis,
+                    VisualizationProvenance.TranscriptFact, 1, "topic-0001",
+                    null, null, null, null, "Rollout remains pending confirmation.",
+                    "Rollout status"),
+            ],
+            [])
+        {
+            Actions =
+            [
+                new("action-unassigned", null, "Confirm regional readiness",
+                    ["evidence-unassigned"]),
+            ],
+            Decisions =
+            [
+                new("decision-unassigned", null, "Wait for regional confirmation",
+                    ["evidence-unassigned"]),
+            ],
+        };
+
+        var projection = TopicMapState.Project(
+            document, "topic-0001", buildMeetingNotes: false);
+        var topic = projection.MeetingBrainMap!.Topics.Single();
+        Check.True(topic.Leaves.Any(item => item.Id == "decision-unassigned"));
+        Check.True(topic.Leaves.Any(item => item.Id == "question-unassigned"));
+        Check.True(topic.Leaves.Any(item => item.Id == "action-unassigned"));
     }
 
     private static void BrainMapCanvasOwnership()
@@ -2324,12 +2807,21 @@ internal static class UiStateChecks
             StringComparison.Ordinal));
         Check.True(!launchSource.Contains("StartDetectorAsync(", StringComparison.Ordinal));
         Check.True(appSource.Contains(
-            "LeftClickCommand = new TrayApp.RelayCommand(() => ShowMainWindow(fromTray: true))",
+            "var openMainWindowCommand = new TrayApp.RelayCommand(() => ShowMainWindow(fromTray: true));",
+            StringComparison.Ordinal));
+        Check.True(appSource.Contains(
+            "LeftClickCommand = openMainWindowCommand,",
+            StringComparison.Ordinal));
+        Check.True(appSource.Contains(
+            "DoubleClickCommand = openMainWindowCommand,",
             StringComparison.Ordinal));
         Check.True(appSource.Contains(
             "MenuFlyoutPresenterStyle = presenterStyle",
             StringComparison.Ordinal));
         Check.True(appSource.Contains(
+            "new TrayContextMenuHost(_contextMenu)",
+            StringComparison.Ordinal));
+        Check.True(!appSource.Contains(
             "ContextMenuMode = ContextMenuMode.SecondWindow,",
             StringComparison.Ordinal));
         Check.True(!appSource.Contains(
@@ -2364,6 +2856,21 @@ internal static class UiStateChecks
             StringComparison.Ordinal);
         Check.True(layoutIndex >= 0 && readyIndex > layoutIndex);
         Check.True(loadedSource.Contains("if (!_initialViewReadyRaised)", StringComparison.Ordinal));
+        var restoreIndex = loadedSource.IndexOf(
+            "TryEnqueue(DispatcherQueuePriority.Low, () => _ = RestoreWorkIqAsync())",
+            StringComparison.Ordinal);
+        Check.True(restoreIndex > readyIndex);
+        var constructorStart = mainSource.IndexOf("public MainWindow(", StringComparison.Ordinal);
+        var constructorEnd = mainSource.IndexOf("private void OnTitleBarSizeChanged", constructorStart,
+            StringComparison.Ordinal);
+        Check.True(!mainSource[constructorStart..constructorEnd].Contains("RestoreWorkIqAsync",
+            StringComparison.Ordinal));
+        var restoreStart = mainSource.IndexOf("private async Task RestoreWorkIqAsync", StringComparison.Ordinal);
+        var restoreEnd = mainSource.IndexOf("private async void OnWorkIqSignInClick", restoreStart,
+            StringComparison.Ordinal);
+        Check.True(mainSource[restoreStart..restoreEnd].Contains(
+            "if (_allowClose || _preparingExit || _workIqCts is not null ||\n            _workIq.IsSignInBusy || _workIq.IsAuthenticated) return;",
+            StringComparison.Ordinal));
         var trayStart = mainSource.IndexOf("public void ShowFromTray()", StringComparison.Ordinal);
         var trayEnd = mainSource.IndexOf("private async Task ReleaseSuppressAsync", trayStart,
             StringComparison.Ordinal);
@@ -2382,11 +2889,46 @@ internal static class UiStateChecks
             StringComparison.Ordinal);
         Check.True(showIndex >= 0 && activateIndex > showIndex && foregroundIndex > activateIndex);
         Check.True(mainSource.Contains(
-            "if (PreferencesPanel.Visibility == Visibility.Visible)\n            {\n                UpdateDiagnostics();",
+            "if (PreferencesPanel.Visibility == Visibility.Visible)\n                UpdateDiagnostics();\n            UpdateWorkIqControls();",
             StringComparison.Ordinal));
         Check.True(mainSource.Contains(
-            "else if (_workIqCts is not null)\n                UpdateWorkIqControls();",
+            "var restore = Task.Run(() => _workIq.RestoreAsync(token), token);",
             StringComparison.Ordinal));
+        Check.True(mainSource.Contains(
+            "try { await restore.WaitAsync(token); }",
+            StringComparison.Ordinal));
+        Check.True(mainSource.Contains(
+            "TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously",
+            StringComparison.Ordinal));
+        Check.True(new WorkIqConnectionStatus().Controls(false, true, false, false, false).StateText.Contains(
+            "Waiting for authentication cleanup; recording is available.", StringComparison.Ordinal));
+    }
+
+    private static void PartialSpeechExit()
+    {
+        var appSource = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "App.xaml.cs.txt"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+        var windowSource = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"))
+            .Replace("\r\n", "\n", StringComparison.Ordinal);
+        var forceClose = appSource.IndexOf("if (ExitReadiness.ShouldCloseAfterSavedPartial(", StringComparison.Ordinal);
+        var forceCloseEnd = appSource.IndexOf("if (confirmed)", forceClose, StringComparison.Ordinal);
+        Check.True(forceClose >= 0 && forceCloseEnd > forceClose);
+        var forceCloseSource = appSource[forceClose..forceCloseEnd];
+        Check.True(forceCloseSource.Contains("_pipeline.CanForceCloseAfterSavedPartial", StringComparison.Ordinal));
+        Check.True(forceCloseSource.Contains("InvokeOnUi(CloseApplication);", StringComparison.Ordinal));
+        Check.True(forceCloseSource.Contains("return;", StringComparison.Ordinal));
+        Check.True(!forceCloseSource.Contains("DisposeAsync", StringComparison.Ordinal));
+        Check.True(!forceCloseSource.Contains("ShutdownCleanup", StringComparison.Ordinal));
+        var closeStart = appSource.IndexOf("private void CloseApplication()", StringComparison.Ordinal);
+        var closeEnd = appSource.IndexOf("private void UpdateStatus", closeStart, StringComparison.Ordinal);
+        Check.True(closeStart >= 0 && closeEnd > closeStart);
+        var closeSource = appSource[closeStart..closeEnd];
+        Check.True(closeSource.Contains("_mainWindow?.CloseForReal();", StringComparison.Ordinal));
+        Check.True(closeSource.Contains("Current.Exit();", StringComparison.Ordinal));
+        Check.True(!closeSource.Contains("DisposeAsync", StringComparison.Ordinal));
+        Check.True(windowSource.Contains("PrimaryButtonText = \"Close app\"", StringComparison.Ordinal));
+        Check.True(windowSource.Contains("CloseButtonText = \"Keep app open\"", StringComparison.Ordinal));
+        Check.True(windowSource.Contains("ContentDialogResult.Primary", StringComparison.Ordinal));
     }
 
     private static void DispatcherCoalescing()
@@ -2454,6 +2996,15 @@ internal static class UiStateChecks
             Check.Equal(width, expanded.PrimaryWidth + expanded.VisualizationWidth);
         }
         Check.Equal(480d, VisualizationLayout.MinimumPrimaryWidth);
+        Check.Equal(new WindowBounds(-11, -11, 2518, 1638),
+            WindowPlacement.MaximizedBounds(
+                new(0, 0, 2496, 1664), new(0, 0, 2496, 1616), 11, 11));
+        Check.Equal(new WindowBounds(40, -8, 1888, 1096),
+            WindowPlacement.MaximizedBounds(
+                new(0, 0, 1920, 1080), new(48, 0, 1872, 1080), 8, 8));
+        Check.Equal(new WindowBounds(-8, -8, 1936, 1056),
+            WindowPlacement.MaximizedBounds(
+                new(-1920, 0, 1920, 1080), new(-1920, 0, 1920, 1040), 8, 8));
 
         var current = new System.Collections.ObjectModel.ObservableCollection<FakeVisualizationItem>
         {
@@ -2514,7 +3065,11 @@ internal static class UiStateChecks
         Check.True(source.Contains("VisualizationExpandText.Text = \"Restore\";", StringComparison.Ordinal));
         Check.True(source.Contains("VisualizationExpandIcon.Glyph = \"\\uE73F\";", StringComparison.Ordinal));
         Check.True(source.Contains("private void AnimateChangedItems<T>", StringComparison.Ordinal));
-        Check.True(source.Contains("AnimateChangedItems(TrailList, trailUpdate.Changed)", StringComparison.Ordinal));
+        Check.True(source.Contains("AnimateChangedItems(MeetingNotesList, notesUpdate.Changed)", StringComparison.Ordinal));
+        Check.True(source.Contains("NativeMethods.SetWindowSubclass(", StringComparison.Ordinal));
+        Check.True(source.Contains(
+            "NativeMethods.ConstrainMaximizedBoundsToWorkArea(hWnd, lParam);",
+            StringComparison.Ordinal));
         Check.True(source.Contains("if (!_animationsEnabled || changed.Count == 0)", StringComparison.Ordinal));
         Check.True(source.Contains("AnimateOpacity(container, 0.68, 1, 160)", StringComparison.Ordinal));
         Check.True(source.Contains(
@@ -2585,19 +3140,83 @@ internal static class UiStateChecks
             "            RecordingOverviewScroll.MaxHeight = allocation.OverviewMaxHeight;",
             StringComparison.Ordinal));
         Check.True(layout.Contains(
-            "if (Math.Abs(RecordingTranscriptRow.MinHeight - allocation.TranscriptMinHeight) > 1)\n" +
-            "            RecordingTranscriptRow.MinHeight = allocation.TranscriptMinHeight;",
+            "if (Math.Abs(TranscriptList.MaxHeight - allocation.TranscriptMaxHeight) > 1)\n" +
+            "            TranscriptList.MaxHeight = allocation.TranscriptMaxHeight;",
             StringComparison.Ordinal));
+        Check.True(layout.Contains("RecordingBodyScroll.ActualHeight,", StringComparison.Ordinal));
+        Check.True(!layout.Contains("RecordingFooter.ActualHeight", StringComparison.Ordinal));
+
+        var document = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+        XElement Control(string name) => document.Descendants().Single(e => (string?)e.Attribute(x + "Name") == name);
+        var panel = Control("RecordingPanel");
+        var rows = panel.Elements().Single(e => e.Name.LocalName == "Grid.RowDefinitions").Elements().ToArray();
+        Check.Equal(2, rows.Length);
+        Check.Equal("*", (string?)rows[0].Attribute("Height"));
+        Check.Equal("Auto", (string?)rows[1].Attribute("Height"));
+        Check.True(rows.All(row => row.Attribute("MinHeight") is null));
+        var bodyScroll = Control("RecordingBodyScroll");
+        Check.True(bodyScroll.Parent == panel);
+        Check.Equal("0", (string?)bodyScroll.Attribute("Grid.Row"));
+        Check.Equal("Auto", (string?)bodyScroll.Attribute("VerticalScrollBarVisibility"));
+        Check.Equal("Disabled", (string?)bodyScroll.Attribute("HorizontalScrollBarVisibility"));
+        Check.True(Control("RecordingBody").Parent == bodyScroll);
+        foreach (var name in new[] { "RecordingOverviewScroll", "InsightSections", "SpeakerSection",
+                     "RecordingUtilityActions", "TranscriptExpander", "TranscriptList" })
+            Check.True(Control(name).Ancestors().Contains(bodyScroll));
+        var footer = Control("RecordingFooter");
+        Check.True(footer.Parent == panel);
+        Check.Equal("1", (string?)footer.Attribute("Grid.Row"));
+        var footerRows = footer.Elements().Single(e => e.Name.LocalName == "Grid.RowDefinitions")
+            .Elements().ToArray();
+        Check.Equal(3, footerRows.Length);
+        Check.True(footerRows.All(row => (string?)row.Attribute("Height") == "Auto"));
+        Check.Equal("0", (string?)Control("StopButton").Attribute("Grid.Row"));
+        Check.Equal("2", (string?)Control("StopButton").Attribute("Grid.ColumnSpan"));
+        Check.Equal("OnStopClick", (string?)Control("StopButton").Attribute("Click"));
+        Check.Equal("1", (string?)Control("WhatDidIMissButton").Attribute("Grid.Row"));
+        Check.Equal("2", (string?)Control("WhatDidIMissButton").Attribute("Grid.ColumnSpan"));
+        Check.Equal("40", (string?)Control("WhatDidIMissButton").Attribute("MinHeight"));
+        Check.Equal("OnWhatDidIMissClick", (string?)Control("WhatDidIMissButton").Attribute("Click"));
+        Check.Equal("2", (string?)Control("NewRecordingHint").Attribute("Grid.Row"));
+        Check.Equal("2", (string?)Control("SaveDecisionPanel").Attribute("Grid.RowSpan"));
+        var root = Control("RootLayout");
+        Check.Equal("1", (string?)Control("TopicMapPanel").Attribute("Grid.Row"));
+        Check.Equal("1", (string?)Control("TopicMapPanel").Attribute("Grid.Column"));
+        Check.True(!Control("TopicMapPanel").Ancestors().Contains(panel));
+        Check.True(!panel.Ancestors().Contains(Control("TopicMapPanel")));
+        Check.True(root.Descendants().Contains(panel));
+        Check.True(root.Descendants().Contains(Control("TopicMapPanel")));
+        foreach (var name in new[] { "StopButton", "NewRecordingButton", "BackToMeetingsButton",
+                     "NewRecordingHint", "WhatDidIMissButton", "SaveDecisionPanel" })
+        {
+            Check.True(Control(name).Ancestors().Contains(footer));
+            Check.True(!Control(name).Ancestors().Any(e => e.Name.LocalName == "ScrollViewer"));
+        }
 
         var normal = RecordingLayout.Calculate(750, 140);
-        Check.True(normal.TranscriptMinHeight >= 140);
-        Check.True(normal.OverviewMaxHeight + normal.TranscriptMinHeight <= 610);
+        Check.Equal(290d, normal.TranscriptMaxHeight);
+        Check.Equal(610d, normal.OverviewMaxHeight + normal.TranscriptMaxHeight);
         Check.Equal(RecordingLayout.DesiredOverviewHeight, normal.OverviewMaxHeight);
 
         var small = RecordingLayout.Calculate(500, 140);
-        Check.True(small.TranscriptMinHeight >= RecordingLayout.MinimumTranscriptHeight);
-        Check.True(small.OverviewMaxHeight + small.TranscriptMinHeight <= 360);
-        Check.True(small.OverviewMaxHeight >= 200);
+        Check.Equal(180d, small.TranscriptMaxHeight);
+        Check.Equal(360d, small.OverviewMaxHeight + small.TranscriptMaxHeight);
+
+        foreach (var bodyHeight in new[] { 0d, 100, 300, 600, 1000 })
+        foreach (var fixedHeight in new[] { 0d, 140, 800 })
+        {
+            var allocation = RecordingLayout.Calculate(bodyHeight, fixedHeight);
+            Check.True(allocation.OverviewMaxHeight >= RecordingLayout.MinimumOverviewHeight);
+            Check.True(allocation.OverviewMaxHeight <= RecordingLayout.DesiredOverviewHeight);
+            Check.True(allocation.TranscriptMaxHeight >= RecordingLayout.MinimumTranscriptHeight);
+            Check.True(allocation.TranscriptMaxHeight <= Math.Max(
+                RecordingLayout.MinimumTranscriptHeight, bodyHeight));
+            var available = Math.Max(0, bodyHeight - fixedHeight);
+            Check.Equal(Math.Max(available,
+                    RecordingLayout.MinimumOverviewHeight + RecordingLayout.MinimumTranscriptHeight),
+                allocation.OverviewMaxHeight + allocation.TranscriptMaxHeight);
+        }
     }
 
     private static void ChecklistCompletion()
@@ -2761,7 +3380,11 @@ internal static class UiStateChecks
             ]));
         Check.Equal(AiActivityVisualState.RateLimited, limited.State);
         Check.Equal("AI rate limited · Q&A", limited.Header);
-        Check.Equal("AI is rate limited for Questions and actions. Retry after 30 sec.", limited.Status);
+        Check.Equal("AI is rate limited for Questions and actions. Retry after 30 sec.", limited.Announcement);
+        Check.Equal(
+            "AI is rate limited for Questions and actions. Retry after 30 sec. " +
+            "Total tokens: Not reported. Input tokens: Not reported. Output tokens: Not reported.",
+            limited.Status);
 
         var unavailable = AiUsagePresentation.Create(new(
             "session",

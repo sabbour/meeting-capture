@@ -10,7 +10,263 @@ internal sealed record VisualizationProjection(
     string EmptyMessage,
     string Fingerprint,
     BrainMapViewModel? BrainMap = null,
-    TopicBriefViewModel? TopicBrief = null);
+    TopicBriefViewModel? TopicBrief = null,
+    MeetingBrainMapViewModel? MeetingBrainMap = null,
+    MeetingNotesViewModel? MeetingNotes = null);
+
+internal sealed record MeetingNotesViewModel(
+    IReadOnlyList<MeetingTopicNotesViewModel> Topics,
+    string EmptyMessage);
+
+internal sealed record MeetingTopicNotesViewModel(
+    string Id,
+    string Heading,
+    IReadOnlyList<string> Bullets,
+    IReadOnlyList<MeetingTopicSuggestionViewModel> Suggestions,
+    bool IsCurrent,
+    bool IsSelected,
+    bool IsCollapsed = false)
+{
+    public bool HasBullets => Bullets.Count > 0;
+    public bool HasNoBullets => Bullets.Count == 0;
+    public bool HasSuggestions => Suggestions.Count > 0;
+    public bool IsExpanded => !IsCollapsed;
+    public string ToggleGlyph => IsCollapsed ? "\uE76C" : "\uE70D";
+    public string ToggleName => IsCollapsed
+        ? $"Expand topic: {Heading}"
+        : $"Collapse topic: {Heading}";
+}
+
+internal static class TopicCollapseState
+{
+    internal static bool Toggle(ISet<string> collapsed, string topicId)
+    {
+        ArgumentNullException.ThrowIfNull(collapsed);
+        if (collapsed.Remove(topicId))
+            return false;
+        collapsed.Add(topicId);
+        return true;
+    }
+
+    internal static IReadOnlyList<int> LeafCounts(
+        MeetingBrainMapViewModel map,
+        IReadOnlySet<string> collapsed) =>
+        map.Topics
+            .Select(topic => collapsed.Contains(topic.Id) ? 0 : topic.Leaves.Count)
+            .ToArray();
+
+    internal static IReadOnlyList<MeetingTopicNotesViewModel> Apply(
+        IEnumerable<MeetingTopicNotesViewModel> topics,
+        IReadOnlySet<string> collapsed) =>
+        topics.Select(topic => topic with { IsCollapsed = collapsed.Contains(topic.Id) }).ToArray();
+}
+
+internal sealed record MeetingTopicSuggestionViewModel(
+    string Id,
+    string Title,
+    string SourceType,
+    string SourceUrl,
+    bool CanOpen)
+{
+    public string OpenActionName => $"Open {SourceType}: {Title}";
+}
+
+internal sealed record MeetingBrainMapViewModel(
+    string MeetingTitle,
+    string Detail,
+    string CurrentTopicId,
+    IReadOnlyList<MeetingBrainMapTopicViewModel> Topics,
+    string EmptyMessage);
+
+internal sealed record MeetingBrainMapTopicViewModel(
+    string Id,
+    string Title,
+    string Detail,
+    IReadOnlyList<MeetingBrainMapLeafViewModel> Leaves);
+
+internal sealed record MeetingBrainMapLeafViewModel(
+    string Id,
+    string TopicId,
+    string Kind,
+    string Title,
+    string Detail)
+{
+    public string AccessibleName =>
+        $"{Kind}: {Title}. {Detail}. Select to view matching meeting notes.";
+}
+
+internal sealed record MeetingBrainMapTopicLayout(
+    BrainMapRect Topic,
+    IReadOnlyList<BrainMapRect> Leaves);
+
+internal readonly record struct BrainMapPoint(double X, double Y);
+
+internal readonly record struct TopicMapRgb(byte Red, byte Green, byte Blue)
+{
+    internal double RelativeLuminance
+    {
+        get
+        {
+            static double Linear(byte channel)
+            {
+                var value = channel / 255d;
+                return value <= 0.04045 ? value / 12.92 : Math.Pow((value + 0.055) / 1.055, 2.4);
+            }
+            return 0.2126 * Linear(Red) + 0.7152 * Linear(Green) + 0.0722 * Linear(Blue);
+        }
+    }
+
+    internal double ContrastRatio(TopicMapRgb other)
+    {
+        var lighter = Math.Max(RelativeLuminance, other.RelativeLuminance);
+        var darker = Math.Min(RelativeLuminance, other.RelativeLuminance);
+        return (lighter + 0.05) / (darker + 0.05);
+    }
+}
+
+internal sealed record MeetingBrainMapConnectorLayout(
+    string Id,
+    BrainMapPoint Start,
+    BrainMapPoint End);
+
+internal sealed record MeetingBrainMapLayout(
+    double Width,
+    double Height,
+    BrainMapRect Root,
+    IReadOnlyList<MeetingBrainMapTopicLayout> Topics,
+    IReadOnlyList<MeetingBrainMapConnectorLayout> Connectors)
+{
+    internal static MeetingBrainMapLayout Calculate(
+        double viewportWidth,
+        IReadOnlyList<int> leafCounts)
+    {
+        ArgumentNullException.ThrowIfNull(leafCounts);
+        if (leafCounts.Any(count => count < 0))
+            throw new ArgumentOutOfRangeException(nameof(leafCounts));
+
+        var width = Math.Max(320, viewportWidth);
+        const double margin = 20;
+        const double rootHeight = 90;
+        const double topicHeight = 104;
+        const double leafHeight = 104;
+        const double horizontalGap = 24;
+        const double verticalGap = 12;
+        const double leafGap = 10;
+        const double rowGap = 28;
+        const double rootGap = 48;
+        var columns = width >= 1400 ? 4 : width >= 1000 ? 3 : width >= 640 ? 2 : 1;
+        var topicWidth = Math.Min(
+            360,
+            (width - margin * 2 - horizontalGap * (columns - 1)) / columns);
+        var leafWidth = Math.Max(1, topicWidth - 20);
+        var rootWidth = Math.Min(360, width - margin * 2);
+        var rows = leafCounts.Count == 0
+            ? 0
+            : (leafCounts.Count + columns - 1) / columns;
+        var rowHeights = new double[rows];
+        for (var row = 0; row < rows; row++)
+        {
+            var firstTopic = row * columns;
+            var rowTopicCount = Math.Min(columns, leafCounts.Count - firstTopic);
+            var tallestBlock = Enumerable.Range(firstTopic, rowTopicCount)
+                .Select(index => topicHeight + verticalGap +
+                    leafCounts[index] * leafHeight + Math.Max(0, leafCounts[index] - 1) * leafGap)
+                .Max();
+            rowHeights[row] = tallestBlock;
+        }
+
+        var firstRowY = margin + rootHeight + rootGap;
+        var root = new BrainMapRect(
+            (width - rootWidth) / 2,
+            margin,
+            rootWidth,
+            rootHeight);
+        var topics = new List<MeetingBrainMapTopicLayout>(leafCounts.Count);
+        var rowY = firstRowY;
+        for (var row = 0; row < rows; row++)
+        {
+            var rowStart = row * columns;
+            var rowTopicCount = Math.Min(columns, leafCounts.Count - rowStart);
+            for (var column = 0; column < rowTopicCount; column++)
+            {
+                var index = rowStart + column;
+                var x = margin + column * (topicWidth + horizontalGap);
+                var topic = new BrainMapRect(x, rowY, topicWidth, topicHeight);
+                var leaves = new List<BrainMapRect>(leafCounts[index]);
+                var leafX = x + (topicWidth - leafWidth) / 2;
+                var leafY = rowY + topicHeight + verticalGap;
+                for (var leaf = 0; leaf < leafCounts[index]; leaf++)
+                {
+                    leaves.Add(new(leafX, leafY, leafWidth, leafHeight));
+                    leafY += leafHeight + leafGap;
+                }
+                topics.Add(new(topic, leaves));
+            }
+            rowY += rowHeights[row] + rowGap;
+        }
+
+        var height = Math.Max(
+            280,
+            (rows == 0 ? firstRowY : rowY - rowGap) + margin);
+        var connectors = new List<MeetingBrainMapConnectorLayout>();
+        if (topics.Count > 0)
+        {
+            var rootCenterX = root.X + root.Width / 2;
+            var rootBottom = root.Y + root.Height;
+            var busY = rootBottom + rootGap / 2;
+            connectors.Add(new(
+                "root:trunk",
+                new(rootCenterX, rootBottom),
+                new(rootCenterX, busY)));
+
+            var lanes = Enumerable.Range(0, Math.Min(columns, topics.Count))
+                .Select(column => (Column: column, X: topics[column].Topic.X - 12))
+                .ToArray();
+            var busStart = Math.Min(rootCenterX, lanes.Min(item => item.X));
+            var busEnd = Math.Max(rootCenterX, lanes.Max(item => item.X));
+            if (busEnd > busStart)
+                connectors.Add(new(
+                    "root:bus",
+                    new(busStart, busY),
+                    new(busEnd, busY)));
+
+            foreach (var lane in lanes)
+            {
+                var topicIndexes = Enumerable.Range(0, topics.Count)
+                    .Where(index => index % columns == lane.Column)
+                    .ToArray();
+                var lastTopic = topics[topicIndexes[^1]];
+                var laneBottom = lastTopic.Leaves.Count == 0
+                    ? lastTopic.Topic.Y + lastTopic.Topic.Height
+                    : lastTopic.Leaves[^1].Y + lastTopic.Leaves[^1].Height;
+                connectors.Add(new(
+                    $"lane:{lane.Column}",
+                    new(lane.X, busY),
+                    new(lane.X, laneBottom)));
+
+                foreach (var index in topicIndexes)
+                {
+                    var topic = topics[index];
+                    var topicCenterY = topic.Topic.Y + topic.Topic.Height / 2;
+                    connectors.Add(new(
+                        $"topic:{index}",
+                        new(lane.X, topicCenterY),
+                        new(topic.Topic.X, topicCenterY)));
+                    for (var leafIndex = 0; leafIndex < topic.Leaves.Count; leafIndex++)
+                    {
+                        var leaf = topic.Leaves[leafIndex];
+                        var leafCenterY = leaf.Y + leaf.Height / 2;
+                        connectors.Add(new(
+                            $"leaf:{index}:{leafIndex}",
+                            new(lane.X, leafCenterY),
+                            new(leaf.X, leafCenterY)));
+                    }
+                }
+            }
+        }
+        return new(width, height, root, topics, connectors);
+    }
+}
 
 internal sealed record BrainMapViewModel(
     string TopicId,
@@ -154,11 +410,15 @@ internal sealed record TrailItemViewModel(
         (IsCurrent ? " Current topic." : string.Empty) +
         (IsSelected ? " Selected." : string.Empty) +
         (ContextStatus is null ? string.Empty : $" {ContextStatus.AccessibleName}") +
-        " Select to center its mind map.";
+        " Select to view details in the whole-meeting map.";
 }
 
 internal static class TopicMapState
 {
+    internal static TopicMapRgb TopicNodeBackground => new(38, 44, 58);
+    internal static TopicMapRgb LeafNodeBackground => new(51, 58, 73);
+    internal static TopicMapRgb NodeTextColor => new(250, 251, 255);
+
     /// <summary>Projects the chronological topic timeline and selected topic brief.</summary>
     internal static VisualizationProjection Project(
         MeetingVisualizationDocument document,
@@ -166,7 +426,8 @@ internal static class TopicMapState
         string? currentTopicId = null,
         IReadOnlyDictionary<string, RelatedContextState>? relatedContextStates = null,
         bool workIqAuthenticated = true,
-        bool isReadOnly = false)
+        bool isReadOnly = false,
+        bool buildMeetingNotes = true)
     {
         ArgumentNullException.ThrowIfNull(document);
         var topics = document.TopicClusters.ToDictionary(topic => topic.Id, StringComparer.Ordinal);
@@ -174,7 +435,8 @@ internal static class TopicMapState
             speaker => speaker.SpeakerId,
             speaker => speaker.DisplayName,
             StringComparer.OrdinalIgnoreCase);
-        string Display(string? text) => ProjectSpeakers(text, speakers).Trim();
+        string Display(string? text) =>
+            MeetingNotesText.WithoutSegmentOrdinals(ProjectSpeakers(text, speakers).Trim());
         var latestTopicId = document.TopicTrail.LastOrDefault()?.TopicId;
         var current = currentTopicId is not null && topics.ContainsKey(currentTopicId)
             ? currentTopicId
@@ -275,7 +537,7 @@ internal static class TopicMapState
                 ? $" · {runCount} consecutive updates collapsed"
                 : string.Empty;
             var detail =
-                $"{(returned ? "Returned" : "Introduced")} · through segment {last.ThroughSegmentOrdinal}{collapsed}";
+                $"{(returned ? "Returned" : "Introduced")}{collapsed}";
             trail.Add(new(
                 first.Id,
                 last.TopicId,
@@ -317,15 +579,23 @@ internal static class TopicMapState
             : BuildBrainMap(
                 document, selectedTopic, topicLabels,
                 current, occurrenceCounts, Display);
+        var meetingBrainMap = BuildMeetingBrainMap(
+            document, orderedTopics, topicLabels, current, Display);
+        var meetingNotes = buildMeetingNotes
+            ? BuildMeetingNotesViewModel(
+                MeetingTopicNotesBuilder.Build(document), document, selected, current)
+            : null;
         var referencedSegmentOrdinals = document.Evidence
             .Where(item => item.SegmentOrdinal is not null)
             .Select(item => item.SegmentOrdinal!.Value)
             .ToHashSet();
         var fingerprint = string.Join("|",
-            document.Speakers.Select(item => $"{item.SpeakerId}:{item.DisplayName}:{item.IsConfirmed}")
+            new[] { $"title:{document.MeetingTitle}" }
+                .Concat(document.Speakers.Select(item => $"{item.SpeakerId}:{item.DisplayName}:{item.IsConfirmed}"))
                 .Concat(document.Segments.Where(item => referencedSegmentOrdinals.Contains(item.Ordinal)).Select(item =>
                     $"{item.Id}:{item.Ordinal}:{item.SpeakerId}:{item.Text}:{item.ConfidenceScore}"))
-                .Concat(document.TopicClusters.Select(item => $"{item.Id}:{item.Label}:{string.Join(",", item.Aliases)}"))
+                .Concat(document.TopicClusters.Select(item =>
+                    $"{item.Id}:{item.Label}:{string.Join(",", item.Aliases)}:{item.FirstOccurrenceOrdinal}:{item.LastOccurrenceOrdinal}"))
                 .Concat(document.TopicTrail.Select(item =>
                     $"{item.Id}:{item.TopicId}:{item.TranscriptRevision}:{item.ThroughSegmentOrdinal}:{item.LabelAtTime}"))
                 .Concat(document.ExplainedTopicLinks.Select(item =>
@@ -351,7 +621,61 @@ internal static class TopicMapState
                 : string.Empty,
             fingerprint,
             brainMap,
-            topicBrief);
+            topicBrief,
+            meetingBrainMap,
+            meetingNotes);
+    }
+
+    internal static MeetingNotesViewModel BuildMeetingNotesViewModel(
+        IReadOnlyList<MeetingTopicNotes> topicNotes,
+        MeetingVisualizationDocument? document = null,
+        string? selectedTopicId = null,
+        string? currentTopicId = null)
+    {
+        ArgumentNullException.ThrowIfNull(topicNotes);
+        var topics = topicNotes
+            .Select(topic => new MeetingTopicNotesViewModel(
+                topic.TopicId,
+                topic.Topic,
+                topic.Bullets.Select(MeetingNotesText.WithoutSegmentOrdinals).ToArray(),
+                document is null
+                    ? []
+                    : SelectBoundedWorkIqSources(document.Evidence.Where(item =>
+                            item.TopicId == topic.TopicId &&
+                            item.Origin == EvidenceOrigin.RelatedContext &&
+                            item.Provenance == VisualizationProvenance.RelatedSourceSuggestion))
+                        .Selected
+                        .Select(source =>
+                        {
+                            var title = RelatedContextTitle.Clean(source.SourceTitle, source.SourceType);
+                            if (title.Length == 0)
+                                title = SourceTypeLabel(source.SourceType);
+                            var canOpen = Uri.TryCreate(source.SourceUrl, UriKind.Absolute, out var uri) &&
+                                uri.Scheme == Uri.UriSchemeHttps &&
+                                !string.IsNullOrWhiteSpace(uri.Host) &&
+                                string.IsNullOrEmpty(uri.UserInfo);
+                            return new MeetingTopicSuggestionViewModel(
+                                source.Id,
+                                MeetingNotesText.WithoutSegmentOrdinals(title),
+                                SourceTypeLabel(source.SourceType),
+                                canOpen ? uri!.AbsoluteUri : string.Empty,
+                                canOpen);
+                        })
+                        .ToArray(),
+                StringComparer.Ordinal.Equals(topic.TopicId, currentTopicId),
+                StringComparer.Ordinal.Equals(topic.TopicId, selectedTopicId)))
+            .ToArray();
+        return new(
+            topics,
+            topics.Length == 0
+                ? "No accepted topics yet. Meeting notes will appear as topics are accepted."
+                : string.Empty);
+    }
+
+    internal static string? CurrentTopicSelection(VisualizationProjection projection)
+    {
+        ArgumentNullException.ThrowIfNull(projection);
+        return projection.CurrentTopicId.Length == 0 ? null : projection.CurrentTopicId;
     }
 
     private static BrainMapViewModel BuildBrainMap(
@@ -381,7 +705,7 @@ internal static class TopicMapState
                 topic.Id,
                 "Transcript fact",
                 display(item.PresentationLabel),
-                $"Grounded in segment {item.SegmentOrdinal}")));
+                "Grounded in this meeting's transcript")));
 
         branches.AddRange(document.Questions
             .Where(item =>
@@ -472,6 +796,138 @@ internal static class TopicMapState
                 : string.Empty);
     }
 
+    private static MeetingBrainMapViewModel BuildMeetingBrainMap(
+        MeetingVisualizationDocument document,
+        IReadOnlyList<TopicCluster> orderedTopics,
+        IReadOnlyDictionary<string, string> topicLabels,
+        string currentTopicId,
+        Func<string?, string> display)
+    {
+        var segments = document.Segments.ToDictionary(item => item.Ordinal);
+        var speakers = document.Speakers.ToDictionary(
+            item => item.SpeakerId,
+            item => item.DisplayName,
+            StringComparer.OrdinalIgnoreCase);
+        var transcriptEvidence = document.Evidence
+            .Where(item =>
+                (item.Origin is EvidenceOrigin.Transcript or EvidenceOrigin.Analysis) &&
+                item.Provenance == VisualizationProvenance.TranscriptFact &&
+                item.SegmentOrdinal is not null &&
+                segments.ContainsKey(item.SegmentOrdinal.Value))
+            .GroupBy(item => item.Id, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToDictionary(item => item.Id, StringComparer.Ordinal);
+
+        bool BelongsToTopic(string? assignedTopicId, IReadOnlyList<string> evidenceIds, string topicId)
+        {
+            if (StringComparer.Ordinal.Equals(assignedTopicId, topicId))
+                return true;
+            return assignedTopicId is null && evidenceIds.Any(id =>
+                transcriptEvidence.TryGetValue(id, out var evidenceItem) &&
+                StringComparer.Ordinal.Equals(evidenceItem.TopicId, topicId));
+        }
+
+        string EvidenceDetail(IEnumerable<string> evidenceIds)
+        {
+            var cited = evidenceIds
+                .Where(transcriptEvidence.ContainsKey)
+                .Select(id => transcriptEvidence[id])
+                .OrderBy(item => item.SegmentOrdinal)
+                .ThenBy(item => item.Id, StringComparer.Ordinal)
+                .FirstOrDefault();
+            if (cited?.SegmentOrdinal is not int ordinal)
+                return "Grounded in this meeting transcript";
+            var segment = segments[ordinal];
+            var speaker = string.IsNullOrWhiteSpace(segment.SpeakerId)
+                ? "Unidentified speaker"
+                : speakers.GetValueOrDefault(segment.SpeakerId, segment.SpeakerId);
+            return $"{speaker} · {segment.Timestamp.LocalDateTime:HH:mm:ss}";
+        }
+
+        var projectedTopics = orderedTopics.Select(topic =>
+        {
+            var leaves = new List<MeetingBrainMapLeafViewModel>();
+            foreach (var fact in transcriptEvidence.Values
+                         .Where(item => item.TopicId == topic.Id)
+                         .OrderBy(item => item.SegmentOrdinal)
+                         .ThenBy(item => item.Id, StringComparer.Ordinal))
+            {
+                var label = string.IsNullOrWhiteSpace(fact.PresentationLabel)
+                    ? fact.Summary
+                    : fact.PresentationLabel;
+                if (string.IsNullOrWhiteSpace(label))
+                    label = "Transcript key point";
+                var factDetail = string.IsNullOrWhiteSpace(fact.Summary)
+                    ? EvidenceDetail([fact.Id])
+                    : $"{EvidenceDetail([fact.Id])} · {display(fact.Summary)}";
+                leaves.Add(new(
+                    fact.Id,
+                    topic.Id,
+                    "Key point",
+                    display(label),
+                    factDetail));
+            }
+
+            leaves.AddRange(document.Decisions
+                .Where(item =>
+                    BelongsToTopic(item.TopicId, item.EvidenceIds, topic.Id) &&
+                    item.EvidenceIds.Any(transcriptEvidence.ContainsKey))
+                .OrderBy(item => item.Id, StringComparer.Ordinal)
+                .Select(item => new MeetingBrainMapLeafViewModel(
+                    item.Id,
+                    topic.Id,
+                    "Decision",
+                    display(item.Text),
+                    EvidenceDetail(item.EvidenceIds))));
+
+            leaves.AddRange(document.Questions
+                .Where(item =>
+                    BelongsToTopic(item.TopicId, item.EvidenceIds, topic.Id) &&
+                    item.QuestionState == QuestionState.Open &&
+                    item.EvidenceIds.Any(transcriptEvidence.ContainsKey))
+                .OrderBy(item => item.Id, StringComparer.Ordinal)
+                .Select(item => new MeetingBrainMapLeafViewModel(
+                    item.Id,
+                    topic.Id,
+                    "Open question",
+                    display(item.Text),
+                    EvidenceDetail(item.EvidenceIds))));
+
+            leaves.AddRange(document.Actions
+                .Where(item =>
+                    BelongsToTopic(item.TopicId, item.EvidenceIds, topic.Id) &&
+                    item.State is VisualizationActionState.Open or VisualizationActionState.Completed &&
+                    item.EvidenceIds.Any(transcriptEvidence.ContainsKey))
+                .OrderBy(item => item.Id, StringComparer.Ordinal)
+                .Select(item => new MeetingBrainMapLeafViewModel(
+                    item.Id,
+                    topic.Id,
+                    item.State == VisualizationActionState.Completed ? "Completed action" : "Action",
+                    display(item.Text),
+                    EvidenceDetail(item.EvidenceIds))));
+
+            var detail = leaves.Count == 0
+                ? "No transcript-grounded details yet"
+                : $"{leaves.Count} grounded point{(leaves.Count == 1 ? string.Empty : "s")}";
+            if (topic.Id == currentTopicId)
+                detail = $"Current topic · {detail}";
+            return new MeetingBrainMapTopicViewModel(
+                topic.Id,
+                topicLabels[topic.Id],
+                detail,
+                leaves);
+        }).ToArray();
+
+        return new(
+            document.MeetingTitle,
+            $"Whole meeting · {projectedTopics.Length} topic{(projectedTopics.Length == 1 ? string.Empty : "s")}",
+            currentTopicId,
+            projectedTopics,
+            projectedTopics.Length == 0
+                ? "No accepted topics yet. The topic map will grow as topics are accepted."
+                : string.Empty);
+    }
+
     private static string RelationCue(ExplainedTopicLinkKind kind) => kind switch
     {
         ExplainedTopicLinkKind.Supports => "Supports",
@@ -529,7 +985,7 @@ internal static class TopicMapState
                     item.Id,
                     title,
                     display(segment.Text),
-                    $"Segment {segment.Ordinal} · {segment.Timestamp.LocalDateTime:HH:mm:ss}");
+                    segment.Timestamp.LocalDateTime.ToString("HH:mm:ss"));
             })
             .ToArray();
 
@@ -544,11 +1000,12 @@ internal static class TopicMapState
                 var relatedTopicId = outgoing ? item.ToTopicId : item.FromTopicId;
                 var relatedLabel = document.TopicClusters
                     .FirstOrDefault(candidate => candidate.Id == relatedTopicId)?.Label ?? relatedTopicId;
-                var citedSegments = item.EvidenceIds
+                var citedTimes = item.EvidenceIds
                     .Where(transcriptEvidence.ContainsKey)
                     .Select(id => transcriptEvidence[id].SegmentOrdinal!.Value)
                     .Distinct()
                     .Order()
+                    .Select(ordinal => segmentByOrdinal[ordinal].Timestamp.LocalDateTime.ToString("HH:mm:ss"))
                     .ToArray();
                 var direction = outgoing
                     ? $"{RelationCue(item.Kind)} → {display(relatedLabel)}"
@@ -556,8 +1013,8 @@ internal static class TopicMapState
                 return new TopicBriefRelationshipViewModel(
                     item.Id,
                     direction,
-                    $"Grounded in transcript segment{(citedSegments.Length == 1 ? string.Empty : "s")} " +
-                    string.Join(", ", citedSegments));
+                    $"Grounded in this meeting's transcript · " +
+                    string.Join(", ", citedTimes));
             })
             .ToArray();
 
@@ -687,13 +1144,12 @@ internal static class TopicMapState
         var last = ordinals[^1];
         var firstTime = segments.GetValueOrDefault(first)?.Timestamp.LocalDateTime.ToString("HH:mm:ss");
         var lastTime = segments.GetValueOrDefault(last)?.Timestamp.LocalDateTime.ToString("HH:mm:ss");
-        var segmentText = first == last ? $"segment {first}" : $"segments {first}–{last}";
         if (firstTime is null)
-            return $"Discussed around {segmentText}.";
+            return "Discussion timing is not available yet.";
         var timeText = first == last || lastTime is null || firstTime == lastTime
             ? firstTime
             : $"{firstTime}–{lastTime}";
-        return $"Discussed around {segmentText} · {timeText}.";
+        return $"Discussed around {timeText}.";
     }
 
     /// <summary>

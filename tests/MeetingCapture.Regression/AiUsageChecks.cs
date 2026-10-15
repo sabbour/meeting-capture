@@ -2,6 +2,7 @@ using System.Collections;
 using System.Reflection;
 using GitHub.Copilot;
 using MeetingCapture.Intelligence;
+using MeetingCapture.TrayApp;
 
 namespace MeetingCapture.Regression;
 
@@ -12,6 +13,8 @@ internal static class AiUsageChecks
         yield return ("AI usage maps and aggregates the SDK assistant usage event", Aggregation);
         yield return ("AI usage reset rejects late results from the prior recording", ResetAndLateResults);
         yield return ("pipeline resets AI usage for the recording session", PipelineReset);
+        yield return ("AI token totals update live across capabilities and retain late usage", LiveAndLateUsage);
+        yield return ("AI token totals survive concurrent reports and request history eviction", ConcurrentUsage);
     }
 
     private static Task Aggregation()
@@ -125,6 +128,81 @@ internal static class AiUsageChecks
             item.TotalNanoAiu.Total == 0 &&
             !item.QuotaSnapshots.IsReported));
         return Task.CompletedTask;
+    }
+
+    private static Task LiveAndLateUsage()
+    {
+        var monitor = new AiUsageMonitor();
+        monitor.Reset("tokens");
+        var before = AiUsagePresentation.Create(monitor.GetSnapshot());
+        Check.True(before.Status.Contains("Total tokens: Not reported"));
+        var requests = Enum.GetValues<AiCapability>()
+            .Select(capability => monitor.Begin(capability, "tokens")).ToArray();
+        foreach (var request in requests)
+            request.CallStarted();
+
+        requests[0].ReportUsage(100, 20, null, null, null);
+        var running = monitor.GetSnapshot();
+        Check.Equal(100L, running.Capabilities.Sum(item => item.InputTokens.Total));
+        Check.Equal(20L, running.Capabilities.Sum(item => item.OutputTokens.Total));
+        var live = AiUsagePresentation.Create(running);
+        Check.True(live.Status.Contains("Total tokens: 120 (partial"));
+        Check.True(live.Status != before.Status);
+        foreach (var request in requests)
+            request.Complete();
+        for (var index = 1; index < requests.Length - 1; index++)
+            requests[index].ReportUsage(10, 2, null, null, null);
+
+        var snapshot = monitor.GetSnapshot();
+        Check.Equal(130L, snapshot.Capabilities.Sum(item => item.InputTokens.Total));
+        Check.Equal(26L, snapshot.Capabilities.Sum(item => item.OutputTokens.Total));
+        Check.Equal(1, snapshot.Capabilities.Sum(item => item.InputTokens.UnreportedCalls));
+        Check.True(snapshot.Requests.All(item => item.State == AiRequestState.Succeeded));
+        Check.Equal(5, snapshot.Capabilities.Sum(item => item.Succeeded));
+        Check.True(AiUsagePresentation.Create(snapshot).Status.Contains("Total tokens: 156 (partial"));
+        Check.True(AiUsagePresentation.Create(snapshot).Status.Contains("Input tokens: 130 (partial"));
+        Check.True(AiUsagePresentation.Create(snapshot).Status.Contains("Output tokens: 26 (partial"));
+
+        var workIq = snapshot.Capabilities.Single(item => item.Capability == AiCapability.WorkIqRetrieval);
+        Check.True(!workIq.InputTokens.IsReported);
+        Check.Equal(1, workIq.InputTokens.UnreportedCalls);
+        requests[0].Complete();
+        requests[0].CallStarted();
+        Check.Equal(5, monitor.GetSnapshot().Capabilities.Sum(item => item.CallsStarted));
+        Check.Equal(5, monitor.GetSnapshot().Capabilities.Sum(item => item.Succeeded));
+        monitor.Reset("reported-zero");
+        var zero = monitor.Begin(AiCapability.Synthesis);
+        zero.CallStarted();
+        zero.ReportUsage(0, 0, null, null, null);
+        zero.Complete();
+        var reportedZero = AiUsagePresentation.Create(monitor.GetSnapshot());
+        Check.True(reportedZero.Status.Contains("Total tokens: 0."));
+        Check.True(!reportedZero.Status.Contains("Not reported"));
+        return Task.CompletedTask;
+    }
+
+    private static async Task ConcurrentUsage()
+    {
+        var monitor = new AiUsageMonitor();
+        monitor.Reset("concurrent");
+        var oldest = monitor.Begin(AiCapability.Visualization);
+        oldest.CallStarted();
+        oldest.Complete();
+        await Task.WhenAll(Enumerable.Range(0, 50).Select(index => Task.Run(() =>
+        {
+            var request = monitor.Begin(AiCapability.Visualization);
+            request.CallStarted();
+            request.ReportUsage(10, 2, null, null, null);
+            request.ReportUsage(5, 1, null, null, null);
+            request.Complete();
+        })));
+        oldest.ReportUsage(7, 4, null, null, null);
+        var snapshot = monitor.GetSnapshot();
+        Check.Equal(757L, snapshot.Capabilities.Sum(item => item.InputTokens.Total));
+        Check.Equal(154L, snapshot.Capabilities.Sum(item => item.OutputTokens.Total));
+        Check.Equal(0, snapshot.Capabilities.Sum(item => item.InputTokens.UnreportedCalls));
+        Check.Equal(51, snapshot.Capabilities.Sum(item => item.Succeeded));
+        Check.True(snapshot.Requests.Count <= 32);
     }
 
     private static AssistantUsageData CreateSdkUsageEvent()

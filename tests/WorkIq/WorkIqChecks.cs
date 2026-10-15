@@ -5,8 +5,10 @@ using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
 using MeetingCapture.WorkIq;
 using MeetingCapture.TrayApp;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Identity.Client;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace MeetingCapture.Regression;
 
@@ -96,6 +98,8 @@ internal static class WorkIqChecks
 
     public static IEnumerable<(string, Func<Task>)> Cases()
     {
+        yield return ("WorkIQ uses a port-less loopback redirect URI", () => Run(() =>
+            Check.Equal("http://localhost", WorkIqService.RedirectUri)));
         yield return ("WorkIQ auth alone is connecting, never end-to-end connected", () => Run(() =>
         {
             var state = new WorkIqConnectionStatus();
@@ -700,6 +704,50 @@ internal static class WorkIqChecks
                     """{"webUrl":"https://example.invalid/person","entityType":"person","resourceMetadata":{"general":{"title":"Person"}}}""",
                     1), Now, SelfIdentity).Availability);
         }));
+        yield return ("WorkIQ retrieve handles service errors empty payloads and non-object hits", () => Run(() =>
+        {
+            var serviceError = Json(
+                """{"isError":true,"content":[{"type":"text","text":"Synthetic service message"}]}""");
+            var declined = Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.ParseRetrievedContext(serviceError, Now, SelfIdentity));
+            Check.Equal(WorkIqFailure.ServiceDeclined, declined.Kind);
+            Check.Equal("tool-error", declined.Code);
+
+            Check.Equal(RelatedContextAvailability.NoEvidence,
+                WorkIqMcpClient.ParseRetrievedContext(
+                    Json("""{"structuredContent":{},"isError":false}"""), Now, SelfIdentity).Availability);
+            Check.Equal(RelatedContextAvailability.NoEvidence,
+                WorkIqMcpClient.ParseRetrievedContext(
+                    Json("""{"structuredContent":{"application/vnd.ms-workiq.retrieval":null},"isError":false}"""),
+                    Now, SelfIdentity).Availability);
+            Check.Equal(RelatedContextAvailability.NoEvidence,
+                WorkIqMcpClient.ParseRetrievedContext(
+                    Json("""{"structuredContent":{"application/vnd.ms-workiq.retrieval":{"retrievalHits":null}},"isError":false}"""),
+                    Now, SelfIdentity).Availability);
+
+            const string valid = """
+                {"webUrl":"https://teams.microsoft.com/l/message/valid","entityType":"Chats",
+                 "resourceMetadata":{"general":{"title":"Synthetic thread"},
+                  "teams":{"author":{"id":"user-123"}}}}
+                """;
+            var mixedHits = WorkIqMcpClient.ParseRetrievedContext(
+                RetrievedContext($"""null, 5, "not an object", {valid}""", 4), Now, SelfIdentity);
+            Check.Equal(RelatedContextAvailability.Available, mixedHits.Availability);
+            Check.Equal(1, mixedHits.Items.Count);
+            Check.True(mixedHits.Detail!.Contains("some results were omitted", StringComparison.Ordinal));
+
+            Check.Equal(
+                "Malformed:rpc:-32000",
+                WorkIqService.DiagnosticFailureReason(
+                    new WorkIqException(WorkIqFailure.Malformed, "rpc:-32000")));
+            var httpFailure = Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.ParseRetrievedContext(
+                    Json("""{"structuredContent":{"statusCode":500},"isError":false}"""),
+                    Now,
+                    SelfIdentity));
+            Check.Equal(WorkIqFailure.ServiceUnavailable, httpFailure.Kind);
+            Check.Equal("http:500", httpFailure.Code);
+        }));
         yield return ("WorkIQ retrieve enforces the participation boundary: id, alias, and display-name-only cases", () => Run(() =>
         {
             const string hits = """
@@ -836,6 +884,64 @@ internal static class WorkIqChecks
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .Count());
         }));
+        yield return ("WorkIQ related families run together and one failure keeps the others", async () =>
+        {
+            var started = new System.Collections.Concurrent.ConcurrentBag<string>();
+            var allStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var snapshots = await WorkIqService.RetrieveFamiliesAsync(
+                ["Meetings", "TeamsMessages", "Email"],
+                async (capability, ct) =>
+                {
+                    started.Add(capability);
+                    if (started.Count == 3) allStarted.TrySetResult();
+                    await allStarted.Task.WaitAsync(TimeSpan.FromSeconds(5), ct);
+                    return capability switch
+                    {
+                        "Meetings" => throw new WorkIqException(WorkIqFailure.Timeout),
+                        "Email" => throw new WorkIqException(WorkIqFailure.Malformed),
+                        _ => new RelatedContextSnapshot(Now,
+                            [new RelatedContextItem("Teams 1", "Relevant source suggestion.", ClaimKind.InferredConnection, [new("Teams 1", "https://example.invalid/TeamsMessage/1", ContextSourceType.TeamsMessage, null)])],
+                            RelatedContextAvailability.Available)
+                    };
+                },
+                TimeSpan.FromSeconds(10), Now, CancellationToken.None);
+            Check.Equal(3, snapshots.Count);
+            Check.Equal(1, snapshots.Count(item =>
+                item.Availability == RelatedContextAvailability.Available));
+            Check.Equal(2, snapshots.Count(item =>
+                item.Availability == RelatedContextAvailability.Unavailable));
+        });
+        yield return ("WorkIQ related family time limit is per family and all-failed reports the failure", async () =>
+        {
+            var failure = await Check.ThrowsAsync<WorkIqException>(() => WorkIqService.RetrieveFamiliesAsync(
+                ["Meetings", "TeamsMessages", "Email"],
+                async (_, ct) =>
+                {
+                    try { await Task.Delay(Timeout.Infinite, ct); }
+                    catch (OperationCanceledException) { throw new WorkIqException(WorkIqFailure.Timeout); }
+                    return null!;
+                },
+                TimeSpan.FromMilliseconds(100), Now, CancellationToken.None));
+            Check.Equal(WorkIqFailure.Timeout, failure.Kind);
+            Check.True(WorkIqService.RelatedContextFamilyTimeout < TimeSpan.FromSeconds(75));
+        });
+        yield return ("WorkIQ related families keep sign-in failure and unsupported handling", async () =>
+        {
+            var signedOut = await Check.ThrowsAsync<WorkIqException>(() => WorkIqService.RetrieveFamiliesAsync(
+                ["Meetings", "TeamsMessages"],
+                (capability, _) => capability == "Meetings"
+                    ? Task.FromException<RelatedContextSnapshot>(new WorkIqException(WorkIqFailure.SignedOut))
+                    : Task.FromResult(new RelatedContextSnapshot(Now,
+                        [new RelatedContextItem("Teams 1", "Relevant source suggestion.", ClaimKind.InferredConnection, [new("Teams 1", "https://example.invalid/TeamsMessage/1", ContextSourceType.TeamsMessage, null)])], RelatedContextAvailability.Available)),
+                TimeSpan.FromSeconds(10), Now, CancellationToken.None));
+            Check.Equal(WorkIqFailure.SignedOut, signedOut.Kind);
+
+            var unsupported = await WorkIqService.RetrieveFamiliesAsync(
+                ["Meetings"],
+                (_, _) => Task.FromException<RelatedContextSnapshot>(new WorkIqException(WorkIqFailure.Unsupported)),
+                TimeSpan.FromSeconds(10), Now, CancellationToken.None);
+            Check.Equal(RelatedContextAvailability.Unavailable, unsupported.Single().Availability);
+        });
         yield return ("WorkIQ related-context diagnostics never retain query or source content", async () =>
         {
             var diagnostics = new AiDiagnosticsStream();
@@ -871,15 +977,43 @@ internal static class WorkIqChecks
         });
         yield return ("WorkIQ MCP rejects HTTP denial, RPC failure, mismatched IDs and missing fetch", async () =>
         {
-            foreach (var mode in new[] { "denied", "rpc", "wrong-id", "no-fetch" })
+            foreach (var mode in new[] { "denied", "rpc", "rpc-other", "wrong-id", "no-fetch" })
             {
                 using var client = new WorkIqMcpClient(new HttpClient(new McpHandler { Failure = mode }));
                 var failure = await Check.ThrowsAsync<WorkIqException>(() => client.InitializeAsync("synthetic-token", CancellationToken.None));
                 Check.Equal(mode switch
                 {
-                    "denied" => WorkIqFailure.Denied, "wrong-id" => WorkIqFailure.Malformed, _ => WorkIqFailure.Unsupported
+                    "denied" => WorkIqFailure.Denied,
+                    "rpc-other" or "wrong-id" => WorkIqFailure.Malformed,
+                    _ => WorkIqFailure.Unsupported
                 }, failure.Kind);
+                if (mode == "rpc-other")
+                    Check.Equal("rpc:-32000", failure.Code);
             }
+        });
+        yield return ("WorkIQ retries a busy service and preserves a service-specific failure", async () =>
+        {
+            var delays = WorkIqMcpClient.ServiceBusyRetryDelays;
+            WorkIqMcpClient.ServiceBusyRetryDelays = [TimeSpan.Zero, TimeSpan.Zero];
+            try
+            {
+                var handler = new McpHandler { Failure = "busy-once" };
+                using var client = new WorkIqMcpClient(new HttpClient(handler));
+                await client.InitializeAsync("synthetic-token", CancellationToken.None);
+                Check.Equal(2, handler.Methods.Count(method => method == "initialize"));
+
+                var busy = new McpHandler { Failure = "busy" };
+                using var busyClient = new WorkIqMcpClient(new HttpClient(busy));
+                var failure = await Check.ThrowsAsync<WorkIqException>(() =>
+                    busyClient.InitializeAsync("synthetic-token", CancellationToken.None));
+                Check.Equal(WorkIqFailure.ServiceUnavailable, failure.Kind);
+                Check.Equal("http:503", failure.Code);
+                Check.Equal(3, busy.Methods.Count);
+                Check.True(!failure.Message.Contains("Check your connection", StringComparison.Ordinal));
+                Check.Equal("The Work IQ service is having a problem right now.",
+                    WorkIqService.RelatedContextUnavailableMessage(failure));
+            }
+            finally { WorkIqMcpClient.ServiceBusyRetryDelays = delays; }
         });
         yield return ("WorkIQ cancellation aborts pending MCP without another request", async () =>
         {
@@ -902,6 +1036,121 @@ internal static class WorkIqChecks
             Check.Equal(WorkIqFailure.Timeout, failure.Kind);
             Check.True(timer.Elapsed < TimeSpan.FromSeconds(3));
             Check.Equal(1, handler.Methods.Count);
+        });
+        yield return ("WorkIQ restore deadline retains worker ownership and rejects late success or fault", async () =>
+        {
+            foreach (var failLate in new[] { false, true })
+            {
+                using var directory = new TemporaryDirectory();
+                var path = Path.Combine(directory.Path, "cache.bin");
+                await File.WriteAllTextAsync(path, "existing-synthetic-credentials");
+                var cache = new ProtectedWorkIqCache(path);
+                var app = PublicClientApplicationBuilder.Create(WorkIqService.ClientId).Build();
+                cache.Attach(app);
+                await app.GetAccountsAsync();
+                var logger = new RestoreLogger();
+                using var service = new WorkIqService(logger, cache);
+                using var deadline = new CancellationTokenSource();
+                var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var late = new TaskCompletionSource<IPublicClientApplication?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                var publications = 0;
+                var browserOpened = false;
+                CancellationToken workerToken = default;
+                service.AuthStateChanged += (_, _) => publications++;
+                service.BrowserOpened += (_, _) => browserOpened = true;
+                var pending = service.RestoreAsync(token =>
+                {
+                    workerToken = token;
+                    started.SetResult();
+                    return late.Task;
+                }, deadline.Token);
+                try
+                {
+                    await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    deadline.CancelAfter(TimeSpan.FromMilliseconds(100));
+                    await Check.ThrowsAsync<OperationCanceledException>(() =>
+                        pending.WaitAsync(TimeSpan.FromSeconds(3)));
+                    Check.True(timer.Elapsed < TimeSpan.FromSeconds(3));
+                    Check.True(workerToken.IsCancellationRequested && service.IsSignInBusy);
+                    Check.Equal((false, 0L), service.AuthState);
+                    var actions = WorkIqConnectionStatus.Actions(service.IsAuthenticated, service.IsSignInBusy, false);
+                    Check.Equal((false, false, false), actions);
+                    var duplicateStarted = false;
+                    await Check.ThrowsAsync<WorkIqException>(() => service.RestoreAsync(_ =>
+                    {
+                        duplicateStarted = true;
+                        return Task.FromResult<IPublicClientApplication?>(app);
+                    }, CancellationToken.None));
+                    await Check.ThrowsAsync<WorkIqException>(() => service.SignInAsync(CancellationToken.None));
+                    Check.True(!duplicateStarted && !browserOpened && service.IsSignInBusy);
+                    Check.Equal("existing-synthetic-credentials", await File.ReadAllTextAsync(path));
+                }
+                finally
+                {
+                    if (failLate) late.TrySetException(new IOException("Synthetic late restore failure"));
+                    else late.TrySetResult(app);
+                }
+                while (service.IsSignInBusy) await Task.Yield();
+                Check.True(!service.IsAuthenticated && !browserOpened);
+                Check.Equal(0L, service.Revision);
+                Check.Equal(0, publications);
+                Check.Equal("existing-synthetic-credentials", await File.ReadAllTextAsync(path));
+                if (failLate)
+                    Check.True(logger.Messages.Any(message =>
+                        message.Contains("cleanup", StringComparison.Ordinal) &&
+                        message.Contains(nameof(IOException), StringComparison.Ordinal)));
+                Check.Equal((true, false, false),
+                    WorkIqConnectionStatus.Actions(service.IsAuthenticated, service.IsSignInBusy, false));
+                await service.RestoreAsync(_ => Task.FromResult<IPublicClientApplication?>(app), CancellationToken.None);
+                Check.True(service.IsAuthenticated && !service.IsSignInBusy);
+                Check.Equal(1, publications);
+            }
+        });
+        yield return ("WorkIQ restore success persists only its own cache and publishes once", async () =>
+        {
+            using var directory = new TemporaryDirectory();
+            var path = Path.Combine(directory.Path, "cache.bin");
+            var cache = new ProtectedWorkIqCache(path);
+            var app = PublicClientApplicationBuilder.Create(WorkIqService.ClientId).Build();
+            cache.Attach(app);
+            await app.GetAccountsAsync();
+            using var service = new WorkIqService(NullLogger<WorkIqService>.Instance, cache);
+            var publications = 0;
+            service.AuthStateChanged += (_, _) => publications++;
+            await service.RestoreAsync(_ => Task.FromResult<IPublicClientApplication?>(app), CancellationToken.None);
+            Check.Equal((true, 1L), service.AuthState);
+            Check.Equal(1, publications);
+            Check.True(!service.IsSignInBusy && File.Exists(path));
+            var restored = PublicClientApplicationBuilder.Create(WorkIqService.ClientId).Build();
+            cache.Load(restored);
+            Check.Equal(0, (await restored.GetAccountsAsync()).Count());
+        });
+        yield return ("WorkIQ shutdown cancels an unfinished restore without late publication", async () =>
+        {
+            using var directory = new TemporaryDirectory();
+            var path = Path.Combine(directory.Path, "cache.bin");
+            var cache = new ProtectedWorkIqCache(path);
+            var app = PublicClientApplicationBuilder.Create(WorkIqService.ClientId).Build();
+            cache.Attach(app);
+            await app.GetAccountsAsync();
+            using var service = new WorkIqService(NullLogger<WorkIqService>.Instance, cache);
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var late = new TaskCompletionSource<IPublicClientApplication?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var publications = 0;
+            service.AuthStateChanged += (_, _) => publications++;
+            var pending = service.RestoreAsync(_ => { started.SetResult(); return late.Task; }, CancellationToken.None);
+            try
+            {
+                await started.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                service.Dispose();
+                await Check.ThrowsAsync<WorkIqException>(() => pending.WaitAsync(TimeSpan.FromSeconds(3)));
+                Check.True(service.IsSignInBusy);
+            }
+            finally { late.TrySetResult(app); }
+            while (service.IsSignInBusy) await Task.Yield();
+            Check.True(!service.IsAuthenticated && !File.Exists(path));
+            Check.Equal(0, publications);
         });
         yield return ("WorkIQ signed-out reads never launch a browser or return empty success", async () =>
         {
@@ -951,6 +1200,15 @@ internal static class WorkIqChecks
 
     private static Task Run(Action action) { action(); return Task.CompletedTask; }
 
+    private sealed class RestoreLogger : ILogger<WorkIqService>
+    {
+        public System.Collections.Concurrent.ConcurrentQueue<string> Messages { get; } = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+            Func<TState, Exception?, string> formatter) => Messages.Enqueue(formatter(state, exception));
+    }
+
     private sealed class McpHandler : HttpMessageHandler
     {
         public bool Sse { get; init; }
@@ -978,6 +1236,8 @@ internal static class WorkIqChecks
                 return silent;
             }
             if (Failure == "denied") return new HttpResponseMessage(HttpStatusCode.Forbidden);
+            if (Failure == "busy" || Failure == "busy-once" && Methods.Count == 1)
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable);
             if (method != "initialize")
             {
                 Check.Equal("synthetic-session", request.Headers.GetValues("Mcp-Session-Id").Single());
@@ -1001,7 +1261,13 @@ internal static class WorkIqChecks
                 Check.Equal(1, urls.GetArrayLength());
                 Check.Equal(WorkIqMcpClient.CalendarPath(Now, Now.AddHours(2)), urls[0].GetString());
             }
-            var json = Failure == "rpc" ? JsonSerializer.Serialize(new { jsonrpc = "2.0", id, error = new { code = -32601 } })
+            var json = Failure is "rpc" or "rpc-other"
+                ? JsonSerializer.Serialize(new
+                {
+                    jsonrpc = "2.0",
+                    id,
+                    error = new { code = Failure == "rpc-other" ? -32000 : -32601 }
+                })
                 : JsonSerializer.Serialize(new { jsonrpc = "2.0", id = Failure == "wrong-id" ? -1 : id, result });
             var response = new HttpResponseMessage(HttpStatusCode.OK);
             response.Headers.Add("Mcp-Session-Id", "synthetic-session");

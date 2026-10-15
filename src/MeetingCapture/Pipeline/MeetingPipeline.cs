@@ -1,4 +1,5 @@
 using MeetingCapture.AudioCapture;
+using MeetingCapture.Diagnostics;
 using MeetingCapture.Graph;
 using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
@@ -12,8 +13,10 @@ public sealed class MeetingPipeline : IAsyncDisposable
 {
     private static readonly TimeSpan SaveReviewDuration = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan MeetingEndInactivityWindow = TimeSpan.FromMinutes(2);
+    private static readonly TimeSpan TranscriptionCallTimeout = TimeSpan.FromSeconds(5);
     private const long AudibleRmsSquared = 500L * 500L;
     private readonly object _gate = new();
+    private readonly string? _aiFinalizationLogDirectory;
     private readonly IMeetingDetector _detector;
     private readonly IAudioCapture[] _devices;
     private readonly ITranscriptionService _transcription;
@@ -28,6 +31,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private readonly Func<TimeSpan, CancellationToken, Task> _delay;
     private readonly Func<DateTimeOffset> _getUtcNow;
     private readonly ILogger<MeetingPipeline> _logger;
+    private readonly TimeSpan _transcriptionTimeout;
     private readonly AiUsageMonitor _usage;
     private readonly AiDiagnosticsStream _diagnostics;
     private PipelineStatus _status = new(0, null, PipelineState.Idle, "Ready", null, null, null);
@@ -53,6 +57,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private CancellationTokenSource _exitCancellation = new();
     private bool _preparingExit;
     private Task<ExitReadiness>? _exitTask;
+    private Task? _disposeTask;
     private SaveReview? _saveReview;
     private string? _pendingVisualizationPath;
     private MeetingVisualizationDocument? _pendingVisualizationDocument;
@@ -74,17 +79,34 @@ public sealed class MeetingPipeline : IAsyncDisposable
         public CancellationTokenSource Cancellation { get; } = CancellationTokenSource.CreateLinkedTokenSource(ct);
         public List<TranscriptionSegment> Segments { get; } = [];
         public List<(IAudioCapture Device, EventHandler<AudioDataEventArgs> Handler)> Devices { get; } = [];
+        public List<Task> PendingAudioPushes { get; } = [];
+        public List<Task> PendingTranscriptionOperations { get; } = [];
+        public HashSet<Task> TimedOutAudioPushes { get; } = [];
+        public TaskCompletionSource TranscriptionOperationsSettled { get; set; } = CompletedSignal();
+        public Task AudioPushTail = Task.CompletedTask;
+        public object SegmentPublicationGate { get; } = new();
+        public int NextSegmentPublicationOrdinal = 1;
         public EventHandler<TranscriptionSegment>? FinalHandler;
         public EventHandler<PartialTranscript>? PartialHandler;
-        public bool AcceptCallbacks = true;
+        public volatile bool AcceptCallbacks = true;
         public bool AcceptAudio = true;
         public bool TranscriptionAttempted;
+        public bool AudioDeliveryFailed;
+        public bool TranscriptionStopRequested;
+        public bool AutomaticStopRequested;
         public bool Closed;
         public bool Complete;
         public string? CaptureError;
         public string? TranscriptionFlushWarning;
         public bool EndPromptShown;
         public bool ConfirmedDetection { get; } = confirmedDetection;
+
+        private static TaskCompletionSource CompletedSignal()
+        {
+            var signal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            signal.SetResult();
+            return signal;
+        }
         public DateTimeOffset LastAudibleAudioAt { get; set; } = startedRecordingAt;
         public DateTimeOffset LastTranscriptProgressAt { get; set; } = startedRecordingAt;
         public int LastPartialTranscriptHash { get; set; }
@@ -101,8 +123,11 @@ public sealed class MeetingPipeline : IAsyncDisposable
         Func<DateTimeOffset>? getUtcNow = null,
         AiUsageMonitor? usage = null,
         AiDiagnosticsStream? diagnostics = null,
-        IPendingVisualizationJournal? pendingVisualizationJournal = null)
+        IPendingVisualizationJournal? pendingVisualizationJournal = null,
+        TimeSpan? transcriptionTimeout = null,
+        string? aiFinalizationLogDirectory = null)
     {
+        _aiFinalizationLogDirectory = aiFinalizationLogDirectory;
         _detector = detector;
         _devices = captureDevices.ToArray();
         _transcription = transcription;
@@ -117,6 +142,9 @@ public sealed class MeetingPipeline : IAsyncDisposable
         _logger = logger;
         _usage = usage ?? new AiUsageMonitor();
         _diagnostics = diagnostics ?? new AiDiagnosticsStream();
+        _transcriptionTimeout = transcriptionTimeout ?? TranscriptionCallTimeout;
+        if (_transcriptionTimeout <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(transcriptionTimeout));
         _delay = delay ?? Task.Delay;
         _getUtcNow = getUtcNow ?? (() => DateTimeOffset.UtcNow);
         _detector.MeetingStarted += OnMeetingStarted;
@@ -141,6 +169,26 @@ public sealed class MeetingPipeline : IAsyncDisposable
         _pendingVisualizationPath is null && IsResting(_status.State); } }
     public bool CanStop { get { lock (_gate) return _run is { Closed: false } && _status.State is PipelineState.Starting or PipelineState.Recording; } }
     public bool CanReviewSave { get { lock (_gate) return _saveReview is not null; } }
+    public bool CanForceCloseAfterSavedPartial
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return !_disposed && !_preparingExit && !_preview &&
+                    _status.State == PipelineState.Failed &&
+                    _saveReview is null && _retryTask is not { IsCompleted: false } &&
+                    _stopTask is not { IsCompleted: false } && _startTask.IsCompleted &&
+                    _pendingVisualizationPath is null && !_devices.Any(device => device.IsCapturing) &&
+                    _run is { Closed: true, Complete: false, CaptureError: not null } run &&
+                    _lastCompleted is { IsComplete: false, Segments.Count: > 0 } completed &&
+                    completed.SessionId == run.Session.Id &&
+                    _lastSavedPath is not null &&
+                    string.Equals(_status.NotesPath, _lastSavedPath, StringComparison.OrdinalIgnoreCase) &&
+                    run.PendingTranscriptionOperations.Any(operation => !operation.IsCompleted);
+            }
+        }
+    }
     public bool IsRunning => State == PipelineState.Recording && !_preview;
     public SpeakerResolver SpeakerResolver => _speakerResolver;
     public AiUsageMonitor AiUsage => _usage;
@@ -343,41 +391,64 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 EventHandler<AudioDataEventArgs> handler = (sender, args) =>
                 {
                     var offerStop = false;
+                    Task push;
                     lock (_gate)
                     {
                         if (!ReferenceEquals(sender, device) || !ReferenceEquals(_run, run) || !run.AcceptCallbacks || !run.AcceptAudio)
                             return;
                         offerStop = NoteAudioActivity(run, args);
+                        var pcmData = args.Buffer.AsSpan(0, args.BytesRecorded).ToArray();
+                        push = QueueAudioPush(run, transcription, pcmData, args.BytesRecorded);
                     }
                     if (offerStop)
                         Publish(MeetingEndedWhileRecording, run.Session);
                     try
                     {
-                        // The existing audio worker owns this synchronous SDK write; do not orphan a push task.
-                        transcription.PushAudioAsync(args.Buffer, args.BytesRecorded, CancellationToken.None)
-                            .GetAwaiter().GetResult();
+                        push.WaitAsync(_transcriptionTimeout).GetAwaiter().GetResult();
+                    }
+                    catch (TimeoutException)
+                    {
+                        if (push.IsCompleted)
+                        {
+                            try { push.GetAwaiter().GetResult(); }
+                            catch (Exception ex) { HandleAudioPushFailure(run, transcription, ex); }
+                            return;
+                        }
+                        var requestStop = false;
+                        lock (_gate)
+                        {
+                            if (!ReferenceEquals(_run, run) || run.Closed) return;
+                            run.TimedOutAudioPushes.Add(push);
+                            run.AcceptAudio = false;
+                            run.AudioDeliveryFailed = true;
+                            if (run.CaptureError is null)
+                            {
+                                run.CaptureError =
+                                    "Speech transcription stalled; audio during the stall was not saved, and only the recognized transcript is available.";
+                                if (_status.State is PipelineState.Starting or PipelineState.Recording)
+                                    SetStatus(_status.State, "Speech stalled; stopping to save the recognized transcript.",
+                                        error: run.CaptureError);
+                            }
+                            requestStop = RequestAutomaticStopLocked(run);
+                        }
+                        if (requestStop)
+                            _ = Task.Run(StopAfterTranscriptionFailureAsync);
                     }
                     catch (Exception ex)
                     {
-                        lock (_gate)
-                        {
-                            if (!ReferenceEquals(_run, run) || !run.AcceptAudio) return;
-                            run.AcceptAudio = false;
-                            _logger.LogError("Audio push failed ({ErrorType}).", ex.GetType().Name);
-                            run.CaptureError = transcription.Health.Error ?? "Audio could not be delivered to transcription.";
-                            if (State == PipelineState.Recording)
-                                SetStatus(PipelineState.Recording, "Transcription stopped; stop recording to save.",
-                                    error: run.CaptureError);
-                        }
+                        HandleAudioPushFailure(run, transcription, ex);
                     }
                 };
                 run.Devices.Add((device, handler));
                 device.DataAvailable += handler;
                 await device.StartAsync(run.Cancellation.Token).ConfigureAwait(false);
+                lock (_gate)
+                    if (run.AutomaticStopRequested) return;
             }
             lock (_gate)
             {
                 run.Cancellation.Token.ThrowIfCancellationRequested();
+                if (run.AutomaticStopRequested) return;
                 SetStatus(PipelineState.Recording,
                     run.CaptureError is null ? "Recording" : "Transcription stopped; stop recording to save.",
                     error: run.CaptureError);
@@ -385,6 +456,12 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (run.AutomaticStopRequested)
+            {
+                _logger.LogWarning("Capture startup ended after transcription failure ({ErrorType}).",
+                    ex.GetType().Name);
+                return;
+            }
             await CloseCaptureAsync(run, startupFailed: true).ConfigureAwait(false);
             _detector.Complete(run.Session.Id);
             RecordingStartFailure failure;
@@ -425,6 +502,75 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
+    private Task QueueAudioPush(SessionRun run, ITranscriptionService transcription, byte[] pcmData, int bytesRecorded)
+    {
+        var previous = run.AudioPushTail;
+        var push = Task.Run(async () =>
+        {
+            await previous.ConfigureAwait(false);
+            lock (_gate)
+                if (run.AudioDeliveryFailed) return;
+            try
+            {
+                await transcription.PushAudioAsync(pcmData, bytesRecorded, CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                HandleAudioPushFailure(run, transcription, ex);
+                throw;
+            }
+        });
+        run.AudioPushTail = push;
+        run.PendingAudioPushes.Add(push);
+        TrackPendingTranscriptionOperation(run, push, "audio push", completed =>
+        {
+            run.PendingAudioPushes.Remove(push);
+            var timedOut = run.TimedOutAudioPushes.Remove(push);
+            if (completed.IsFaulted && timedOut)
+                _logger.LogError("Late transcription audio push failed ({ErrorType}).",
+                    completed.Exception!.GetBaseException().GetType().Name);
+            if (completed.IsFaulted && !run.AudioDeliveryFailed)
+                HandleAudioPushFailure(run, _transcription, completed.Exception!.GetBaseException());
+        }, logFailure: false);
+        return push;
+    }
+
+    private void HandleAudioPushFailure(SessionRun run, ITranscriptionService transcription, Exception ex)
+    {
+        lock (_gate)
+            if (!ReferenceEquals(_run, run) || run.Closed || run.AudioDeliveryFailed) return;
+        var error = transcription.Health.Error;
+        var requestStop = false;
+        lock (_gate)
+        {
+            if (!ReferenceEquals(_run, run) || run.Closed || run.AudioDeliveryFailed) return;
+            run.AcceptAudio = false;
+            run.AudioDeliveryFailed = true;
+            run.CaptureError = string.IsNullOrWhiteSpace(error)
+                ? "Audio could not be delivered to transcription."
+                : error;
+            if (_status.State is PipelineState.Starting or PipelineState.Recording)
+            {
+                SetStatus(_status.State, "Transcription failed; stopping to save.",
+                    error: run.CaptureError);
+                requestStop = RequestAutomaticStopLocked(run);
+            }
+        }
+        _logger.LogError("Audio push failed ({ErrorType}).", ex.GetType().Name);
+        if (requestStop)
+            _ = Task.Run(StopAfterTranscriptionFailureAsync);
+    }
+
+    private bool RequestAutomaticStopLocked(SessionRun run)
+    {
+        if (run.AutomaticStopRequested || _stopTask is not null ||
+            _status.State is not (PipelineState.Starting or PipelineState.Recording))
+            return false;
+        run.AutomaticStopRequested = true;
+        return true;
+    }
+
     public Task StopManualAsync()
     {
         lock (_gate)
@@ -433,9 +579,12 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (_run is null || _run.Closed || !_owned || _preview) return Task.CompletedTask;
             var run = _run;
             var startup = _startTask;
+            var preservePartialDuringStartup = run.AutomaticStopRequested &&
+                _status.State == PipelineState.Starting;
             _stopTask = Task.Run(() => StopCoreAsync(run, startup));
             SetStatus(PipelineState.Stopping, "Stopping capture...");
-            run.Cancellation.Cancel();
+            if (!preservePartialDuringStartup)
+                run.Cancellation.Cancel();
             return _stopTask;
         }
     }
@@ -490,22 +639,24 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     path, run.CaptureError);
                 return;
             }
-            if (run.TranscriptionFlushWarning is not null)
+            if (run.TranscriptionFlushWarning is not null && ResourcesStillOwned())
             {
-                Finish(PipelineState.Saved,
+                Finish(PipelineState.Failed,
                     WithVisualizationStatus("Available transcript saved; final speech flush did not complete.", path),
                     path, run.TranscriptionFlushWarning);
                 return;
             }
             try
             {
+                // A stalled final speech flush keeps the recognized text; notes are still generated from it.
                 await GenerateAndSaveAsync(snapshot, path, _exitCancellation.Token, allowPartialSave: true,
-                    completionWarning: run.CaptureError)
+                    completionWarning: run.TranscriptionFlushWarning ?? run.CaptureError)
                     .ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (_exitCancellation.IsCancellationRequested)
             {
-                Finish(PipelineState.Saved, "Transcript saved.", path, run.CaptureError);
+                Finish(PipelineState.Saved, "Transcript saved.", path,
+                    run.TranscriptionFlushWarning ?? run.CaptureError);
             }
         }
         catch (Exception ex)
@@ -534,39 +685,101 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            run.CaptureError = "Audio capture did not stop cleanly.";
+            lock (_gate)
+                run.CaptureError = run.CaptureError is null
+                    ? "Audio capture did not stop cleanly."
+                    : $"{run.CaptureError} Audio capture did not stop cleanly.";
             _logger.LogError("Capture shutdown failed ({ErrorType}).", ex.GetType().Name);
         }
         finally
         {
+            lock (_gate) run.AcceptAudio = false;
             foreach (var (device, handler) in run.Devices) device.DataAvailable -= handler;
         }
-        run.CaptureError ??= DescribeCaptureCompletionWarning(
-            _devices.SelectMany(device => device.Health));
+        var captureWarning = DescribeCaptureCompletionWarning(_devices.SelectMany(device => device.Health));
+        if (captureWarning is not null)
+            lock (_gate)
+                run.CaptureError = run.CaptureError is null
+                    ? captureWarning
+                    : $"{run.CaptureError} {captureWarning}";
         if (!startupFailed) SetStatus(PipelineState.Finalizing, "Flushing final transcript...");
         var flushed = false;
         if (run.TranscriptionAttempted)
         {
-            try
+            Task[] pendingPushes;
+            bool audioDeliveryFailed;
+            lock (_gate)
             {
-                var result = await _transcription.StopAsync(CancellationToken.None).ConfigureAwait(false);
+                pendingPushes = run.PendingAudioPushes.Where(push => !push.IsCompleted).ToArray();
+                audioDeliveryFailed = run.AudioDeliveryFailed;
+            }
+            if (pendingPushes.Length > 0 && !audioDeliveryFailed)
+            {
+                try
+                {
+                    await Task.WhenAll(pendingPushes).WaitAsync(_transcriptionTimeout).ConfigureAwait(false);
+                }
+                catch (TimeoutException)
+                {
+                    MarkAudioDeliveryStalled(run);
+                }
+                catch (Exception ex)
+                {
+                    HandleAudioPushFailure(run, _transcription, ex);
+                }
+            }
+
+            lock (_gate)
+                pendingPushes = run.PendingAudioPushes.Where(push => !push.IsCompleted).ToArray();
+            if (pendingPushes.Length > 0)
+            {
                 lock (_gate)
                 {
-                    // The service result is authoritative, including segments emitted during its flush.
-                    if (result.Segments.Count >= run.Segments.Count)
-                    {
-                        run.Segments.Clear();
-                        run.Segments.AddRange(result.Segments.Select(Enrich));
-                        for (var index = 0; index < run.Segments.Count; index++)
-                            _visualization.AppendOrUpdateSegment(index + 1, run.Segments[index]);
-                    }
+                    run.TranscriptionFlushWarning =
+                        "Final speech flush was deferred until a stalled audio push settles; recognized text was retained.";
+                    run.CaptureError ??= run.TranscriptionFlushWarning;
                 }
-                flushed = true;
+                DeferTranscriptionStop(run, pendingPushes);
+                _logger.LogWarning("Speech finalization was deferred because an audio push is still active.");
             }
-            catch (Exception ex)
+            else
             {
-                run.TranscriptionFlushWarning = "Transcription flush failed; available text was retained.";
-                _logger.LogError("Transcription shutdown failed ({ErrorType}).", ex.GetType().Name);
+                var stopTask = StartTranscriptionStop(run);
+                try
+                {
+                    var result = await stopTask.WaitAsync(_transcriptionTimeout).ConfigureAwait(false);
+                    TranscriptionSegment[]? finalSegments = null;
+                    lock (_gate)
+                    {
+                        // The service result is authoritative, including segments emitted during its flush.
+                        if (!run.Closed && result.Segments.Count >= run.Segments.Count)
+                        {
+                            run.Segments.Clear();
+                            run.Segments.AddRange(result.Segments.Select(Enrich));
+                            finalSegments = run.Segments.ToArray();
+                        }
+                    }
+                    if (finalSegments is not null)
+                        for (var index = 0; index < finalSegments.Length; index++)
+                            _visualization.AppendOrUpdateSegment(index + 1, finalSegments[index]);
+                    flushed = true;
+                }
+                catch (TimeoutException)
+                {
+                    lock (_gate)
+                    {
+                        run.TranscriptionFlushWarning =
+                            "Final speech flush stalled; available recognized text was retained.";
+                        run.CaptureError ??= run.TranscriptionFlushWarning;
+                    }
+                    _logger.LogWarning("Speech finalization timed out; saving the recognized transcript.");
+                }
+                catch (Exception ex)
+                {
+                    lock (_gate)
+                        run.TranscriptionFlushWarning = "Transcription flush failed; available text was retained.";
+                    _logger.LogError("Transcription shutdown failed ({ErrorType}).", ex.GetType().Name);
+                }
             }
         }
         lock (_gate)
@@ -583,6 +796,124 @@ public sealed class MeetingPipeline : IAsyncDisposable
             _lastSavedPath = null;
             run.Cancellation.Cancel();
             run.Cancellation.Dispose();
+        }
+    }
+
+    private void MarkAudioDeliveryStalled(SessionRun run)
+    {
+        lock (_gate)
+        {
+            run.AcceptAudio = false;
+            run.AudioDeliveryFailed = true;
+            run.CaptureError ??=
+                "Speech transcription stalled; audio during the stall was not saved, and only the recognized transcript is available.";
+            foreach (var push in run.PendingAudioPushes.Where(push => !push.IsCompleted))
+                run.TimedOutAudioPushes.Add(push);
+            if (_status.State is PipelineState.Stopping or PipelineState.Finalizing)
+                SetStatus(_status.State, "Speech stalled; saving the recognized transcript.",
+                    error: run.CaptureError);
+        }
+    }
+
+    private Task<TranscriptionResult> StartTranscriptionStop(SessionRun run)
+    {
+        lock (_gate) run.TranscriptionStopRequested = true;
+        var stopTask = Task.Run(() => _transcription.StopAsync(CancellationToken.None));
+        TrackPendingTranscriptionOperation(run, stopTask, "speech shutdown");
+        return stopTask;
+    }
+
+    private void DeferTranscriptionStop(SessionRun run, Task[] pendingPushes)
+    {
+        Task deferredStop;
+        lock (_gate)
+        {
+            if (run.TranscriptionStopRequested) return;
+            run.TranscriptionStopRequested = true;
+            deferredStop = Task.Run(async () =>
+            {
+                try { await Task.WhenAll(pendingPushes).ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Audio delivery ended with {ErrorType}; stopping Speech after it settled.",
+                        ex.GetType().Name);
+                }
+
+                var stopTask = Task.Run(() => _transcription.StopAsync(CancellationToken.None));
+                TrackPendingTranscriptionOperation(run, stopTask, "speech shutdown");
+                try { await stopTask.ConfigureAwait(false); }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning("Deferred Speech shutdown failed ({ErrorType}).", ex.GetType().Name);
+                }
+            });
+        }
+        TrackPendingTranscriptionOperation(run, deferredStop, "deferred speech shutdown");
+    }
+
+    private async Task StopAfterTranscriptionFailureAsync()
+    {
+        try { await StopManualAsync().ConfigureAwait(false); }
+        catch (Exception ex)
+        {
+            _logger.LogError("Fail-fast recording stop failed ({ErrorType}).", ex.GetType().Name);
+        }
+    }
+
+    private void TrackPendingTranscriptionOperation(SessionRun run, Task operation, string name,
+        Action<Task>? onCompleted = null, bool logFailure = true)
+    {
+        lock (_gate)
+        {
+            if (run.PendingTranscriptionOperations.Count == 0)
+                run.TranscriptionOperationsSettled =
+                    new(TaskCreationOptions.RunContinuationsAsynchronously);
+            run.PendingTranscriptionOperations.Add(operation);
+        }
+        ObservePendingTranscriptionOperation(run, operation, name, onCompleted, logFailure);
+    }
+
+    private void ObservePendingTranscriptionOperation(SessionRun run, Task operation, string name,
+        Action<Task>? onCompleted = null, bool logFailure = true)
+    {
+        _ = operation.ContinueWith(completed =>
+        {
+            if (logFailure && completed.IsFaulted)
+                _logger.LogError("Transcription {Operation} failed ({ErrorType}).", name,
+                    completed.Exception!.GetBaseException().GetType().Name);
+            else if (logFailure && completed.IsCanceled)
+                _logger.LogWarning("Transcription {Operation} was canceled.", name);
+
+            lock (_gate)
+            {
+                run.PendingTranscriptionOperations.Remove(operation);
+                onCompleted?.Invoke(completed);
+                if (run.PendingTranscriptionOperations.Count == 0)
+                    run.TranscriptionOperationsSettled.TrySetResult();
+                var wasOwned = _owned;
+                _owned = ResourcesStillOwned();
+                if (wasOwned && !_owned && ReferenceEquals(_run, run) &&
+                    _status.State == PipelineState.Failed)
+                {
+                    var status = _status;
+                    SetStatus(status.State, status.Message, status.NotesPath, status.Error,
+                        status.IntelligenceFailure, status.SessionId, status.SaveDeadline);
+                }
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task WaitForTranscriptionOperationsAsync()
+    {
+        while (true)
+        {
+            Task settled;
+            lock (_gate)
+            {
+                if (_run is not { PendingTranscriptionOperations.Count: > 0 } run) return;
+                settled = run.TranscriptionOperationsSettled.Task;
+            }
+            await settled.ConfigureAwait(false);
         }
     }
 
@@ -724,34 +1055,45 @@ public sealed class MeetingPipeline : IAsyncDisposable
         SetStatus(PipelineState.Generating, "Transcript saved. Generating meeting notes...", path, sessionId: snapshot.SessionId);
         MeetingNotes notes;
         IntelligenceFailure? failure = null;
+        // The final topic-map pass only refines the map built live during recording. Its failure must not
+        // mark the meeting's notes as failed, or every small map validation problem asks the user to Retry AI.
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
         try
         {
             var document = _visualization.Snapshot();
             var result = await _visualizationIntelligence.AnalyzeVisualizationAsync(document, ct)
                 .WaitAsync(ct).ConfigureAwait(false);
+            bool stale;
             lock (_gate)
-                if (_lastCompleted?.SessionId != snapshot.SessionId ||
-                    _lastCompleted.Revision != snapshot.Revision)
-                    throw new OperationCanceledException("Visualization analysis became stale.", ct);
-            _visualization.ApplyAnalysisResult(document, result);
+                stale = _lastCompleted?.SessionId != snapshot.SessionId ||
+                    _lastCompleted.Revision != snapshot.Revision;
+            if (stale)
+                AiFinalizationDiagnostics.Record("final-visualization", "stale-skipped", null,
+                    elapsed.ElapsedMilliseconds, _aiFinalizationLogDirectory);
+            else
+                _visualization.ApplyAnalysisResult(document, result);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
-            failure = FailureFrom(ex, "Visualization analysis failed. Check settings and retry.");
-            _logger.LogWarning("Visualization analysis failed ({ErrorType}); preserving grounded transcript data.",
+            AiFinalizationDiagnostics.Record("final-visualization", "kept-live-map", ex,
+                elapsed.ElapsedMilliseconds, _aiFinalizationLogDirectory);
+            _logger.LogWarning("Final topic map update failed ({ErrorType}); keeping the live topic map.",
                 ex.GetType().Name);
         }
+        elapsed.Restart();
         try
         {
             var generated = await _intelligence.SynthesizeAsync(snapshot.Title, snapshot.ToTranscriptionResult(), ct)
                 .WaitAsync(ct).ConfigureAwait(false);
             notes = CreateNotes(snapshot, generated, failure);
         }
-        catch (OperationCanceledException) { throw; }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             failure ??= FailureFrom(ex, "Note generation failed. Check settings and retry.");
+            AiFinalizationDiagnostics.Record("final-notes", "retry-available", ex,
+                elapsed.ElapsedMilliseconds, _aiFinalizationLogDirectory);
             _logger.LogWarning("Note generation failed ({ErrorType}); preserving transcript.", ex.GetType().Name);
             notes = CreateNotes(snapshot, PreservedNotes(snapshot), failure);
         }
@@ -774,6 +1116,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             _logger.LogWarning(
                 "Generated notes could not be saved ({ErrorType}); preserving the durable transcript for retry.",
                 ex.GetType().Name);
+            AiFinalizationDiagnostics.Record("final-save", "retry-available", ex, 0, _aiFinalizationLogDirectory);
             _diagnostics.RecordPersistence(
                 AiDiagnosticStage.GeneratedMarkdownRewrite,
                 ex,
@@ -815,8 +1158,12 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private async Task<string> PersistNotesAsync(
         TranscriptSnapshot snapshot, MeetingNotes notes, CancellationToken ct)
     {
-        var path = await _storage.SaveAsync(notes, ct).ConfigureAwait(false);
         var document = _visualization.Snapshot();
+        var persistedNotes = CreateNotes(snapshot, notes, notes.IntelligenceFailure);
+        persistedNotes.TopicNotes.Clear();
+        persistedNotes.TopicNotes.AddRange(MeetingTopicNotesBuilder.Build(document));
+        var cachedNotes = CreateNotes(snapshot, persistedNotes, persistedNotes.IntelligenceFailure);
+        var path = await _storage.SaveAsync(persistedNotes, ct).ConfigureAwait(false);
         var retryingPendingVisualization = false;
         lock (_gate)
         {
@@ -824,7 +1171,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 throw new InvalidOperationException("Notes storage changed the completed session's stable path.");
             retryingPendingVisualization = _pendingVisualizationPath is not null &&
                 string.Equals(_pendingVisualizationPath, path, StringComparison.OrdinalIgnoreCase);
-            _lastSavedNotes = CreateNotes(snapshot, notes, notes.IntelligenceFailure);
+            _lastSavedNotes = cachedNotes;
             _lastSavedPath = path;
             _pendingVisualizationPath = path;
             _pendingVisualizationDocument = document;
@@ -878,6 +1225,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         };
         if (generated is not null)
         {
+            notes.TopicNotes.AddRange(generated.TopicNotes);
             notes.Decisions.AddRange(generated.Decisions);
             notes.ActionItems.AddRange(generated.ActionItems);
             notes.Topics.AddRange(generated.Topics);
@@ -970,19 +1318,51 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private void AcceptSegment(SessionRun run, TranscriptionSegment segment)
     {
+        TranscriptionSegment enriched;
+        SessionTranscriptSegment update;
+        int ordinal;
         lock (_gate)
         {
             if (!ReferenceEquals(_run, run) || !run.AcceptCallbacks) return;
             run.LastTranscriptProgressAt = _getUtcNow();
-            if (!string.IsNullOrWhiteSpace(segment.SpeakerId))
-            {
-                _speakerResolver.NotifySpeaker(segment.SpeakerId);
-            }
-            var enriched = Enrich(segment);
+            enriched = segment;
             run.Segments.Add(enriched);
-            _visualization.AppendOrUpdateSegment(run.Segments.Count, enriched);
-            Publish(TranscriptSegmentReceived, new SessionTranscriptSegment(run.Session.Id, run.Segments.Count, enriched));
+            ordinal = run.Segments.Count;
         }
+
+        lock (run.SegmentPublicationGate)
+        {
+            while (ordinal != run.NextSegmentPublicationOrdinal)
+                Monitor.Wait(run.SegmentPublicationGate);
+            try
+            {
+                if (!IsCurrentRunAcceptingCallbacks(run)) return;
+                if (!string.IsNullOrWhiteSpace(segment.SpeakerId))
+                    _speakerResolver.NotifySpeaker(segment.SpeakerId);
+                lock (_gate)
+                {
+                    if (!ReferenceEquals(_run, run) || !run.AcceptCallbacks) return;
+                    enriched = Enrich(segment);
+                    run.Segments[ordinal - 1] = enriched;
+                    update = new SessionTranscriptSegment(run.Session.Id, ordinal, enriched);
+                }
+                if (!_visualization.TryAppendOrUpdateSegment(
+                        run.Session.Id, ordinal, enriched, () => IsCurrentRunAcceptingCallbacks(run)))
+                    return;
+                if (!IsCurrentRunAcceptingCallbacks(run)) return;
+                Publish(TranscriptSegmentReceived, update);
+            }
+            finally
+            {
+                run.NextSegmentPublicationOrdinal++;
+                Monitor.PulseAll(run.SegmentPublicationGate);
+            }
+        }
+    }
+
+    private bool IsCurrentRunAcceptingCallbacks(SessionRun run)
+    {
+        return ReferenceEquals(Volatile.Read(ref _run), run) && run.AcceptCallbacks;
     }
 
     private void NotePartialTranscriptProgress(SessionRun run, PartialTranscript partial)
@@ -1031,6 +1411,16 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private void OnSpeakerResolved(object? sender, SpeakerResolvedEventArgs args)
     {
+        lock (_gate)
+        {
+            if (_run is { Closed: false } run)
+            {
+                for (var index = 0; index < run.Segments.Count; index++)
+                    if (string.Equals(run.Segments[index].SpeakerId, args.SpeakerId,
+                            StringComparison.OrdinalIgnoreCase))
+                        run.Segments[index] = Enrich(run.Segments[index]);
+            }
+        }
         try
         {
             if (_visualization.HasActiveSession)
@@ -1125,13 +1515,15 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (_owned)
             {
                 state = PipelineState.Failed;
-                error = "Capture resources could not be released. Restart the application before recording again.";
+                error ??= "Capture resources could not be released. Restart the application before recording again.";
             }
             SetStatus(state, message, path, error, intelligenceFailure);
         }
     }
 
-    private bool ResourcesStillOwned() => _devices.Any(d => d.IsCapturing) || _transcription.HasActiveResources;
+    private bool ResourcesStillOwned() =>
+        _devices.Any(d => d.IsCapturing) || _transcription.HasActiveResources ||
+        (_run?.PendingTranscriptionOperations.Any(operation => !operation.IsCompleted) ?? false);
 
     private void SetStatus(PipelineState state, string message, string? path = null, string? error = null,
         IntelligenceFailure? intelligenceFailure = null, string? sessionId = null,
@@ -1304,30 +1696,43 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    public ValueTask DisposeAsync()
     {
         lock (_gate)
         {
-            if (_disposed) return;
+            if (_disposeTask is { IsCompleted: false } pending) return new(pending);
+            if (_disposed) return ValueTask.CompletedTask;
             _disposed = true;
+            _disposeTask = DisposeCoreAsync();
+            return new(_disposeTask);
         }
+    }
+
+    private async Task DisposeCoreAsync()
+    {
         _detector.MeetingStarted -= OnMeetingStarted;
         _detector.MeetingEnded -= OnMeetingEnded;
         _speakerResolver.SpeakerResolved -= OnSpeakerResolved;
+        Exception? stopFailure = null;
         try
         {
             await StopOwnedOperationsAsync().ConfigureAwait(false);
         }
-        finally
+        catch (Exception ex)
         {
-            _diagnostics.Clear();
-            List<Exception> errors = [];
-            try { await _transcription.DisposeAsync().ConfigureAwait(false); }
-            catch (Exception ex) { errors.Add(ex); }
-            foreach (var device in _devices)
-                try { device.Dispose(); }
-                catch (Exception ex) { errors.Add(ex); }
-            if (errors.Count > 0) throw new AggregateException("Pipeline resources failed to dispose cleanly.", errors);
+            stopFailure = ex;
         }
+        await WaitForTranscriptionOperationsAsync().ConfigureAwait(false);
+        _diagnostics.Clear();
+        List<Exception> errors = [];
+        if (stopFailure is not null) errors.Add(stopFailure);
+        try { await _transcription.DisposeAsync().ConfigureAwait(false); }
+        catch (Exception ex) { errors.Add(ex); }
+        foreach (var device in _devices)
+            try { device.Dispose(); }
+            catch (Exception ex) { errors.Add(ex); }
+        if (errors.Count == 1 && stopFailure is not null)
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopFailure).Throw();
+        if (errors.Count > 0) throw new AggregateException("Pipeline resources failed to dispose cleanly.", errors);
     }
 }

@@ -11,6 +11,18 @@ public sealed class WorkIqConnectionStatus
     public static (bool SignIn, bool SignOut, bool Cancel) Actions(bool authenticated, bool busy, bool pending)
         => (!authenticated && !busy, authenticated && !busy, pending);
 
+    public WorkIqControlState Controls(bool authenticated, bool signInBusy, bool pending,
+        bool cancelling, bool restoring)
+        => new(
+            Actions(authenticated, signInBusy || pending, pending),
+            pending && !cancelling,
+            restoring ? "Restoring WorkIQ..."
+                : cancelling ? "Cancelling sign-in..." : "WorkIQ sign-in in progress",
+            restoring ? "Restoring only this app's protected WorkIQ sign-in..."
+                : signInBusy && !pending
+                    ? Message + " Waiting for authentication cleanup; recording is available."
+                    : Message);
+
     public bool AuthenticationChanged(bool authenticated, long revision)
     {
         if (revision <= _authRevision) return false;
@@ -53,3 +65,9 @@ public sealed class WorkIqConnectionStatus
         => SetMessage("WorkIQ calendar refresh failed: " + detail +
             (LastSuccessfulRefresh is { } at ? $" Last successful refresh {at.LocalDateTime:t}." : ""));
 }
+
+public readonly record struct WorkIqControlState(
+    (bool SignIn, bool SignOut, bool Cancel) Actions,
+    bool CancelEnabled,
+    string ProgressText,
+    string StateText);

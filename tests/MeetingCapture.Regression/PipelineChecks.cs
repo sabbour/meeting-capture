@@ -1,4 +1,5 @@
 using MeetingCapture.AudioCapture;
+using MeetingCapture.Diagnostics;
 using MeetingCapture.Intelligence;
 using MeetingCapture.MeetingDetection;
 using MeetingCapture.Pipeline;
@@ -12,6 +13,8 @@ internal static class PipelineChecks
     public static IEnumerable<(string, Func<Task>)> Cases()
     {
         yield return ("pipeline start/stop/finalization share exclusive ownership", ExclusiveLifecycle);
+        yield return ("pipeline serializes and drains all accepted audio before finalization", AcceptedAudioDrainsBeforeStop);
+        yield return ("pipeline push completion near its deadline remains owned through Stop", AudioPushDeadlineRace);
         yield return ("pipeline discard wins before persistence and skips synthesis", DiscardBeforeSave);
         yield return ("pipeline Save now persists immediately and only once", SaveNow);
         yield return ("pipeline review timeout automatically saves", TimedAutoSave);
@@ -22,12 +25,17 @@ internal static class PipelineChecks
         yield return ("pipeline stop during startup cancels and rolls back", StopDuringStartup);
         yield return ("pipeline each startup failure rolls back and permits retry", StartupFailures);
         yield return ("pipeline final flush persists all 1,201 segments and ignores stale callbacks", FinalFlushAndStaleEvents);
+        yield return ("pipeline transcript subscribers do not hold the lifecycle gate", TranscriptSubscribersDoNotHoldLifecycleGate);
+        yield return ("pipeline publishes concurrent final segments in accepted order", SegmentPublicationsStayOrdered);
+        yield return ("pipeline bounds stalled audio, saves partial transcript, and retains native ownership", StalledPushSavesPartialAndRetainsOwnership);
         yield return ("pipeline AI failure keeps durable transcript and stable retry output", IntelligenceFailureAndRetry);
+        yield return ("pipeline final map failure keeps generated notes and logs metadata only", FinalVisualizationFailureKeepsNotes);
         yield return ("pipeline post-synthesis Markdown failure remains a retryable partial save", PostSynthesisMarkdownFailure);
         yield return ("pipeline failed AI retry preserves defensive copy of all prior notes", PreservePriorSynthesis);
         yield return ("pipeline canceled or storage-failed retry preserves prior successful output", PreservePriorSynthesisOnInterruptedRetry);
         yield return ("pipeline retry cancellation releases gate and retains transcript", RetryCancellation);
         yield return ("pipeline disposal waits for owned retry before releasing services", DisposeDuringRetry);
+        yield return ("pipeline disposal waits for timed-out speech shutdown", DisposeDuringTimedOutSpeechShutdown);
         yield return ("pipeline disposal after canceled or failed retry does not replay historical faults", DisposeAfterRetryFailure);
         yield return ("pipeline disposal still reports new service and device cleanup failures", NewDisposalFailures);
         yield return ("pipeline storage failure retains completed transcript for retry", StorageFailure);
@@ -47,8 +55,10 @@ internal static class PipelineChecks
         yield return ("pipeline detection notification does not hold lifecycle lock across UI dispatch", DetectionDispatch);
         yield return ("pipeline ten synthetic sessions detach all per-session handlers", TenCycles);
         yield return ("pipeline audio preview starts no transcription and hands off ownership", AudioPreview);
-        yield return ("pipeline push exception saves an incomplete transcript after resources release", PushFailure);
+        yield return ("pipeline push failure stops capture and saves the incomplete transcript", PushFailure);
+        yield return ("pipeline Speech failure during startup preserves and saves recognized text", PushFailureDuringStartup);
         yield return ("pipeline repeated partial captions never become finalized speaker content", PartialCaptions);
+        yield return ("pipeline applies synchronous speaker resolution before publishing final segment", SyncSpeakerResolution);
         yield return ("pipeline does not infer speaker identity from nearby microphone activity", NoMicIdentityGuess);
         yield return ("terminal recording status releases safe navigation before notification and retains transcript", TerminalNavigation);
         yield return ("exit cancels optional synthesis after durable transcript and tolerates repeated requests", ExitDuringSynthesis);
@@ -222,11 +232,23 @@ internal static class PipelineChecks
             if (!withSpeech)
                 Check.Equal("Transcript saved; no speech was recognized.", f.Pipeline.Status.Message);
             Check.True(File.Exists(f.Storage.Paths[0]));
+            var savedPath = f.Storage.Paths[0];
+            var savedText = await File.ReadAllTextAsync(savedPath);
             Check.True(ReferenceEquals(completed, f.Pipeline.LastCompletedTranscript));
             await f.Pipeline.StartManualAsync("Synthetic next recording", CancellationToken.None);
             Check.True(f.Pipeline.CanStop && !f.Pipeline.CanStart);
+            Check.True(f.Pipeline.CurrentSessionId != completed.SessionId);
+            Check.Equal(0, f.Pipeline.CurrentTranscript!.Segments.Count);
+            Check.Equal(0, f.Visualization.Snapshot().Segments.Count);
+            Check.Equal(0, f.Visualization.Snapshot().TopicClusters.Count);
+            Check.Equal(0, f.Visualization.Snapshot().Questions.Count);
+            Check.True(ReferenceEquals(completed, f.Pipeline.LastCompletedTranscript));
+            f.Transcription.Emit("Only the second synthetic recording");
             await f.Pipeline.StopManualAsync();
             Check.True(f.Pipeline.CanStart);
+            Check.Equal("Only the second synthetic recording", f.Pipeline.LastCompletedTranscript!.FullText);
+            Check.Equal(savedText, await File.ReadAllTextAsync(savedPath));
+            Check.Equal(2, f.Storage.Paths.Distinct().Count());
         }
     }
 
@@ -246,6 +268,31 @@ internal static class PipelineChecks
         Check.Equal("Synthetic remote speech", afterRename.Text);
         Check.Equal("Guest-1", beforeRename.SpeakerDisplayName);
         await f.Pipeline.StopManualAsync();
+    }
+
+    private static async Task SyncSpeakerResolution()
+    {
+        await using var f = new PipelineFixture();
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+                f.Pipeline.SaveNow(sessionId);
+        };
+        f.Pipeline.SpeakerResolver.UnknownSpeakerDetected += (_, speakerId) =>
+            f.Pipeline.SpeakerResolver.Resolve(speakerId, "Synthetic resolved speaker");
+        SessionTranscriptSegment? published = null;
+        f.Pipeline.TranscriptSegmentReceived += (_, update) => published = update;
+
+        await f.Pipeline.StartManualAsync("Synthetic synchronous resolution", CancellationToken.None);
+        f.Transcription.Emit("Resolved before publishing");
+
+        Check.Equal("Synthetic resolved speaker",
+            f.Pipeline.CurrentTranscript!.Segments.Single().SpeakerDisplayName);
+        Check.Equal("Synthetic resolved speaker", published!.Segment.SpeakerDisplayName);
+        Check.Equal("Synthetic resolved speaker", f.Visualization.Snapshot().Speakers.Single().DisplayName);
+        await f.Pipeline.StopManualAsync();
+        Check.Equal("Synthetic resolved speaker",
+            f.Pipeline.LastCompletedTranscript!.Segments.Single().SpeakerDisplayName);
     }
 
     private static async Task ExitDuringSynthesis()
@@ -443,6 +490,42 @@ internal static class PipelineChecks
         await f.Pipeline.StopManualAsync();
         Check.Equal(1, f.Pipeline.LastCompletedTranscript!.Segments.Count);
         Check.Equal(1201, completed.Segments.Count);
+    }
+
+    private static async Task FinalVisualizationFailureKeepsNotes()
+    {
+        foreach (var error in new Exception[]
+        {
+            new InvalidOperationException("synthetic map validation secret"),
+            IntelligenceErrors.Create(IntelligenceFailureKind.Timeout, "github", "synthetic-model")
+        })
+        {
+            await using var f = new PipelineFixture();
+            await f.Pipeline.StartManualAsync("Synthetic map failure", CancellationToken.None);
+            f.Transcription.Emit("SYNTHETIC PRIVATE TRANSCRIPT");
+            f.Intelligence.VisualizationFailure = error;
+            await f.Pipeline.StopManualAsync();
+
+            Check.Equal(PipelineState.Saved, f.Pipeline.State);
+            Check.True(f.Pipeline.Status.IntelligenceFailure is null);
+            Check.Equal("Synthetic generated summary", f.Storage.Writes.Last().Summary);
+            Check.True(f.Storage.Writes.Last().IntelligenceFailure is null);
+            Check.True((await File.ReadAllTextAsync(f.Pipeline.Status.NotesPath!))
+                .Contains("Synthetic generated summary", StringComparison.Ordinal));
+
+            var log = await File.ReadAllTextAsync(Path.Combine(f.AiLogDirectory, AiFinalizationDiagnostics.FileName));
+            Check.True(log.Contains("stage=final-visualization outcome=kept-live-map", StringComparison.Ordinal));
+            Check.True(log.Contains($"type={error.GetType().Name}", StringComparison.Ordinal));
+            Check.True(!log.Contains("SYNTHETIC PRIVATE TRANSCRIPT", StringComparison.Ordinal));
+            Check.True(!log.Contains("secret", StringComparison.OrdinalIgnoreCase));
+            Check.True(f.Pipeline.CanStart);
+        }
+
+        var line = AiFinalizationDiagnostics.Format("unexpected-stage", "unexpected-outcome",
+            new HttpRequestException("synthetic secret", null, System.Net.HttpStatusCode.BadGateway), -5);
+        Check.True(line.Contains("stage=final outcome=failed kind=Unknown type=HttpRequestException http=502 elapsedMs=0",
+            StringComparison.Ordinal));
+        Check.True(!line.Contains("secret", StringComparison.Ordinal));
     }
 
     private static async Task IntelligenceFailureAndRetry()
@@ -647,6 +730,319 @@ internal static class PipelineChecks
         }
     }
 
+    private static async Task TranscriptSubscribersDoNotHoldLifecycleGate()
+    {
+        await using var f = new PipelineFixture();
+        await f.Pipeline.StartManualAsync("Synthetic subscriber gate", CancellationToken.None);
+
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Visualization.Changed += (_, _) =>
+        {
+            entered.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        };
+
+        var emit = Task.Run(() => f.Transcription.Emit("Synthetic transcript"));
+        try
+        {
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            Check.True(await Task.Run(() => f.Pipeline.CanStop).WaitAsync(TimeSpan.FromSeconds(1)));
+            await Task.Run(() => f.Capture.EmitAudio()).WaitAsync(TimeSpan.FromSeconds(1));
+            Check.Equal(1, f.Transcription.Pushes);
+        }
+        finally
+        {
+            release.TrySetResult();
+        }
+
+        await emit;
+        await f.Pipeline.StopManualAsync();
+        Check.Equal(PipelineState.Saved, f.Pipeline.State);
+    }
+
+    private static async Task AcceptedAudioDrainsBeforeStop()
+    {
+        var secondCapture = new FakeCapture { Source = "loopback" };
+        await using var f = new PipelineFixture(secondCapture,
+            transcriptionTimeout: TimeSpan.FromSeconds(2));
+        var pushGate = new AsyncGate();
+        f.Transcription.OnPushAudio = pushGate.WaitAsync;
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+                f.Pipeline.SaveNow(sessionId);
+        };
+        long bytesAtStop = -1;
+        f.Transcription.OnStop = _ =>
+        {
+            bytesAtStop = f.Transcription.TotalAudioBytesReceived;
+            return Task.CompletedTask;
+        };
+        await f.Pipeline.StartManualAsync("Synthetic queued audio", CancellationToken.None);
+
+        var firstFrame = new byte[] { 1, 2 };
+        var secondFrame = new byte[] { 3, 4 };
+        var firstEmit = Task.Run(() => f.Capture.EmitAudio(firstFrame));
+        var pushesWhileBlocked = 0;
+        var stopsWhileBlocked = 0;
+        try
+        {
+            await pushGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+            var secondEmit = Task.Run(() => secondCapture.EmitAudio(secondFrame));
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            pushesWhileBlocked = f.Transcription.Pushes;
+            var stop = f.Pipeline.StopManualAsync();
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            stopsWhileBlocked = f.Transcription.Stops;
+
+            pushGate.Release();
+            await Task.WhenAll(firstEmit, secondEmit).WaitAsync(TimeSpan.FromSeconds(2));
+            await stop.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            pushGate.Release();
+        }
+
+        Check.Equal(1, pushesWhileBlocked);
+        Check.Equal(0, stopsWhileBlocked);
+        Check.Equal(4L, bytesAtStop);
+        Check.Equal(4L, f.Transcription.TotalAudioBytesReceived);
+        Check.Equal(2, f.Transcription.AudioFrames.Count);
+        Check.True(f.Transcription.AudioFrames[0].SequenceEqual(new byte[] { 1, 2 }));
+        Check.True(f.Transcription.AudioFrames[1].SequenceEqual(new byte[] { 3, 4 }));
+        Check.True(f.Pipeline.CanStart);
+    }
+
+    private static async Task SegmentPublicationsStayOrdered()
+    {
+        await using var f = new PipelineFixture();
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+                f.Pipeline.SaveNow(sessionId);
+        };
+        await f.Pipeline.StartManualAsync("Synthetic ordered segments", CancellationToken.None);
+        var visualGate = new AsyncGate();
+        var changeCount = 0;
+        f.Visualization.Changed += (_, _) =>
+        {
+            if (Interlocked.Increment(ref changeCount) == 1)
+                visualGate.WaitAsync(CancellationToken.None).GetAwaiter().GetResult();
+        };
+        var ordinals = new List<int>();
+        f.Pipeline.TranscriptSegmentReceived += (_, update) =>
+        {
+            lock (ordinals) ordinals.Add((int)update.Revision);
+        };
+        var final = f.Transcription.CaptureFinalHandlers()!;
+        var first = Task.Run(() => final(f.Transcription,
+            new TranscriptionSegment("Ordered first", DateTimeOffset.UtcNow)));
+        try
+        {
+            await visualGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+            var second = Task.Run(() => final(f.Transcription,
+                new TranscriptionSegment("Ordered second", DateTimeOffset.UtcNow)));
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            var currentSegments = f.Pipeline.CurrentTranscript!.Segments.Count;
+            var canStop = await Task.Run(() => f.Pipeline.CanStop).WaitAsync(TimeSpan.FromSeconds(1));
+            visualGate.Release();
+            await second.WaitAsync(TimeSpan.FromSeconds(1));
+            Check.Equal(2, currentSegments);
+            Check.True(canStop);
+        }
+        finally
+        {
+            visualGate.Release();
+        }
+        await first.WaitAsync(TimeSpan.FromSeconds(1));
+        Check.True(ordinals.SequenceEqual(new[] { 1, 2 }));
+        await f.Pipeline.StopManualAsync();
+    }
+
+    private static async Task AudioPushDeadlineRace()
+    {
+        const int timeoutMilliseconds = 100;
+        await using var f = new PipelineFixture(
+            transcriptionTimeout: TimeSpan.FromMilliseconds(timeoutMilliseconds));
+        var pushGate = new AsyncGate();
+        f.Transcription.OnPushAudio = pushGate.WaitAsync;
+        var review = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+            {
+                review.TrySetResult(sessionId);
+                Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+                f.Pipeline.SaveNow(sessionId);
+            }
+        };
+        long bytesAtStop = -1;
+        var pushesSettledAtStop = false;
+        f.Transcription.OnStop = _ =>
+        {
+            bytesAtStop = f.Transcription.TotalAudioBytesReceived;
+            pushesSettledAtStop = f.Transcription.PushesSettled.IsCompleted;
+            return Task.CompletedTask;
+        };
+        await f.Pipeline.StartManualAsync("Synthetic deadline race", CancellationToken.None);
+        var emit = Task.Run(() => f.Capture.EmitAudio([5, 6]));
+        await pushGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+        var releaseNearDeadline = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(timeoutMilliseconds));
+            pushGate.Release();
+        });
+        var stop = f.Pipeline.StopManualAsync();
+        await Task.WhenAll(emit, releaseNearDeadline).WaitAsync(TimeSpan.FromSeconds(2));
+        var sessionId = await review.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        await stop.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Check.Equal(sessionId, f.Pipeline.LastCompletedTranscript!.SessionId);
+        Check.Equal(1, f.Transcription.Pushes);
+        Check.Equal(1, f.Transcription.Stops);
+        Check.Equal(2L, bytesAtStop);
+        Check.Equal(2L, f.Transcription.TotalAudioBytesReceived);
+        Check.True(pushesSettledAtStop);
+        Check.True(f.Pipeline.CanStart);
+    }
+
+    private static async Task StalledPushSavesPartialAndRetainsOwnership()
+    {
+        await using var f = new PipelineFixture(transcriptionTimeout: TimeSpan.FromMilliseconds(80));
+        var pushGate = new AsyncGate();
+        var stopGate = new AsyncGate();
+        var stopStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var review = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var canStart = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Transcription.OnPushAudio = pushGate.WaitAsync;
+        f.Transcription.PushFailure = new IOException("Synthetic late push failure");
+        f.Transcription.OnStop = ct =>
+        {
+            stopStarted.TrySetResult();
+            return stopGate.WaitAsync(ct);
+        };
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+            {
+                review.TrySetResult(sessionId);
+                Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+                f.Pipeline.SaveNow(sessionId);
+            }
+            if (f.Pipeline.CanStart) canStart.TrySetResult();
+        };
+        try
+        {
+            await f.Pipeline.StartManualAsync("Synthetic stalled speech", CancellationToken.None);
+            f.Transcription.Emit("Recognized before stall");
+            var staleFinal = f.Transcription.CaptureFinalHandlers()!;
+            var frame = new byte[] { 17, 34 };
+            var emit = Task.Run(() => f.Capture.EmitAudio(frame));
+            await pushGate.Entered.WaitAsync(TimeSpan.FromSeconds(1));
+            await emit.WaitAsync(TimeSpan.FromSeconds(1));
+            frame[0] = 99;
+            frame[1] = 100;
+
+            var sessionId = await review.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await f.Pipeline.StopManualAsync().WaitAsync(TimeSpan.FromSeconds(2));
+            var stopStartedBeforePushSettled = stopStarted.Task.IsCompleted;
+            var completed = f.Pipeline.LastCompletedTranscript!;
+            Check.Equal(sessionId, completed.SessionId);
+            Check.Equal(1, completed.Segments.Count);
+            Check.True(completed.FullText.Contains("Recognized before stall"));
+            Check.True(!completed.IsComplete);
+            Check.True(f.Pipeline.Status.Error?.Contains("Speech transcription stalled", StringComparison.Ordinal) == true);
+            Check.True(!f.Capture.IsCapturing);
+            Check.Equal(1, f.Transcription.Pushes);
+            Check.True(!f.Pipeline.CanStart);
+            Check.True(File.Exists(f.Pipeline.Status.NotesPath));
+            Check.True(f.Pipeline.CanForceCloseAfterSavedPartial);
+
+            staleFinal(f.Transcription,
+                new TranscriptionSegment("Late result after close", DateTimeOffset.UtcNow));
+            Check.Equal(1, f.Pipeline.LastCompletedTranscript!.Segments.Count);
+
+            pushGate.Release();
+            await stopStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Check.True(!stopStartedBeforePushSettled);
+            Check.Equal(1, f.Transcription.AudioFrames.Count);
+            Check.True(f.Transcription.AudioFrames[0].SequenceEqual(new byte[] { 17, 34 }));
+            Check.True(!f.Pipeline.CanStart);
+
+            f.Transcription.Emit("Late SDK result");
+            stopGate.Release();
+            await f.Transcription.StopCompleted.WaitAsync(TimeSpan.FromSeconds(2));
+            await canStart.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            Check.True(f.Pipeline.CanStart);
+            Check.Equal(1, f.Pipeline.LastCompletedTranscript!.Segments.Count);
+
+            await f.Pipeline.StartManualAsync("Synthetic next session", CancellationToken.None);
+            var delivered = 0;
+            f.Pipeline.TranscriptSegmentReceived += (_, _) => delivered++;
+            staleFinal(f.Transcription,
+                new TranscriptionSegment("Stale result in next session", DateTimeOffset.UtcNow));
+            Check.Equal(0, delivered);
+            Check.Equal(0, f.Pipeline.CurrentTranscript!.Segments.Count);
+            await f.Pipeline.StopManualAsync();
+            Check.True(f.Pipeline.CanStart);
+            Check.True(!f.Pipeline.CanForceCloseAfterSavedPartial);
+            await f.Pipeline.PrepareForExitAsync();
+        }
+        finally
+        {
+            pushGate.Release();
+            stopGate.Release();
+        }
+    }
+
+    private static async Task DisposeDuringTimedOutSpeechShutdown()
+    {
+        await using var f = new PipelineFixture(transcriptionTimeout: TimeSpan.FromMilliseconds(80));
+        var stopGate = new AsyncGate();
+        var stopStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var review = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Transcription.OnStop = ct =>
+        {
+            stopStarted.TrySetResult();
+            return stopGate.WaitAsync(ct);
+        };
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+            {
+                review.TrySetResult(sessionId);
+                f.Pipeline.SaveNow(sessionId);
+            }
+        };
+        try
+        {
+            await f.Pipeline.StartManualAsync("Synthetic shutdown", CancellationToken.None);
+            f.Transcription.Emit("Recognized before shutdown");
+            var stop = f.Pipeline.StopManualAsync();
+            await stopStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+            var sessionId = await review.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            await stop.WaitAsync(TimeSpan.FromSeconds(2));
+            Check.Equal(sessionId, f.Pipeline.LastCompletedTranscript!.SessionId);
+
+            var exit = f.Pipeline.PrepareForExitAsync();
+            await Check.ThrowsAsync<InvalidOperationException>(() => exit);
+            var dispose = f.Pipeline.DisposeAsync().AsTask();
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            var disposalWaitedForSpeech = !dispose.IsCompleted && f.Transcription.Disposals == 0;
+
+            stopGate.Release();
+            await dispose.WaitAsync(TimeSpan.FromSeconds(2));
+            Check.True(disposalWaitedForSpeech);
+            Check.Equal(1, f.Transcription.Disposals);
+        }
+        finally
+        {
+            stopGate.Release();
+        }
+    }
+
     private static async Task RetryCancellation()
     {
         await using var f = new PipelineFixture();
@@ -774,7 +1170,8 @@ internal static class PipelineChecks
         Check.Equal("Synthetic available text", f.Pipeline.LastCompletedTranscript.FullText);
         Check.Equal("Transcription flush failed; available text was retained.", f.Pipeline.Status.Error);
         Check.True((await File.ReadAllTextAsync(f.Pipeline.Status.NotesPath!)).Contains("Synthetic available text"));
-        Check.Equal(0, f.Intelligence.Calls);
+        Check.Equal(1, f.Intelligence.Calls);
+        Check.Equal("Synthetic available text", f.Intelligence.Inputs.Single().FullText);
         AssertDetached(f);
         await f.Pipeline.StartManualAsync("Synthetic recording after flush warning", CancellationToken.None);
         await f.Pipeline.StopManualAsync();
@@ -1151,22 +1548,74 @@ internal static class PipelineChecks
     private static async Task PushFailure()
     {
         await using var f = new PipelineFixture();
+        var saved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+                f.Pipeline.SaveNow(sessionId);
+            if (status.State == PipelineState.Saved)
+                saved.TrySetResult();
+        };
         await f.Pipeline.StartManualAsync("Synthetic push failure", CancellationToken.None);
         f.Transcription.Emit("Synthetic before fault");
         f.Transcription.PushFailure = new IOException("Synthetic push fault");
+        f.Transcription.HealthError = "Speech rejected audio (synthetic).";
         f.Capture.EmitAudio();
-        Check.True(f.Pipeline.Status.Error is not null);
-        Check.True(f.Pipeline.CanStop);
+        await saved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Check.Equal(PipelineState.Saved, f.Pipeline.State);
+        Check.Equal("Speech rejected audio (synthetic).", f.Pipeline.Status.Error);
+        Check.True(!f.Capture.IsCapturing);
+        Check.Equal(1, f.Capture.Stops);
         var pushes = f.Transcription.Pushes;
         for (var i = 0; i < 10; i++) f.Capture.EmitAudio();
         Check.Equal(pushes, f.Transcription.Pushes);
         f.Transcription.Emit("Synthetic after fault");
-        await f.Pipeline.StopManualAsync();
-        Check.Equal(PipelineState.Saved, f.Pipeline.State);
-        Check.True(f.Pipeline.Status.Error is not null);
         Check.True(!f.Pipeline.LastCompletedTranscript!.IsComplete);
-        Check.Equal(2, f.Pipeline.LastCompletedTranscript!.Segments.Count);
+        Check.Equal(1, f.Pipeline.LastCompletedTranscript!.Segments.Count);
         Check.True(File.Exists(f.Pipeline.Status.NotesPath));
+    }
+
+    private static async Task PushFailureDuringStartup()
+    {
+        await using var f = new PipelineFixture();
+        var gate = new AsyncGate();
+        var saved = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        f.Transcription.HealthError = "Speech rejected startup audio (synthetic).";
+        f.Transcription.OnPushAudio = async ct =>
+        {
+            await gate.WaitAsync(ct);
+            throw new IOException("Synthetic startup push failure");
+        };
+        f.Capture.OnStart = _ =>
+        {
+            f.Transcription.Emit("Recognized during startup");
+            f.Capture.EmitAudio([3, 4]);
+            return Task.CompletedTask;
+        };
+        f.Pipeline.StateChanged += (_, status) =>
+        {
+            if (status.State == PipelineState.ReviewingSave && status.SessionId is { } sessionId)
+                f.Pipeline.SaveNow(sessionId);
+            if (status.State == PipelineState.Saved)
+                saved.TrySetResult();
+        };
+        var release = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            gate.Release();
+        });
+
+        await f.Pipeline.StartManualAsync("Synthetic startup push failure", CancellationToken.None)
+            .WaitAsync(TimeSpan.FromSeconds(2));
+        await release.WaitAsync(TimeSpan.FromSeconds(2));
+        await saved.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Check.Equal(1, f.Transcription.Pushes);
+        Check.Equal(1, f.Capture.Stops);
+        Check.True(!f.Capture.IsCapturing);
+        Check.Equal("Speech rejected startup audio (synthetic).", f.Pipeline.Status.Error);
+        Check.Equal("Recognized during startup", f.Pipeline.LastCompletedTranscript!.FullText);
+        Check.True(!f.Pipeline.LastCompletedTranscript.IsComplete);
     }
 
     private static void AssertDetached(PipelineFixture f)

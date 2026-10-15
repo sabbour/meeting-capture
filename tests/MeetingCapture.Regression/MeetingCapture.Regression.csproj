@@ -24,6 +24,7 @@
     <PackageReference Include="GitHub.Copilot.SDK" Version="1.0.3" ExcludeAssets="build;buildTransitive" />
     <PackageReference Include="NAudio" Version="2.2.1" />
     <Compile Include="..\..\src\MeetingCapture\WorkIq\*.cs" Link="Production\WorkIq\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\Diagnostics\*.cs" Link="Production\Diagnostics\%(Filename)%(Extension)" />
     <Compile Include="..\WorkIq\*.cs" Link="WorkIq\%(Filename)%(Extension)" />
     <Compile Include="..\..\src\MeetingCapture\AudioCapture\IAudioCapture.cs" Link="Production\IAudioCapture.cs" />
     <Compile Include="..\..\src\MeetingCapture\AudioCapture\AudioBuffer.cs" Link="Production\AudioBuffer.cs" />
@@ -52,6 +53,8 @@
     <Compile Include="..\..\src\MeetingCapture\TrayApp\VisualizationCollectionState.cs" Link="Production\VisualizationCollectionState.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\CopilotModelPresentation.cs" Link="Production\CopilotModelPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\WindowPlacement.cs" Link="Production\WindowPlacement.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\TrayMenuLayout.cs" Link="Production\TrayMenuLayout.cs" />
+    <None Include="..\..\src\MeetingCapture\TrayApp\TrayContextMenuHost.cs" Link="TrayContextMenuHost.cs.txt" CopyToOutputDirectory="PreserveNewest" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\ChecklistItemViewModel.cs" Link="Production\ChecklistItemViewModel.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SaveReviewPresentation.cs" Link="Production\SaveReviewPresentation.cs" />
     <Compile Include="..\..\src\MeetingCapture\TrayApp\SpeakerAvatarPresentation.cs" Link="Production\SpeakerAvatarPresentation.cs" />
@@ -76,5 +79,7 @@
     <Compile Include="..\..\src\MeetingCapture\Intelligence\CopilotNotesService.cs" Link="Production\CopilotNotesService.cs" />
     <Compile Include="..\..\src\MeetingCapture\Intelligence\CopilotModelCatalog.cs" Link="Production\CopilotModelCatalog.cs" />
     <Compile Include="..\..\src\MeetingCapture\Storage\*.cs" Link="Production\Storage\%(Filename)%(Extension)" />
+    <Compile Include="..\..\src\MeetingCapture\StartupPriority.cs" Link="Production\StartupPriority.cs" />
+    <Compile Include="..\..\src\MeetingCapture\TrayApp\AboutInfo.cs" Link="Production\AboutInfo.cs" />
   </ItemGroup>
 </Project>

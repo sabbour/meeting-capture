@@ -21,8 +21,7 @@ public sealed class RelatedContextCoordinator : IDisposable
     private long _statusVersion;
     private Task<RelatedContextStatus>? _inFlight;
     private ContextQuery? _activeQuery;
-    private ContextQuery? _queuedQuery;
-    private TaskCompletionSource<RelatedContextStatus>? _queuedCompletion;
+    private readonly List<PendingQuery> _queued = new();
     private CancellationTokenSource? _requestCancellation;
     private string _topicId = string.Empty;
     private long _latestTranscriptRevision = -1;
@@ -74,12 +73,15 @@ public sealed class RelatedContextCoordinator : IDisposable
             }
             else if (_inFlight is not null && _source.IsAvailable && sameSessionSource)
             {
-                _queuedCompletion ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
-                if (_queuedQuery is null ||
-                    _queuedQuery.TopicId != topicId ||
-                    query.TranscriptRevision >= _queuedQuery.TranscriptRevision)
-                    _queuedQuery = query with { Topic = topic, TopicId = topicId };
-                request = _queuedCompletion.Task;
+                var pending = _queued.FirstOrDefault(item => item.Query.TopicId == topicId);
+                if (pending is null)
+                {
+                    pending = new(query with { Topic = topic, TopicId = topicId });
+                    _queued.Add(pending);
+                }
+                else if (query.TranscriptRevision >= pending.Query.TranscriptRevision)
+                    pending.Query = query with { Topic = topic, TopicId = topicId };
+                request = pending.Completion.Task;
             }
             else
             {
@@ -173,9 +175,12 @@ public sealed class RelatedContextCoordinator : IDisposable
                     cancellationToken).ConfigureAwait(false));
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
-        catch (Exception)
+        catch (Exception ex)
         {
-            failure = "Related context could not be loaded.";
+            MeetingCapture.Diagnostics.RelatedDiagnostics.Record("coordinator", _source.IsAvailable, ex);
+            failure = ex is MeetingCapture.WorkIq.WorkIqException workIq
+                ? MeetingCapture.WorkIq.WorkIqService.RelatedContextUnavailableMessage(workIq)
+                : "Work IQ request failed. See Diagnostics/related.log for the error type.";
         }
 
         RelatedContextStatus status;
@@ -230,12 +235,22 @@ public sealed class RelatedContextCoordinator : IDisposable
                 publishVersion = ++_statusVersion;
             }
 
-            if (_queuedQuery is not null)
+            // Deliver this topic's result before advancing the status to the next topic.
+            // Otherwise the version guard discards every result except the last one.
+            // A newer revision of the same topic is already queued, so this result is stale.
+            var superseded = _queued.Any(pending =>
+                pending.Query.SessionId == query.SessionId &&
+                CleanTopicId(pending.Query.TopicId) == topicId &&
+                pending.Query.TranscriptRevision > query.TranscriptRevision);
+            if (publish && !superseded)
+                Publish(status, publishVersion);
+            publish = false;
+            if (!_disposed && generation == _generation && _queued.Count > 0)
             {
-                var queued = _queuedQuery;
-                queuedCompletion = _queuedCompletion;
-                _queuedQuery = null;
-                _queuedCompletion = null;
+                var pending = _queued[0];
+                _queued.RemoveAt(0);
+                var queued = pending.Query;
+                queuedCompletion = pending.Completion;
                 var queuedTopic = CleanTopic(queued.Topic);
                 var queuedTopicId = CleanTopicId(queued.TopicId);
                 _topicId = queuedTopicId;
@@ -297,9 +312,9 @@ public sealed class RelatedContextCoordinator : IDisposable
     private void ResetLocked(
         string sessionId, string topic, long transcriptRevision, long sourceRevision, bool cancel)
     {
-        _queuedCompletion?.TrySetCanceled();
-        _queuedCompletion = null;
-        _queuedQuery = null;
+        foreach (var pending in _queued)
+            pending.Completion.TrySetCanceled();
+        _queued.Clear();
         if (cancel)
         {
             _generation++;
@@ -365,9 +380,16 @@ public sealed class RelatedContextCoordinator : IDisposable
             _inFlight = null;
             _activeQuery = null;
             _cached = null;
-            _queuedCompletion?.TrySetCanceled();
-            _queuedCompletion = null;
-            _queuedQuery = null;
+            foreach (var pending in _queued)
+                pending.Completion.TrySetCanceled();
+            _queued.Clear();
         }
+    }
+
+    private sealed class PendingQuery(ContextQuery query)
+    {
+        public ContextQuery Query { get; set; } = query;
+        public TaskCompletionSource<RelatedContextStatus> Completion { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }
