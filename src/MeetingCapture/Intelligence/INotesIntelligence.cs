@@ -48,8 +48,8 @@ public interface INotesIntelligence
         CancellationToken cancellationToken);
 
     /// <summary>
-    /// Produces a very short (≤2 sentence) catch-up summary of a recent transcript snippet,
-    /// used by the live "What did I miss?" re-entry button. Returns plain text.
+    /// Identifies the current discussion topic from a recent transcript snippet and returns
+    /// its short canonical label as plain text.
     /// </summary>
     Task<string> SummarizeRecentAsync(
         string recentTranscript,

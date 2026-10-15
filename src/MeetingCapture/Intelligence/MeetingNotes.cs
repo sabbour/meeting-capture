@@ -62,6 +62,8 @@ public static class MeetingNotesText
     {
         if (string.IsNullOrEmpty(value))
             return string.Empty;
+        // Segment numbers are useful as internal citations but are distracting in the saved
+        // notes, so remove both the citation phrase and any remaining standalone ordinal.
         var cleaned = SegmentOrdinal.Replace(GroundingOrdinal.Replace(value, string.Empty), string.Empty);
         cleaned = Regex.Replace(cleaned, @"[ \t]+([,.;:])", "$1");
         cleaned = Regex.Replace(cleaned, @"[ \t]{2,}", " ");
@@ -78,6 +80,8 @@ public static class MeetingTopicNotesBuilder
     public static IReadOnlyList<MeetingTopicNotes> Build(MeetingVisualizationDocument document)
     {
         ArgumentNullException.ThrowIfNull(document);
+        // Index transcript and speaker data once; every bullet below uses these maps to recover
+        // the exact source segment and display name for its cited evidence.
         var segments = document.Segments.ToDictionary(item => item.Ordinal);
         var speakers = document.Speakers.ToDictionary(
             item => item.SpeakerId,
@@ -93,6 +97,7 @@ public static class MeetingTopicNotesBuilder
             .Select(group => group.First())
             .ToDictionary(item => item.Id, StringComparer.Ordinal);
 
+        // Prefer the assigned topic. Evidence is used only when an older item has no topic ID.
         var topicLabels = document.TopicClusters.ToDictionary(
             item => item.Id,
             item => MeetingNotesText.WithoutSegmentOrdinals(ProjectSpeakers(item.Label, speakers)),
@@ -112,6 +117,8 @@ public static class MeetingTopicNotesBuilder
             .Select(topic =>
             {
                 var candidates = new List<(int Ordinal, int Priority, string Id, string Text)>();
+                // Decisions are selected first because they are the most useful short statement
+                // of a topic's outcome; their cited segments determine the speaker attribution.
                 foreach (var decision in document.Decisions.Where(item =>
                              BelongsToTopic(item.TopicId, item.EvidenceIds, topic.Id)))
                 {
@@ -147,6 +154,8 @@ public static class MeetingTopicNotesBuilder
                             : $"Decision discussed by {speakerSummary}: {decisionText}"));
                 }
 
+                // Add transcript-backed facts only. Retrieved documents and model inferences are
+                // intentionally excluded from these meeting notes.
                 foreach (var fact in evidence.Values
                              .Where(item => item.TopicId == topic.Id && item.SegmentOrdinal is not null)
                              .OrderBy(item => item.SegmentOrdinal)
@@ -169,6 +178,7 @@ public static class MeetingTopicNotesBuilder
                             : $"{factSpeaker}: {Bound(text)}"));
                 }
 
+                // Keep two distinct bullets in a stable order, with decisions ahead of facts.
                 var bullets = candidates
                     .OrderBy(item => item.Priority)
                     .ThenBy(item => item.Ordinal)
@@ -183,6 +193,7 @@ public static class MeetingTopicNotesBuilder
     }
 
     private static bool StartsWithAny(string text, IEnumerable<string> names) =>
+        // Avoid adding a second speaker prefix when the model's sentence already starts with one.
         names.Any(name => !string.IsNullOrWhiteSpace(name) &&
             System.Text.RegularExpressions.Regex.IsMatch(
                 text,
@@ -196,6 +207,8 @@ public static class MeetingTopicNotesBuilder
     {
         if (string.IsNullOrWhiteSpace(segment.SpeakerId))
             return "Unidentified speaker";
+        // A confirmed or supplied display name is preferred; the stable speaker ID is the
+        // fallback when no readable name was recorded.
         return speakers.TryGetValue(segment.SpeakerId, out var displayName) &&
                !string.IsNullOrWhiteSpace(displayName)
             ? displayName.Trim()
@@ -207,6 +220,7 @@ public static class MeetingTopicNotesBuilder
         IReadOnlyDictionary<string, string> speakers)
     {
         var projected = text;
+        // Replace longer IDs first so an ID that contains another ID cannot be partly replaced.
         foreach (var speaker in speakers.OrderByDescending(item => item.Key.Length))
             projected = System.Text.RegularExpressions.Regex.Replace(
                 projected,
@@ -219,6 +233,8 @@ public static class MeetingTopicNotesBuilder
 
     private static string Bound(string text)
     {
+        // Collapse transcript whitespace before applying the limit so line breaks cannot make
+        // otherwise short bullets appear longer than they need to be.
         var compact = string.Join(' ', text.Split(
             (char[]?)null,
             StringSplitOptions.RemoveEmptyEntries));

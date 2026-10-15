@@ -130,6 +130,8 @@ public sealed class AiDiagnosticsStream
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
         lock (_gate)
         {
+            // Advancing the generation makes callbacks already in flight belong to the old
+            // recording, so they cannot repopulate the freshly cleared event list.
             _generation++;
             _sessionId = sessionId;
             _nextRequestId = 0;
@@ -137,6 +139,7 @@ public sealed class AiDiagnosticsStream
             _captureSensitiveContent = false;
             _events.Clear();
         }
+        // Notify after releasing the lock because listeners may immediately read a snapshot.
         Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -144,6 +147,8 @@ public sealed class AiDiagnosticsStream
     {
         lock (_gate)
         {
+            // Invalidate observations even though the session ID stays the same; Clear is also
+            // used when the user wants to discard diagnostics without ending the recording.
             _generation++;
             _events.Clear();
         }
@@ -159,6 +164,8 @@ public sealed class AiDiagnosticsStream
             _captureSensitiveContent = enabled;
             if (!enabled && _events.Count > 0)
             {
+                // Removing payloads from existing events is necessary too: disabling capture
+                // must not leave previously captured prompts available in the in-memory view.
                 var redacted = _events.Select(item => item with
                 {
                     SensitivePromptPayload = null,
@@ -176,6 +183,7 @@ public sealed class AiDiagnosticsStream
 
     public AiDiagnosticsSnapshot GetSnapshot()
     {
+        // Return an array copy so callers cannot observe later queue changes or mutate the queue.
         lock (_gate)
             return new(
                 _sessionId,
@@ -199,6 +207,8 @@ public sealed class AiDiagnosticsStream
         lock (_gate)
         {
             generation = _generation;
+            // A request tied to a prior recording may still finish, but it must not appear in
+            // the diagnostics for the new recording.
             var accepted = expectedSessionId is null ||
                 string.Equals(expectedSessionId, _sessionId, StringComparison.Ordinal);
             request = new(
@@ -278,6 +288,8 @@ public sealed class AiDiagnosticsStream
         var changed = false;
         lock (_gate)
         {
+            // SDK events can arrive after reset or after the request ended. Late usage is the
+            // only post-completion event retained because providers may report it last.
             if (generation != _generation || !request.Accepted ||
                 (request.Ended && kind != AiDiagnosticEventKind.UsageReported))
                 return;
@@ -303,6 +315,7 @@ public sealed class AiDiagnosticsStream
             changed = true;
         }
         if (changed)
+            // Event handlers run outside the lock so UI updates do not block diagnostic writes.
             Changed?.Invoke(this, EventArgs.Empty);
     }
 
@@ -322,6 +335,8 @@ public sealed class AiDiagnosticsStream
         AiDiagnosticRetryOutcome? retryOutcome = null)
     {
         var timestamp = _now();
+        // Each event carries the request's accumulated counters, not just the values from this
+        // callback, so the latest row is useful even when earlier SDK events held the usage.
         var value = new AiDiagnosticEvent(
             ++_sequence,
             _sessionId,
@@ -355,6 +370,7 @@ public sealed class AiDiagnosticsStream
             errorCode,
             retryOutcome);
         _events.Enqueue(value);
+        // Keep memory use predictable during long recordings by retaining only the newest rows.
         while (_events.Count > _capacity)
             _events.Dequeue();
         return value;
@@ -364,6 +380,8 @@ public sealed class AiDiagnosticsStream
     {
         if (!_captureSensitiveContent || value is null)
             return (null, false);
+        // Sensitive capture is opt-in. Even then, remove common credential forms and cap the
+        // stored text so diagnostic export cannot accidentally retain an unbounded payload.
         var sanitized = BearerToken.Replace(
             SecretAssignment.Replace(
                 JsonSecretAssignment.Replace(value, "$1\"[REDACTED]\""),
@@ -376,6 +394,8 @@ public sealed class AiDiagnosticsStream
 
     private static string? CleanMetadata(string? value, string? fallback)
     {
+        // Metadata is useful for grouping, but it should not carry blank or unexpectedly large
+        // values into every event.
         var cleaned = value?.Trim();
         if (string.IsNullOrWhiteSpace(cleaned))
             return fallback;
@@ -407,6 +427,8 @@ public sealed class AiDiagnosticsStream
             => owner.Update(generation, request, AiDiagnosticEventKind.UsageReported,
                 AiRequestState.Running, update: current =>
                 {
+                    // One request can make several provider calls; add each report and keep the
+                    // latest snapshot for each quota rather than duplicating quota rows.
                     current.InputTokens = Add(current.InputTokens, inputTokens);
                     current.OutputTokens = Add(current.OutputTokens, outputTokens);
                     current.ProviderCost = Add(current.ProviderCost, providerCost);

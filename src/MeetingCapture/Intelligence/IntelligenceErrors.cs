@@ -35,6 +35,8 @@ public static class IntelligenceErrors
     {
         if (exception is IntelligenceException failure)
             return failure;
+        // Convert known transport and parsing failures first; only provider-specific messages
+        // need the text classifier below.
         var kind = exception switch
         {
             TimeoutException or OperationCanceledException => IntelligenceFailureKind.Timeout,
@@ -53,6 +55,8 @@ public static class IntelligenceErrors
     public static IntelligenceFailureKind ClassifyProviderError(string? error)
     {
         var text = error ?? string.Empty;
+        // Check limits and quota before general authentication/model wording because provider
+        // responses often include several overlapping phrases.
         if (Contains("quota") || Contains("billing_not_configured"))
             return IntelligenceFailureKind.QuotaExceeded;
         if (Contains("rate_limit") || Contains("rate limit") || Contains("rate-limited") ||
@@ -81,6 +85,7 @@ public static class IntelligenceErrors
 
     private static string RetryText(TimeSpan delay)
     {
+        // Show a rounded-up unit so the displayed retry time never tells the user to retry early.
         if (delay < TimeSpan.FromMinutes(1))
             return $"in {Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds))} seconds";
         if (delay < TimeSpan.FromHours(1))

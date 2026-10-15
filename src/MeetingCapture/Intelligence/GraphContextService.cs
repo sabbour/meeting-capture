@@ -33,6 +33,8 @@ public sealed class GraphContextService
 
     public async Task<List<RelatedItem>> SearchRelatedAsync(string query, CancellationToken ct)
     {
+        // Validate before asking for a token so disabled, signed-out, and blank-query states
+        // remain distinct from a successful search with no results.
         ct.ThrowIfCancellationRequested();
         if (!_graphService.IsConfigured)
             throw IntelligenceErrors.Create(IntelligenceFailureKind.Disabled, "Microsoft Graph");
@@ -46,6 +48,7 @@ public sealed class GraphContextService
             throw IntelligenceErrors.Create(IntelligenceFailureKind.SignedOut, "Microsoft Graph");
 
         // These entity types cannot be mixed in a single Graph search request.
+        // Run them together, then merge and cap the combined results by their source dates.
         var sources = await Task.WhenAll(
             SearchSourceAsync(query, "message", "email", token, ct),
             SearchSourceAsync(query, "chatMessage", "Teams", token, ct),
@@ -75,12 +78,14 @@ public sealed class GraphContextService
         var provider = $"Microsoft Graph ({source})";
         try
         {
+            // Each source gets its own request because Graph accepts one entity type per body.
             using var request = new HttpRequestMessage(HttpMethod.Post, SearchEndpoint);
             request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
             request.Content = new StringContent(BuildRequestBody(query, [entityType]), Encoding.UTF8, "application/json");
             using var response = await Http.SendAsync(request, ct).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
+                // Convert HTTP status to the app's safe error category before exposing it.
                 throw IntelligenceErrors.Create(response.StatusCode switch
                 {
                     HttpStatusCode.Unauthorized => IntelligenceFailureKind.Authentication,
@@ -106,6 +111,8 @@ public sealed class GraphContextService
         var results = new List<RelatedItem>();
         try
         {
+            // Graph wraps each entity-type search in response containers. Missing containers
+            // are treated as a broken response, while an explicit total of zero is valid.
             using var doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
@@ -135,6 +142,8 @@ public sealed class GraphContextService
                             ? (odataProp.GetString() ?? string.Empty)
                             : string.Empty;
 
+                        // Use the declared entity type to choose the source-specific fields; an
+                        // unknown type is not guessed because its URL and title may differ.
                         var item = odataType switch
                         {
                             "#microsoft.graph.message"     => ParseEmail(resource),
@@ -151,9 +160,11 @@ public sealed class GraphContextService
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException or FormatException)
         {
+            // Do not return partial results from a structurally inconsistent Graph payload.
             throw IntelligenceErrors.Create(IntelligenceFailureKind.MalformedResponse, provider);
         }
 
+        // Keep the newest items only after all three source searches have been parsed.
         return results
             .OrderByDescending(r => r.Date ?? DateTimeOffset.MinValue)
             .Take(9)
@@ -172,6 +183,7 @@ public sealed class GraphContextService
     private static RelatedItem ParseTeamsMessage(JsonElement resource, JsonElement hit)
     {
         // Prefer the hit-level summary, fall back to body content.
+        // The hit summary is already tailored to search relevance; body content is a fallback.
         var summary = GetString(hit, "summary");
         if (string.IsNullOrWhiteSpace(summary) && resource.TryGetProperty("body", out var body))
             summary = GetString(body, "content") ?? string.Empty;

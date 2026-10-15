@@ -48,6 +48,8 @@ public static class RelatedContextTitle
     /// <summary>Collapses whitespace and removes a wrapping tag such as &lt;TeamsMessage&gt;...&lt;/TeamsMessage&gt;.</summary>
     public static string Clean(string? value, ContextSourceType? sourceType)
     {
+        // Work IQ sometimes wraps a title in a provider tag. Flatten whitespace first so the
+        // wrapper check works even when the source inserted line breaks.
         var title = string.Join(" ", (value ?? string.Empty).Split(
             (char[]?)null,
             StringSplitOptions.RemoveEmptyEntries));
@@ -134,6 +136,7 @@ public static class RelatedContextNormalizer
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         if (snapshot.Availability != RelatedContextAvailability.Available)
+            // A failed or unavailable lookup must not keep stale-looking source cards.
             return snapshot.Availability switch
             {
                 RelatedContextAvailability.NoEvidence => snapshot with
@@ -153,6 +156,8 @@ public static class RelatedContextNormalizer
                 }
             };
 
+        // Normalize each item independently, discard unusable citations, and then remove
+        // duplicate suggestions before enforcing the display limit.
         var items = snapshot.Items
             .Select(NormalizeItem)
             .Where(item => item is not null)
@@ -186,6 +191,8 @@ public static class RelatedContextNormalizer
 
     private static RelatedContextItem? NormalizeItem(RelatedContextItem item)
     {
+        // A suggestion is useful only when it has readable text and at least one safe source
+        // the user can open to verify it.
         var summary = Clean(item.Summary, MaxSummaryLength);
         var sources = item.Sources
             .Select(NormalizeSource)
@@ -209,6 +216,8 @@ public static class RelatedContextNormalizer
     private static ContextEvidenceSource? NormalizeSource(ContextEvidenceSource source)
     {
         var title = Clean(RelatedContextTitle.Clean(source.Title, source.SourceType), MaxTitleLength);
+        // Only HTTPS URLs without embedded credentials become clickable citations; store a
+        // canonical URL so duplicate detection is consistent.
         if (title.Length == 0 || !Uri.TryCreate(source.Url, UriKind.Absolute, out var url) ||
             url.Scheme != Uri.UriSchemeHttps || string.IsNullOrWhiteSpace(url.Host) ||
             !string.IsNullOrEmpty(url.UserInfo))
@@ -227,6 +236,7 @@ public static class RelatedContextNormalizer
 
     private static string Clean(string? value, int maxLength)
     {
+        // Normalize all whitespace and bound text before it reaches the UI or persisted model.
         var text = string.Join(" ", (value ?? string.Empty)
             .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
         return text.Length <= maxLength ? text : text[..maxLength].TrimEnd();
@@ -240,6 +250,8 @@ public static class RelatedContextNormalizer
 
     private static string DeterministicSuggestionId(IReadOnlyList<ContextEvidenceSource> sources)
     {
+        // Hash sorted source identities so the same source set keeps the same ID regardless of
+        // the order in which the provider returned its citations.
         var identity = string.Join("\n", sources
             .Select(source => $"{source.SourceType}:{source.SourceId}")
             .Order(StringComparer.Ordinal));

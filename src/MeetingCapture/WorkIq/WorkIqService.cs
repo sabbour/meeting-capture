@@ -70,11 +70,13 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     }
 
     private static IPublicClientApplication CreateApp() => PublicClientApplicationBuilder.Create(ClientId)
+        // Organization-only authority keeps Work IQ sign-in in the supported work/school tenant flow.
         .WithAuthority("https://login.microsoftonline.com/organizations")
         .WithRedirectUri(RedirectUri)
         .Build();
 
     private static WorkIqMcpClient CreateClient(TimeSpan? requestTimeout = null) => new(
+        // Do not forward the bearer token through redirects to a different host.
         new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
     {
         Timeout = Timeout.InfiniteTimeSpan
@@ -82,12 +84,15 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
 
     public async Task SignInAsync(CancellationToken ct)
     {
+        // Capture the auth revision so a sign-out or newer sign-in cannot be overwritten by this
+        // browser flow when it eventually returns.
         var revision = Revision;
         WorkIqException? serviceProblem = null;
         try
         {
             await _signIn.RunAsync(async token =>
             {
+                // Prepare the MSAL app and connect once before publishing it as signed in.
                 var app = CreateApp();
                 _cache.Attach(app);
                 var auth = await app.AcquireTokenInteractive(Scopes)
@@ -117,6 +122,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             {
                 lock (_gate)
                 {
+                    // Persist the protected cache before exposing the new authenticated state.
                     CheckRevision(revision);
                     var app = prepared.Application ?? throw new WorkIqException(WorkIqFailure.Authentication);
                     _cache.Save(app);
@@ -141,6 +147,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         Func<CancellationToken, Task<IPublicClientApplication?>> restoreApplication,
         CancellationToken ct)
     {
+        // Restoration runs in the same bounded sign-in lane as browser sign-in, while its
+        // background worker owns the MSAL cache I/O and publishes only if still current.
         using var phase = _responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqRestoreWait);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(30));
@@ -155,6 +163,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 await _requests.WaitAsync(operationToken).ConfigureAwait(false);
                 try
                 {
+                    // One worker at a time may access this MSAL cache and its persistence file.
                     var app = await restoreApplication(operationToken).ConfigureAwait(false);
                     if (app is not null)
                     {
@@ -175,6 +184,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 if (prepared.Application is not { } app) return;
                 lock (_gate)
                 {
+                    // The caller's deadline and auth revision are checked again at publication,
+                    // after all slower account and service work has finished.
                     token.ThrowIfCancellationRequested();
                     CheckRevision(revision);
                     _app = app;
@@ -200,6 +211,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
 
     private async Task<IPublicClientApplication?> RestoreApplicationAsync(CancellationToken token)
     {
+        // Restore only the locally protected cache and attempt silent sign-in; startup never
+        // opens a browser or asks the user to authenticate unexpectedly.
         var app = CreateApp();
         using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCacheLoad))
             _cache.Load(app);
@@ -223,6 +236,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
 
     public async Task<List<MeetingTitleCandidate>> GetCalendarAsync(DateTimeOffset start, DateTimeOffset end, CancellationToken ct)
     {
+        // Serialize MSAL and MCP use with other account operations, and bound the full calendar
+        // operation independently from the underlying HTTP request timeout.
         using var phase = _responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqCalendar);
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(30));
@@ -236,6 +251,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             IPublicClientApplication app;
             lock (_gate)
             {
+                // A request that began before a connection change must not use the old app.
                 CheckRevision(revision);
                 app = _app ?? throw new WorkIqException(WorkIqFailure.SignedOut);
             }
@@ -250,6 +266,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             using (_responsiveness?.BeginBackgroundPhase(ResponsivenessPhase.WorkIqConnect))
                 await client.InitializeAsync(auth.AccessToken, token).ConfigureAwait(false);
             var response = await client.FetchCalendarResultAsync(auth.AccessToken, start, end, token).ConfigureAwait(false);
+            // Parse requires a complete page; ambiguous or truncated calendars are not used for
+            // meeting-name inference.
             var meetings = WorkIqMcpClient.ParseCalendar(response);
             lock (_gate)
             {
@@ -271,6 +289,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             var failure = Failure(ex);
             if (failure.Kind is WorkIqFailure.Authentication or WorkIqFailure.SignedOut)
             {
+                // Expired or removed credentials clear the published connection only if this
+                // request still belongs to the current auth revision.
                 var changed = false;
                 lock (_gate)
                 {
@@ -292,6 +312,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     /// <summary>Returns a photo only for a selected attendee's verified email address.</summary>
     public Task<WorkIqProfilePhoto?> GetProfilePhotoAsync(string? verifiedEmail, CancellationToken ct)
     {
+        // Only accept an exact email address from the selected attendee record; display names
+        // and "Name <address>" forms are not valid lookup identities.
         var email = verifiedEmail?.Trim();
         if (string.IsNullOrWhiteSpace(email) ||
             !System.Net.Mail.MailAddress.TryCreate(email, out var parsed) ||
@@ -308,6 +330,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         ContextQuery query, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(query);
+        // Tie usage and diagnostics to the originating recording session so late results can be
+        // ignored after that recording ends.
         var observation = _usage.Begin(AiCapability.WorkIqRetrieval, query.SessionId);
         var diagnostic = _diagnostics.Begin(
             AiCapability.WorkIqRetrieval,
@@ -323,6 +347,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         var entered = false;
         try
         {
+            // Only one related-context query uses the authenticated client at a time.
             await _contextRequests.WaitAsync(token).ConfigureAwait(false);
             entered = true;
             IPublicClientApplication app;
@@ -340,6 +365,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 client, auth.AccessToken, revision, token).ConfigureAwait(false);
             _logger.LogInformation("WorkIQ related-context query started.");
             var retrievedAt = DateTimeOffset.UtcNow;
+            // Count one logical call for each source family before they run in parallel.
             foreach (var _ in RelatedContextCapabilities)
             {
                 observation.CallStarted();
@@ -368,6 +394,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                             skipRetrieve,
                             declined =>
                             {
+                                // Remember unsupported/denied retrieve for this connection
+                                // revision so later topics go directly to keyword search.
                                 var recorded = Failure(declined);
                                 if (recorded.Kind == WorkIqFailure.Unsupported ||
                                     recorded.Code == "tool-error:AccessDenied")
@@ -401,6 +429,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 snapshot.Availability, snapshot.Items.Count);
             lock (_gate)
             {
+                // Do not save a token cache or publish results for an account that changed
+                // while the source-family requests were running.
                 token.ThrowIfCancellationRequested();
                 CheckRevision(revision);
                 _cache.Save(app);
@@ -426,6 +456,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         catch (Exception ex)
         {
             var failure = Failure(ex);
+            // Permission and service-capability failures are useful unavailable states for the
+            // Related panel; they are not empty successful searches.
             if (failure.Kind == WorkIqFailure.Denied)
             {
                 observation.Fail(AiRequestFailure.Authorization);
@@ -464,6 +496,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             }
             if (failure.Kind is WorkIqFailure.Authentication or WorkIqFailure.SignedOut)
             {
+                // Clear expired credentials only when this query still owns the active revision.
                 var changed = false;
                 lock (_gate)
                 {
@@ -528,6 +561,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         Action<WorkIqException> onRetrieveDeclined,
         CancellationToken cancellationToken)
     {
+        // Search is used only when retrieve is known to be unavailable, or when the service
+        // explicitly declines/does not support that request. Transport and sign-in errors remain visible.
         if (skipRetrieve && search is not null)
             return await search(cancellationToken).ConfigureAwait(false);
         try
@@ -538,6 +573,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             search is not null &&
             declined.Kind is WorkIqFailure.ServiceDeclined or WorkIqFailure.Unsupported)
         {
+            // Report the declined capability before switching retrieval strategies so the caller
+            // can remember it for later queries.
             onRetrieveDeclined(declined);
             try
             {
@@ -563,6 +600,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         DateTimeOffset retrievedAt,
         CancellationToken cancellationToken)
     {
+        // Start all source families independently, each with its own deadline. One failure does
+        // not cancel useful results from the other families.
         var attempts = capabilities.Select(async capability =>
         {
             using var familyDeadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -595,6 +634,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                 continue;
             }
             if (error is WorkIqException { Kind: WorkIqFailure.Authentication or WorkIqFailure.SignedOut })
+                // Authentication affects every source, so it must escape instead of becoming
+                // one more unavailable family.
                 throw error;
             firstFailure ??= error;
             snapshots.Add(new RelatedContextSnapshot(
@@ -607,6 +648,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
         }
         if (firstFailure is not null &&
             !snapshots.Any(item => item.Availability != RelatedContextAvailability.Unavailable))
+            // If every family failed, return one real failure; otherwise retain the partial
+            // result list with per-family unavailable messages.
             throw firstFailure!;
         return snapshots;
     }
@@ -619,12 +662,15 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     {
         lock (_gate)
         {
+            // `/me` is stable for this auth revision, so all source families can reuse one
+            // verified identity read.
             if (_identityCache is { } cached && cached.Revision == revision)
                 return cached.Identity;
         }
         var result = await client.FetchCurrentUserIdentityResultAsync(accessToken, ct).ConfigureAwait(false);
         var identity = WorkIqMcpClient.ParseCurrentUserIdentity(result);
         lock (_gate)
+            // Keep the revision beside the value; a new account will not reuse these aliases.
             _identityCache = (revision, identity);
         return identity;
     }
@@ -632,6 +678,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     private async Task<WorkIqProfilePhoto?> GetProfilePhotoCoreAsync(
         string cacheKey, string? userIdentity, bool currentUser, CancellationToken ct)
     {
+        // Photo reads share the serialized account lane and a separate deadline so a missing
+        // profile picture cannot block recording or meeting detection.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
         deadline.CancelAfter(TimeSpan.FromSeconds(30));
         var token = deadline.Token;
@@ -645,6 +693,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             lock (_gate)
             {
                 CheckRevision(revision);
+                // Cache both found and missing photos to avoid repeated requests, but do not
+                // grow this per-user cache without bound.
                 if (_photoCache.TryGetValue(cacheKey, out var cached))
                     return cached;
                 if (_photoCache.Count >= MaxPhotoCacheEntries)
@@ -666,6 +716,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             var metadata = await client.FetchProfilePhotoMetadataResultAsync(
                 auth.AccessToken, identity, token).ConfigureAwait(false);
             WorkIqProfilePhoto? photo = null;
+            // Fetch bytes only after metadata confirms that a photo exists.
             if (WorkIqMcpClient.HasProfilePhoto(metadata))
             {
                 photo = WorkIqMcpClient.ParseProfilePhoto(
@@ -674,6 +725,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
 
             lock (_gate)
             {
+                // Recheck connection state before caching a result from this authenticated call.
                 token.ThrowIfCancellationRequested();
                 CheckRevision(revision);
                 _photoCache[cacheKey] = photo;
@@ -687,6 +739,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             var failure = Failure(ex);
             if (failure.Kind is WorkIqFailure.Denied or WorkIqFailure.Unsupported)
             {
+                // A missing permission or unsupported photo endpoint is a normal no-photo result,
+                // so cache null and let the attendee list render without an avatar.
                 lock (_gate)
                     if (!_disposed && revision == _revision && _photoCache.Count < MaxPhotoCacheEntries)
                         _photoCache[cacheKey] = null;
@@ -694,6 +748,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             }
             if (failure.Kind is WorkIqFailure.Authentication or WorkIqFailure.SignedOut)
             {
+                // A stale token invalidates all cached photos because they belong to the old account.
                 var changed = false;
                 lock (_gate)
                 {
@@ -717,6 +772,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     {
         lock (_gate)
         {
+            // Remove in-memory identity and photo data before clearing the encrypted token file.
             _app = null;
             _photoCache.Clear();
             Interlocked.Increment(ref _revision);
@@ -728,18 +784,23 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
 
     private void PublishAuthStateLocked()
     {
+        // Publish a single immutable pair so readers cannot observe an authenticated flag from
+        // one revision and a revision number from another.
         Volatile.Write(ref _authStateSnapshot,
             new AuthStateSnapshot(_app is not null && !_disposed, Interlocked.Read(ref _revision)));
     }
 
     private void CheckRevision(long revision)
     {
+        // Used after awaits to prevent old operations publishing after sign-out or account switch.
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (revision != _revision) throw new OperationCanceledException("WorkIQ connection changed.");
     }
 
     private WorkIqException Failure(Exception error)
     {
+        // Convert provider exceptions to fixed user-safe categories. Keep the underlying message
+        // out of logs because it may contain account or request details.
         var failure = error switch
         {
             WorkIqException known => known,
@@ -760,11 +821,14 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     private sealed class Prepared(IPublicClientApplication? app) : IDisposable
     {
         public IPublicClientApplication? Application { get; private set; } = app;
+        // Drop the temporary reference after publication or cancellation.
         public void Dispose() => Application = null;
     }
 
     public void Dispose()
     {
+        // Prevent new work from treating this service as signed in, then invalidate pending
+        // operations by changing the revision.
         _signIn.Dispose();
         lock (_gate)
         {

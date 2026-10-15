@@ -25,6 +25,8 @@ internal static class WorkIqParticipation
     {
         role = null;
         matchKind = null;
+        // Names and source prose are not identity evidence. Without a verified tenant identity
+        // and structured metadata, participation cannot be claimed.
         if (!identity.IsResolved || resourceMetadata.ValueKind != JsonValueKind.Object)
             return false;
 
@@ -53,6 +55,8 @@ internal static class WorkIqParticipation
         };
         foreach (var candidate in candidates)
         {
+            // Check only fields appropriate to this source family and report the first verified
+            // role, keeping the source's actual participation type visible to the caller.
             if (!Matches(resourceMetadata, candidate.Item1, candidate.Item2, identity, out matchKind))
                 continue;
             role = candidate.Item3;
@@ -69,6 +73,8 @@ internal static class WorkIqParticipation
         out ContextIdentityMatchKind? matchKind)
     {
         matchKind = null;
+        // Work IQ's metadata groups person details by source family; a missing field is simply
+        // not proof of participation.
         if (!resourceMetadata.TryGetProperty(section, out var container) ||
             container.ValueKind != JsonValueKind.Object ||
             !container.TryGetProperty(field, out var value))
@@ -76,6 +82,8 @@ internal static class WorkIqParticipation
 
         if (value.ValueKind == JsonValueKind.Array)
         {
+            // Recipient, attendee, and member fields are lists; accept a match only from one
+            // structured person entry.
             foreach (var entry in value.EnumerateArray())
                 if (MatchesIdentity(entry, identity, out matchKind))
                     return true;
@@ -92,6 +100,7 @@ internal static class WorkIqParticipation
         matchKind = null;
         if (person.ValueKind != JsonValueKind.Object)
             return false;
+        // Directory IDs are stronger than aliases, so test all supported ID names first.
         if (TryGetString(person, "id", out var id) && identity.MatchesId(id))
         {
             matchKind = ContextIdentityMatchKind.ObjectId;
@@ -108,6 +117,7 @@ internal static class WorkIqParticipation
             return true;
         }
         foreach (var nestedName in new[] { "user", "identity" })
+            // Some provider shapes wrap the same directory object under user or identity.
             if (person.TryGetProperty(nestedName, out var nested) &&
                 MatchesIdentity(nested, identity, out matchKind))
                 return true;
@@ -120,6 +130,8 @@ internal static class WorkIqParticipation
         email ??= TryGetString(person, "mail", out var mail) ? mail : null;
         email ??= TryGetString(person, "userPrincipalName", out var upn) ? upn : null;
         email ??= TryGetString(person, "address", out var plainAddress) ? plainAddress : null;
+        // Only exact case-insensitive matches against verified /me aliases count; display names
+        // and unverified account usernames never reach this check.
         if (!identity.MatchesEmail(email))
             return false;
         matchKind = ContextIdentityMatchKind.VerifiedAlias;
