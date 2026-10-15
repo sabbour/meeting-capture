@@ -42,6 +42,7 @@ public sealed partial class MainWindow
             rows.Add(row);
         }
 
+        // Rows are collected first; the bound collection is only touched when the speaker set or order changed.
         if (_speakerBalance.Select(row => row.SpeakerId).SequenceEqual(
                 rows.Select(row => row.SpeakerId), StringComparer.OrdinalIgnoreCase))
             return;
@@ -56,6 +57,8 @@ public sealed partial class MainWindow
 
     private void UpdateCombineSpeakersButton()
     {
+        // Merging is offered in states where the transcript can be updated, and needs at least two speaker ids other
+        // than the shared Unknown placeholder (which is not a distinct identity); those ids may still be unresolved.
         var canCombine = _pipeline.State is PipelineState.Recording or PipelineState.Saved or
             PipelineState.Failed or PipelineState.Idle && !_retryBusy && !_preparingExit &&
             _speakerBalance.Count(row => row.SpeakerId != SpeakerTimeline.UnknownSpeakerId) >= 2;
@@ -64,6 +67,7 @@ public sealed partial class MainWindow
 
     private async void OnCombineSpeakersClick(object sender, RoutedEventArgs e)
     {
+        // Guard against re-entry (a dialog is already open) and against a window that has no XamlRoot yet.
         if (_combineSpeakersDialogOpen || RootLayout.XamlRoot is not { } xamlRoot) return;
         var candidates = _speakerBalance.Where(row => row.SpeakerId != SpeakerTimeline.UnknownSpeakerId).ToList();
         if (candidates.Count < 2) return;
@@ -115,10 +119,12 @@ public sealed partial class MainWindow
         dialog.Content = new ScrollViewer { Content = content, MaxHeight = 360 };
         Sync();
 
+        // Block a second dialog while this one is awaiting a result.
         _combineSpeakersDialogOpen = true;
         ContentDialogResult result;
         try { result = await dialog.ShowAsync(); }
         finally { _combineSpeakersDialogOpen = false; }
+        // Cancel/close, or a missing "keep" selection, leaves everything untouched.
         if (result != ContentDialogResult.Primary ||
             (keep.SelectedItem as ComboBoxItem)?.Tag is not SpeakerBalance kept)
             return;
@@ -130,6 +136,7 @@ public sealed partial class MainWindow
     {
         var plan = SpeakerMergePlan.Create(speakerIds, keptId);
         if (plan is null) return;
+        // Capture the session now: if a different meeting is shown when the merge finishes, don't apply speaker-row changes to it.
         var sessionId = _sessionId;
         Exception? failure = null;
         // The pipeline owns transcript/storage changes; update this window only after the resolver confirms the merge.
@@ -137,6 +144,8 @@ public sealed partial class MainWindow
         catch (Exception ex) when (ex is not OutOfMemoryException) { failure = ex; }
 
         var resolver = _pipeline.SpeakerResolver;
+        // Success is judged from the resolver, not just the absence of an exception: the in-memory alias can apply
+        // even if persisting the saved transcript later failed (the "merged but not saved" warning below).
         var merged = plan.AbsorbedIds.All(id =>
             string.Equals(resolver.Canonical(id), plan.KeptId, StringComparison.OrdinalIgnoreCase));
         if (merged && sessionId == _sessionId)
@@ -162,11 +171,13 @@ public sealed partial class MainWindow
         var brush = GetSpeakerBrush(plan.KeptId);
         var image = _speakerAvatarImages.GetValueOrDefault(plan.KeptId);
 
+        // Transcript lines, their word counts and avatar caches all key off speaker id, so each must be remapped.
         var lines = _transcript.ToList();
         if (_partialItem is { } partial && !lines.Contains(partial)) lines.Add(partial);
         foreach (var line in lines.Where(line => plan.Absorbs(line.SpeakerId)))
         {
             line.SpeakerId = plan.KeptId;
+            // Partial (provisional) lines are dimmed; keep the label so they remain visibly unfinalised.
             line.Speaker = line.Opacity < 1 ? $"{display} (provisional)" : display;
             line.SpeakerBrush = brush;
             line.AvatarInitials = avatar.Initials;
@@ -183,17 +194,20 @@ public sealed partial class MainWindow
         }
         if (_lastFinalSpeakerId is not null) _lastFinalSpeakerId = plan.Remap(_lastFinalSpeakerId);
 
+        // Drop absorbed ids from the queue of speakers waiting for a name prompt, preserving order of the rest.
         var pending = _pendingUnknownSpeakers.Where(id => !plan.Absorbs(id)).ToArray();
         _pendingUnknownSpeakers.Clear();
         foreach (var id in pending) _pendingUnknownSpeakers.Enqueue(id);
         if (_currentPromptSpeakerId is not null && plan.Absorbs(_currentPromptSpeakerId))
         {
+            // The prompt on screen refers to a speaker that no longer exists; close it and advance to the next one.
             _currentPromptSpeakerId = null;
             SpeakerNamingPanel.Visibility = Visibility.Collapsed;
             _suppressAutoDismiss = false;
             ShowNextSpeakerPrompt();
         }
 
+        // Re-derive dependent views last, after all row/count state is consistent.
         RefreshSpeakerTimeline();
         RefreshVisualization();
         UpdateRecordingPresentation();
