@@ -1150,7 +1150,9 @@ internal static class UiStateChecks
         Check.Equal("topic-0001", projection.TopicBrief!.TopicId);
         Check.Equal("Avery release readiness", projection.TopicBrief.Label);
         Check.Equal("Earlier topic you selected", projection.TopicBrief.Status);
-        Check.Equal("Discussed around 18:00:10.", projection.TopicBrief.DiscussedAt);
+        var localDiscussionTime = DateTimeOffset.Parse("2026-09-23T18:00:10-07:00")
+            .LocalDateTime.ToString("HH:mm:ss");
+        Check.Equal($"Discussed around {localDiscussionTime}.", projection.TopicBrief.DiscussedAt);
         Check.True(projection.Trail[0].HasNext && !projection.Trail[1].HasNext);
         Check.True(projection.Trail[1].AccessibleName.Contains("Current topic", StringComparison.Ordinal));
         Check.True(projection.Trail[0].AccessibleName.Contains("Selected", StringComparison.Ordinal));
