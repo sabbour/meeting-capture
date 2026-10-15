@@ -1,5 +1,6 @@
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Visibility, countdown and button text for the save review (a short window to save or discard).</summary>
 internal readonly record struct SaveReviewPresentation(
     bool IsVisible,
     bool CanDecide,

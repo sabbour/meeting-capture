@@ -1,13 +1,19 @@
 namespace MeetingCapture.TrayApp;
 
+/// <summary>A window position and size in pixels.</summary>
 internal readonly record struct WindowBounds(int X, int Y, int Width, int Height);
+
+/// <summary>Maximum heights given to the overview and transcript areas of the recording page.</summary>
 internal readonly record struct RecordingLayoutAllocation(
     double OverviewMaxHeight,
     double TranscriptMaxHeight);
+
+/// <summary>Widths given to the main area and the topic pane.</summary>
 internal readonly record struct VisualizationLayoutAllocation(
     double PrimaryWidth,
     double VisualizationWidth);
 
+/// <summary>Chooses the default size and position of the main window, scaled for display DPI.</summary>
 internal static class WindowPlacement
 {
     internal const int DefaultWidth = 600;
@@ -102,6 +108,7 @@ internal static class WindowPlacement
     private static int Scale(int value, double scale) => (int)Math.Round(value * scale);
 }
 
+/// <summary>Splits the window width between the main area and the topic pane, keeping a minimum width for the main area.</summary>
 internal static class VisualizationLayout
 {
     internal const double MinimumPrimaryWidth = 480;
@@ -131,6 +138,7 @@ internal static class VisualizationLayout
     }
 }
 
+/// <summary>Splits the available height between the overview and the transcript on the recording page.</summary>
 internal static class RecordingLayout
 {
     internal const double DesiredOverviewHeight = 320;

@@ -2,6 +2,7 @@ using System.Text.RegularExpressions;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>What happened to an AI request in the diagnostics stream.</summary>
 public enum AiDiagnosticEventKind
 {
     Started,
@@ -14,6 +15,7 @@ public enum AiDiagnosticEventKind
     Persistence
 }
 
+/// <summary>The step of AI work that a diagnostic event belongs to.</summary>
 public enum AiDiagnosticStage
 {
     CopilotRequest,
@@ -23,6 +25,7 @@ public enum AiDiagnosticStage
     VisualizationJournal
 }
 
+/// <summary>Result of retrying or recovering a failed save of AI output.</summary>
 public enum AiDiagnosticRetryOutcome
 {
     RetryAvailable,
@@ -33,6 +36,7 @@ public enum AiDiagnosticRetryOutcome
     RecoveryUnavailable
 }
 
+/// <summary>One recorded AI request for diagnostics: timing, capability, provider and model, and outcome.</summary>
 public sealed record AiDiagnosticEvent(
     long Sequence,
     string? SessionId,
@@ -66,12 +70,18 @@ public sealed record AiDiagnosticEvent(
     int? ErrorCode = null,
     AiDiagnosticRetryOutcome? RetryOutcome = null);
 
+/// <summary>A copy of the recent AI diagnostic events at one time.</summary>
 public sealed record AiDiagnosticsSnapshot(
     string? SessionId,
     DateTimeOffset CapturedAt,
     bool SensitiveContentCaptureEnabled,
     IReadOnlyList<AiDiagnosticEvent> Events);
 
+/// <summary>
+/// Keeps a bounded, in-memory list of recent AI diagnostic events for the current recording
+/// session. Secrets are redacted from captured text, and prompt or response payloads are kept
+/// only when sensitive-content capture is turned on. Raises <see cref="Changed"/> on updates.
+/// </summary>
 public sealed class AiDiagnosticsStream
 {
     private const int DefaultCapacity = 256;
@@ -114,6 +124,7 @@ public sealed class AiDiagnosticsStream
         get { lock (_gate) return _captureSensitiveContent; }
     }
 
+    /// <summary>Clears all events and starts a new session. Later events from the old session are ignored.</summary>
     public void Reset(string sessionId)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(sessionId);
@@ -371,6 +382,7 @@ public sealed class AiDiagnosticsStream
         return cleaned.Length <= 160 ? cleaned : cleaned[..160];
     }
 
+    /// <summary>Records lifecycle, result, and usage events for one AI diagnostics request.</summary>
     internal sealed class RequestObservation(
         AiDiagnosticsStream owner,
         long generation,
@@ -441,6 +453,7 @@ public sealed class AiDiagnosticsStream
             value is null ? current : (current ?? 0) + value.Value;
     }
 
+    /// <summary>Accumulates the current diagnostic state and reported usage for one AI request.</summary>
     internal sealed class RequestState(
         long requestId,
         string correlationId,

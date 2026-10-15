@@ -4,8 +4,10 @@ using Microsoft.Identity.Client;
 
 namespace MeetingCapture.WorkIq;
 
+/// <summary>Stores the Microsoft sign-in token cache for WorkIQ on disk in encrypted form.</summary>
 public sealed class ProtectedWorkIqCache
 {
+    /// <summary>Gets the default per-user path for the protected Work IQ token cache.</summary>
     public static string DefaultPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "MeetingCapture", "workiq.msal.bin");
     private readonly string _path;
@@ -13,11 +15,13 @@ public sealed class ProtectedWorkIqCache
     private sealed class Snapshot { public byte[]? Encrypted; }
     public ProtectedWorkIqCache(string? path = null) => _path = path ?? DefaultPath;
 
+    /// <summary>Registers cache handlers that restore persisted token data on first access.</summary>
     public void Load(IPublicClientApplication app)
     {
         Attach(app, restore: true);
     }
 
+    /// <summary>Registers callbacks to optionally restore and protect token-cache data for an application.</summary>
     public void Attach(IPublicClientApplication app, bool restore = false)
     {
         var snapshot = _snapshots.GetOrCreateValue(app);
@@ -51,6 +55,7 @@ public sealed class ProtectedWorkIqCache
         });
     }
 
+    /// <summary>Persists the latest protected token-cache snapshot captured by the registered callback.</summary>
     public void Save(IPublicClientApplication app)
     {
         var temp = _path + ".tmp";
@@ -68,6 +73,7 @@ public sealed class ProtectedWorkIqCache
         }
     }
 
+    /// <summary>Deletes the persisted token cache and any leftover temporary file.</summary>
     public void Clear()
     {
         try

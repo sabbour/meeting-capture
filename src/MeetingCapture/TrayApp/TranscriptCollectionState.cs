@@ -2,12 +2,14 @@ using System.Collections.ObjectModel;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>A transcript row that can be updated in place when its revision or speaker changes.</summary>
 internal interface ITranscriptRowState
 {
     long Revision { get; set; }
     string SpeakerId { get; set; }
 }
 
+/// <summary>What an update did to a transcript row: added, changed, or turned a partial into a final line.</summary>
 internal readonly record struct TranscriptCollectionUpdate<T>(
     T Row,
     bool Added,
@@ -17,6 +19,7 @@ internal readonly record struct TranscriptCollectionUpdate<T>(
     internal bool RequiresFollow => Added || FinalizedPartial;
 }
 
+/// <summary>Holds the transcript rows shown in the UI, up to <c>capacity</c>, plus the one in-progress partial row.</summary>
 internal sealed class TranscriptCollectionState<T>(int capacity)
     where T : class, ITranscriptRowState
 {

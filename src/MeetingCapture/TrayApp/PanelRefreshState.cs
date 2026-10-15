@@ -2,22 +2,33 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Stage of an insight panel refresh.</summary>
 public enum PanelState
 {
     Pending, Refreshing, SucceededWithResults, SucceededEmpty, Failed, Unavailable
 }
 
+/// <summary>Latest refresh result for one panel: the state, which transcript and settings revisions it used, and any failure.</summary>
 public sealed record PanelStatus(
     PanelState State, string SessionId, long TranscriptRevision, long ConfigurationRevision,
     DateTimeOffset? LastAttemptAt, DateTimeOffset? LastSuccessAt, IntelligenceFailure? Failure);
 
+/// <summary>
+/// Tracks refreshes of one insight panel. Only one refresh runs at a time, and a result from an
+/// older generation (after <see cref="Invalidate"/>) or an older transcript revision is ignored.
+/// </summary>
 public sealed class PanelRefreshState
 {
     private long _generation;
     private bool _busy;
+
+    /// <summary>True while a refresh started by <see cref="TryBegin"/> has not yet ended.</summary>
     public bool IsBusy => _busy;
+
+    /// <summary>The latest status of the panel.</summary>
     public PanelStatus Status { get; private set; } = new(PanelState.Pending, "", -1, -1, null, null, null);
 
+    /// <summary>Resets the panel to pending for a new session or settings revision, and drops results from earlier refreshes.</summary>
     public void Invalidate(string sessionId, long configurationRevision)
     {
         _generation++;
@@ -25,6 +36,7 @@ public sealed class PanelRefreshState
         // Cancellation does not prove the underlying operation finished. Keep its guard.
     }
 
+    /// <summary>Starts a refresh. Returns its generation, or null if one is already running or the transcript has not advanced (unless forced).</summary>
     public long? TryBegin(string sessionId, long revision, long configurationRevision, bool force)
     {
         if (_busy || Status.SessionId != sessionId || Status.ConfigurationRevision != configurationRevision ||
@@ -35,6 +47,7 @@ public sealed class PanelRefreshState
         return _generation;
     }
 
+    /// <summary>Records a refresh result. Returns false and ignores it if it is stale.</summary>
     public bool Complete(long generation, long revision, bool hasResults, IntelligenceFailure? failure)
     {
         if (generation != _generation || revision < Status.TranscriptRevision)
@@ -53,6 +66,7 @@ public sealed class PanelRefreshState
         return true;
     }
 
+    /// <summary>Marks the refresh as finished so a new one can start. A refresh that left no result returns to pending.</summary>
     public void End(long generation)
     {
         _busy = false;
@@ -61,8 +75,10 @@ public sealed class PanelRefreshState
     }
 }
 
+/// <summary>Keeps insight lists stable between refreshes.</summary>
 public static class InsightRetention
 {
+    /// <summary>Returns trimmed snapshot items that are not already in <paramref name="existing"/> (case-insensitive, no repeats).</summary>
     public static IReadOnlyList<string> NewItems(IEnumerable<string> existing, IEnumerable<string> snapshot)
     {
         var seen = existing.ToHashSet(StringComparer.OrdinalIgnoreCase);

@@ -2,6 +2,7 @@ using System.ComponentModel;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>A checklist row (such as an action item) that raises change notifications when its completed state changes.</summary>
 public sealed class ChecklistItemViewModel : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
@@ -27,6 +28,7 @@ public sealed class ChecklistItemViewModel : INotifyPropertyChanged
     private void Notify(string name) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 }
 
+/// <summary>Builds checklist header text, such as the open and done counts.</summary>
 internal static class ChecklistPresentation
 {
     internal static string Header(string label, IEnumerable<ChecklistItemViewModel> items)

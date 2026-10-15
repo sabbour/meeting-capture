@@ -3,6 +3,7 @@ using System.Text;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>A request for related context: the topic to search for, in a recording session at a transcript revision.</summary>
 public sealed record ContextQuery(
     string SessionId,
     string Topic,
@@ -10,8 +11,10 @@ public sealed record ContextQuery(
     bool ForceRefresh = false,
     string? TopicId = null);
 
+/// <summary>Whether a related-context item reports a past fact or a connection inferred by the model.</summary>
 public enum ClaimKind { HistoricalFact, InferredConnection }
 
+/// <summary>The kind of source a related-context item comes from.</summary>
 public enum ContextSourceType
 {
     TeamsMessage, TeamsChannel, OutlookMail, Calendar, Document, MeetingArtifact, LocalTranscript,
@@ -19,6 +22,7 @@ public enum ContextSourceType
     TeamsGroupChat
 }
 
+/// <summary>How the current user took part in a related source (for example author, attendee, or email recipient).</summary>
 public enum ContextInvolvementRole
 {
     TeamsAuthor,
@@ -32,13 +36,16 @@ public enum ContextInvolvementRole
     EmailBccRecipient
 }
 
+/// <summary>How the user was matched to a participant of a source: by directory object ID or by a verified alias.</summary>
 public enum ContextIdentityMatchKind { ObjectId, VerifiedAlias }
 
+/// <summary>Cleans titles returned by related-context sources.</summary>
 public static class RelatedContextTitle
 {
     private static readonly string[] KnownWrappers =
         ["TeamsMessage", "File", "Event", "Email"];
 
+    /// <summary>Collapses whitespace and removes a wrapping tag such as &lt;TeamsMessage&gt;...&lt;/TeamsMessage&gt;.</summary>
     public static string Clean(string? value, ContextSourceType? sourceType)
     {
         var title = string.Join(" ", (value ?? string.Empty).Split(
@@ -64,8 +71,10 @@ public static class RelatedContextTitle
     }
 }
 
+/// <summary>Outcome of a related-context lookup.</summary>
 public enum RelatedContextAvailability { Available, NoEvidence, Unavailable, Error }
 
+/// <summary>A source (such as a message, email, or document) that backs a related-context item.</summary>
 public sealed record ContextEvidenceSource(
     string Title,
     string Url,
@@ -76,6 +85,7 @@ public sealed record ContextEvidenceSource(
     ContextInvolvementRole? InvolvementRole = null,
     ContextIdentityMatchKind? InvolvementMatchKind = null);
 
+/// <summary>A related-context suggestion with a summary and the sources that support it.</summary>
 public sealed record RelatedContextItem(
     string Title,
     string Summary,
@@ -84,19 +94,30 @@ public sealed record RelatedContextItem(
     string? RelevanceRationale = null,
     string? SuggestionId = null);
 
+/// <summary>The result of one related-context lookup: items, availability, and an optional detail message.</summary>
 public sealed record RelatedContextSnapshot(
     DateTimeOffset RetrievedAt,
     IReadOnlyList<RelatedContextItem> Items,
     RelatedContextAvailability Availability,
     string? Detail = null);
 
+/// <summary>A provider of related context for a meeting topic.</summary>
 public interface IRelatedContextSource
 {
+    /// <summary>True when the source can currently be queried.</summary>
     bool IsAvailable { get; }
+
+    /// <summary>Changes when the source state changes (for example sign-in), so cached results can be discarded.</summary>
     long Revision { get; }
+
+    /// <summary>Finds related context for the topic in <paramref name="query"/>.</summary>
     Task<RelatedContextSnapshot> GetRelatedContextAsync(ContextQuery query, CancellationToken cancellationToken);
 }
 
+/// <summary>
+/// Cleans and limits related-context results before display: trims text, allows only HTTPS
+/// source URLs without credentials, removes duplicates, and keeps at most 5 items.
+/// </summary>
 public static class RelatedContextNormalizer
 {
     private const int MaxItems = 5;
@@ -105,6 +126,10 @@ public static class RelatedContextNormalizer
     private const int MaxSummaryLength = 320;
     private const int MaxRationaleLength = 240;
 
+    /// <summary>
+    /// Returns a cleaned copy of <paramref name="snapshot"/>. Non-available results lose their items and
+    /// get a fixed safe message; an available result with no valid items becomes <c>NoEvidence</c>.
+    /// </summary>
     public static RelatedContextSnapshot Normalize(RelatedContextSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);

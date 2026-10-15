@@ -4,6 +4,11 @@ using MeetingCapture.Transcription;
 
 namespace MeetingCapture.Intelligence;
 
+/// <summary>
+/// Holds the live meeting visualization model for one recording session: transcript segments,
+/// speakers, topics, evidence, and analysis results. Thread-safe. Changes bump <see cref="Revision"/>
+/// and raise <see cref="Changed"/>. Call <see cref="Snapshot"/> to read an immutable copy.
+/// </summary>
 public sealed class MeetingVisualizationSession
 {
     internal const int TopicLabelCharacterLimit = 80;
@@ -36,10 +41,16 @@ public sealed class MeetingVisualizationSession
     private int? _reanalysisFromOrdinal;
     private bool _publishingChanges;
 
+    /// <summary>Raised with the new revision after the session content changes.</summary>
     public event EventHandler<long>? Changed;
+
+    /// <summary>Increases each time the session content changes.</summary>
     public long Revision { get { lock (_gate) return _revision; } }
+
+    /// <summary>True after <see cref="Begin"/> and before <see cref="Complete"/>.</summary>
     public bool HasActiveSession { get { lock (_gate) return _sessionId.Length > 0 && !_closed; } }
 
+    /// <summary>Clears previous data and starts a new session.</summary>
     public void Begin(string sessionId, string meetingTitle, DateTimeOffset startedAt)
     {
         if (string.IsNullOrWhiteSpace(sessionId)) throw new ArgumentException("Session ID is required.", nameof(sessionId));
@@ -55,6 +66,7 @@ public sealed class MeetingVisualizationSession
         PublishChanged(publish);
     }
 
+    /// <summary>Adds the transcript segment at <paramref name="ordinal"/>, or replaces it if it already exists.</summary>
     public void AppendOrUpdateSegment(int ordinal, TranscriptionSegment segment)
         => UpdateSegment(null, ordinal, segment, null);
 
@@ -144,6 +156,10 @@ public sealed class MeetingVisualizationSession
         PublishChanged(publish);
     }
 
+    /// <summary>
+    /// Adds a new topic, or updates the topic given by <paramref name="existingTopicId"/> with the new label.
+    /// Adds a topic-trail entry when the topic changes from the previous one.
+    /// </summary>
     public TopicCluster AcceptTopic(
         string label, long transcriptRevision, int throughSegmentOrdinal, string? existingTopicId = null)
     {
@@ -195,6 +211,7 @@ public sealed class MeetingVisualizationSession
         return result;
     }
 
+    /// <summary>Stores each source in the snapshot as related-source evidence for a topic. Existing evidence for the same URL is updated.</summary>
     public void ApplyRelatedContext(string topicId, RelatedContextSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
@@ -236,6 +253,7 @@ public sealed class MeetingVisualizationSession
         PublishChanged(publish);
     }
 
+    /// <summary>Applies only the delta (questions, evidence, links, actions, decisions) without changing topic labels.</summary>
     public void ApplyAnalysisDelta(MeetingVisualizationAnalysisDelta delta)
     {
         ArgumentNullException.ThrowIfNull(delta);
@@ -245,6 +263,10 @@ public sealed class MeetingVisualizationSession
         PublishChanged(publish);
     }
 
+    /// <summary>
+    /// Applies a full analysis result, including topic assignments. <paramref name="analyzedPrefix"/>
+    /// is the document state that was sent for analysis.
+    /// </summary>
     public void ApplyAnalysisResult(
         MeetingVisualizationDocument analyzedPrefix, MeetingVisualizationAnalysisResult result)
     {
@@ -532,6 +554,7 @@ public sealed class MeetingVisualizationSession
         return ChangedLocked();
     }
 
+    /// <summary>Marks the session as ended. After this, most changes are rejected, but speaker merges are still allowed.</summary>
     public void Complete(DateTimeOffset endedAt, bool isComplete)
     {
         bool publish;
@@ -546,6 +569,7 @@ public sealed class MeetingVisualizationSession
         PublishChanged(publish);
     }
 
+    /// <summary>Returns an immutable copy of the current session. Throws if no session was started.</summary>
     public MeetingVisualizationDocument Snapshot()
     {
         lock (_gate) return SnapshotLocked();

@@ -14,10 +14,12 @@ public sealed record ParticipantChip(string Initials, string DisplayName, bool I
         : $"{DisplayName}, scheduled invitee";
 }
 
+/// <summary>The few participant chips to show, and text for how many more are hidden.</summary>
 internal readonly record struct ParticipantPreview(
     IReadOnlyList<ParticipantChip> Chips,
     string Overflow);
 
+/// <summary>Status, freshness and guidance text for the participant roster.</summary>
 internal readonly record struct RosterPresentation(
     string Status,
     string Freshness,

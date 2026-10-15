@@ -11,6 +11,7 @@ using Windows.UI.Text;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Strikes through text when the bound value is true (for completed checklist items).</summary>
 public sealed class CompletionTextDecorationsConverter : IValueConverter
 {
     public object Convert(object value, Type targetType, object parameter, string language)
@@ -166,6 +167,7 @@ public sealed class MeetingRow
     }
 }
 
+/// <summary>A person the user can pick as a speaker's name. <c>Display</c> adds "(You)" or the email.</summary>
 public sealed record SpeakerNameOption(string Name, string? Email, bool IsLocal = false)
 {
     public string Display => IsLocal ? $"{Name} (You)"
@@ -203,6 +205,7 @@ public sealed class RelatedItemViewModel
     public string SourceGlyph { get; }
 }
 
+/// <summary>A source (for example a meeting, message, email or file) that backs a related context item.</summary>
 public sealed class ContextEvidenceSourceViewModel
 {
     public static IReadOnlyList<ContextEvidenceSourceViewModel> Create(RelatedContextItem item) =>

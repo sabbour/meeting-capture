@@ -33,6 +33,9 @@ public interface IMeetingDetector : IDisposable
     /// <summary>Clear snooze and dismissal cooldowns; reevaluate on the next poll.</summary>
     void Resume();
 
+    /// <summary>Starts polling. Does nothing if polling is already running.</summary>
     Task StartAsync(CancellationToken cancellationToken);
+
+    /// <summary>Stops polling.</summary>
     Task StopAsync(CancellationToken cancellationToken);
 }

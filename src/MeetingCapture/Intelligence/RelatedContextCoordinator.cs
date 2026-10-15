@@ -1,7 +1,9 @@
 namespace MeetingCapture.Intelligence;
 
+/// <summary>Progress of related-context loading for the current topic.</summary>
 public enum RelatedContextState { Pending, Refreshing, Cached, Available, NoEvidence, Unavailable, Failed }
 
+/// <summary>Current related-context state with the topic, revisions, and latest snapshot it applies to.</summary>
 public sealed record RelatedContextStatus(
     RelatedContextState State,
     string SessionId,
@@ -12,6 +14,11 @@ public sealed record RelatedContextStatus(
     string? Detail,
     string? TopicId = null);
 
+/// <summary>
+/// Runs related-context lookups for the current topic. It avoids duplicate requests, queues one
+/// pending request per topic, drops stale results, caches the last result, and publishes
+/// <see cref="StatusChanged"/> as the state changes.
+/// </summary>
 public sealed class RelatedContextCoordinator : IDisposable
 {
     private const int MaxTopicLength = 240;
@@ -33,11 +40,17 @@ public sealed class RelatedContextCoordinator : IDisposable
         _source = source;
     }
 
+    /// <summary>Raised when <see cref="Status"/> changes.</summary>
     public event EventHandler<RelatedContextStatus>? StatusChanged;
 
+    /// <summary>The latest status.</summary>
     public RelatedContextStatus Status { get; private set; } =
         new(RelatedContextState.Pending, string.Empty, string.Empty, -1, -1, null, null);
 
+    /// <summary>
+    /// Loads related context for <paramref name="query"/>. May return the current status, join a request
+    /// already in progress, or queue the query. Set <c>ForceRefresh</c> to ignore the cache.
+    /// </summary>
     public Task<RelatedContextStatus> RefreshAsync(ContextQuery query, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -147,6 +160,7 @@ public sealed class RelatedContextCoordinator : IDisposable
         return request.WaitAsync(cancellationToken);
     }
 
+    /// <summary>Cancels requests in progress and resets to the empty pending state.</summary>
     public void Invalidate()
     {
         RelatedContextStatus changed;

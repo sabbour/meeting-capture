@@ -2,8 +2,10 @@ using System.Reflection;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>A link shown in the About dialog.</summary>
 internal sealed record AboutLink(string Label, string Url);
 
+/// <summary>A third-party package credit with its license, shown in the About dialog.</summary>
 internal sealed record AboutCredit(string Name, string PackagePrefix, string License, string Url);
 
 /// <summary>Static content for the About dialog: no UI types so it can be checked offline.</summary>

@@ -5,6 +5,7 @@ using Microsoft.Extensions.Options;
 
 namespace MeetingCapture.AudioCapture;
 
+/// <summary>Identifies which capture source a PCM buffer came from.</summary>
 public enum AudioSource { Loopback, Microphone }
 
 /// <summary>Mixes microphone and loopback PCM on one bounded real-time clock.</summary>

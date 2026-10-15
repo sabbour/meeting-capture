@@ -7,8 +7,10 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.WorkIq;
 
+/// <summary>A search result from WorkIQ: the raw resource and an optional summary.</summary>
 public sealed record WorkIqSearchHit(JsonElement Resource, string? Summary);
 
+/// <summary>A meeting subject found through WorkIQ, with an optional summary.</summary>
 public sealed record WorkIqMeetingSubject(string Subject, string? Summary);
 
 /// <summary>

@@ -14,6 +14,7 @@ public sealed record TranscriptionSegment(
 /// </summary>
 public sealed record PartialTranscript(string Text, string? SpeakerId = null);
 
+/// <summary>A point-in-time copy of a session's transcript. <c>Revision</c> increases as it changes; <c>IsComplete</c> is true once recording ended.</summary>
 public sealed record TranscriptSnapshot
 {
     public string SessionId { get; }

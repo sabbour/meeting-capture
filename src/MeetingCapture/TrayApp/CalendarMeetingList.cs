@@ -2,12 +2,15 @@ using MeetingCapture.MeetingDetection;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Chooses and orders calendar meetings to offer when the user starts a recording.</summary>
 public static class CalendarMeetingList
 {
+    /// <summary>True if the meeting is running now, or starts within an hour before or after <paramref name="now"/>.</summary>
     public static bool IsAroundNow(MeetingTitleCandidate meeting, DateTimeOffset now)
         => meeting.Start <= now && now < meeting.End ||
            meeting.Start >= now.AddHours(-1) && meeting.Start <= now.AddHours(1);
 
+    /// <summary>Keeps eligible online meetings: those around now first (current ones first), then later ones, then earlier ones (newest first).</summary>
     public static List<MeetingTitleCandidate> Select(IEnumerable<MeetingTitleCandidate> meetings, DateTimeOffset now)
     {
         var timed = meetings.Where(MeetingTitleResolver.IsEligibleOnlineMeeting).ToArray();
@@ -19,6 +22,7 @@ public static class CalendarMeetingList
     }
 }
 
+/// <summary>Text shown in the "meeting detected" prompt.</summary>
 public sealed record MeetingPromptContent(
     string Title,
     string CalendarState,
@@ -26,6 +30,7 @@ public sealed record MeetingPromptContent(
     string? Organizer,
     string? Invitees);
 
+/// <summary>Builds the "meeting detected" prompt text from a detected session.</summary>
 public static class MeetingPromptPresentation
 {
     public static MeetingPromptContent Create(MeetingSession session, string calendarState)

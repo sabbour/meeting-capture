@@ -6,6 +6,7 @@ using Microsoft.UI.Xaml.Controls;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Speaker timeline part of the main window.</summary>
 public sealed partial class MainWindow
 {
     private bool _combineSpeakersDialogOpen;

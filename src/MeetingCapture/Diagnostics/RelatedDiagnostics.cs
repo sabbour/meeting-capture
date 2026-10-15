@@ -4,6 +4,10 @@ using MeetingCapture.WorkIq;
 
 namespace MeetingCapture.Diagnostics;
 
+/// <summary>
+/// Metadata-only log for related-context (WorkIQ) failures. It records the operation, failure
+/// kind, safe error code, HTTP status, and exception type, never message text.
+/// </summary>
 internal static class RelatedDiagnostics
 {
     private static readonly object Gate = new();
@@ -25,6 +29,7 @@ internal static class RelatedDiagnostics
             $"type={error.GetType().Name}{Environment.NewLine}";
     }
 
+    /// <summary>Appends one entry to related.log, rotating the file at 256 KB. Never throws.</summary>
     internal static void Record(string operation, bool? authenticated, Exception error, string? directory = null)
     {
         try

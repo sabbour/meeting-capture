@@ -2,6 +2,7 @@ using System.Globalization;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Initials and accessible name for a speaker avatar. Unresolved speakers show "?".</summary>
 internal readonly record struct SpeakerAvatarPresentation(string Initials, string AccessibleName)
 {
     public static SpeakerAvatarPresentation Create(string displayName, bool isResolved)

@@ -2,6 +2,7 @@ using MeetingCapture.Pipeline;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Which recording-page controls (paging, catch-up, summary) to show for the current pipeline state.</summary>
 public sealed record RecordingViewState(
     bool ShowPaging, bool ShowLatest, bool ShowCatchUp, bool CanSummarize,
     bool ShowSummaryRetry, string EmptyMessage)

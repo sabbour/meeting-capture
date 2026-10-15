@@ -3,6 +3,7 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.TrayApp;
 
+/// <summary>How the AI activity indicator looks.</summary>
 internal enum AiActivityVisualState
 {
     Unavailable,
@@ -13,6 +14,7 @@ internal enum AiActivityVisualState
     RateLimited,
 }
 
+/// <summary>Text and visual state for the AI activity indicator. <c>TransitionKey</c> changes when the display should animate.</summary>
 internal sealed record AiUsageUiPresentation(
     AiActivityVisualState State,
     string Header,
@@ -20,6 +22,7 @@ internal sealed record AiUsageUiPresentation(
     string Announcement,
     string TransitionKey);
 
+/// <summary>Builds the AI activity indicator from a usage snapshot.</summary>
 internal static class AiUsagePresentation
 {
     internal static AiUsageUiPresentation Create(AiUsageSnapshot snapshot)

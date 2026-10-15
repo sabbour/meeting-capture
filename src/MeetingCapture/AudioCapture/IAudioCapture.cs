@@ -12,6 +12,7 @@ public interface IAudioCapture : IDisposable
     /// <summary>True when the capture is actively recording.</summary>
     bool IsCapturing { get; }
 
+    /// <summary>Current health snapshot for each underlying audio source.</summary>
     IReadOnlyList<AudioSourceHealth> Health { get; }
 
     /// <summary>PCM sample rate in Hz.</summary>
@@ -26,16 +27,25 @@ public interface IAudioCapture : IDisposable
     /// </summary>
     event EventHandler<AudioDataEventArgs> DataAvailable;
 
+    /// <summary>Starts capturing and raising <see cref="DataAvailable"/>.</summary>
     Task StartAsync(CancellationToken cancellationToken);
+
+    /// <summary>Stops capturing and releases the underlying audio device.</summary>
     Task StopAsync(CancellationToken cancellationToken);
 }
 
+/// <summary>Lifecycle and quality state of one audio source.</summary>
 public enum CaptureHealthState { Disabled, Ready, Active, Degraded, Failed, Stopped }
 
+/// <summary>
+/// Snapshot of an audio source: byte and buffer counters, dropped buffers, time of the last audio,
+/// the latest level, and any error.
+/// </summary>
 public sealed record AudioSourceHealth(
     string Source, CaptureHealthState State, long ReceivedBytes, long ReceivedBuffers,
     long DroppedBuffers, DateTimeOffset? LastAudioAt, double? Level, string? Error);
 
+/// <summary>Carries a buffer of raw PCM bytes; only the first <see cref="BytesRecorded"/> bytes are valid.</summary>
 public sealed class AudioDataEventArgs(byte[] buffer, int bytesRecorded) : EventArgs
 {
     public byte[] Buffer { get; } = buffer;

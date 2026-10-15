@@ -4,6 +4,10 @@ using MeetingCapture.Intelligence;
 
 namespace MeetingCapture.Storage;
 
+/// <summary>
+/// Stores topic-map data as a JSON file beside the Markdown notes. The file records a SHA-256 hash
+/// of the notes so a load can detect when the notes changed afterwards.
+/// </summary>
 public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStorage
 {
     internal const long MaxJsonBytes = 16 * 1024 * 1024;
@@ -158,6 +162,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
     }
 }
 
+/// <summary>Checks that topic-map data is well formed and within size limits before it is saved or used.</summary>
 public static class MeetingVisualizationValidator
 {
     private const int MaxIdLength = 256;

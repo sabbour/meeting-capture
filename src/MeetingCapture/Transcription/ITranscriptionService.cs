@@ -2,6 +2,7 @@ using MeetingCapture.AudioCapture;
 
 namespace MeetingCapture.Transcription;
 
+/// <summary>Health of transcription: state, bytes received, last transcript time, and audio push timing.</summary>
 public sealed record TranscriptionHealth(
     CaptureHealthState State, long ReceivedBytes, DateTimeOffset? LastTranscriptAt,
     long PushWriteCount, double LastPushWriteMilliseconds,

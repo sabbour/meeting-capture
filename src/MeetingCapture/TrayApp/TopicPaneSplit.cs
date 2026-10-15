@@ -1,5 +1,6 @@
 namespace MeetingCapture.TrayApp;
 
+/// <summary>Layout rules for the split between the topic map and the notes pane.</summary>
 internal static class TopicPaneSplit
 {
     internal const double DefaultMainShare = 0.6;
