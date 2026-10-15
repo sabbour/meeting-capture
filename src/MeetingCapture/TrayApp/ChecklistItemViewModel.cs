@@ -18,6 +18,7 @@ public sealed class ChecklistItemViewModel : INotifyPropertyChanged
         {
             if (_isCompleted == value) return;
             _isCompleted = value;
+            // The text style also depends on completion, so notify both bound values.
             Notify(nameof(IsCompleted));
             Notify(nameof(TextOpacity));
         }
@@ -33,6 +34,7 @@ internal static class ChecklistPresentation
 {
     internal static string Header(string label, IEnumerable<ChecklistItemViewModel> items)
     {
+        // Count completed items once, then derive the open count from the full list.
         var completed = items.Count(item => item.IsCompleted);
         return $"{label} ({items.Count() - completed} open, {completed} done)";
     }

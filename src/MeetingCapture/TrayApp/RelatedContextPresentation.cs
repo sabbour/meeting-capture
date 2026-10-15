@@ -37,12 +37,14 @@ internal static class RelatedContextPresentation
         RelatedContextStatus? status,
         bool workIqAuthenticated)
     {
+        // Sign-in state is clearer than an old request error, so report it before inspecting the last result.
         if (!workIqAuthenticated)
             return "Workplace suggestions are unavailable: not signed in to Work IQ.";
         if (status is null ||
             status.State is not (RelatedContextState.Unavailable or RelatedContextState.Failed))
             return string.Empty;
 
+        // Prefer the provider snapshot's detail, then fall back to the coordinator's status text.
         var detail = status.Snapshot?.Detail ?? status.Detail ?? string.Empty;
         var reason = detail.Contains("timed out", StringComparison.OrdinalIgnoreCase)
             ? "Work IQ timed out"
@@ -107,6 +109,7 @@ internal static class RelatedContextPresentation
         bool workIqAuthenticated,
         int itemCount)
     {
+        // Skip remote lookup for ineligible topics before describing any prior request state.
         if (!string.IsNullOrWhiteSpace(acceptedTopic) && !topicEligible)
             return new(
                 "Related suggestions are skipped for long summaries; the topic map continues updating.",
@@ -150,6 +153,7 @@ internal static class RelatedContextPresentation
         if (queried.Length == 0)
             return new(string.Empty, string.Empty, false);
 
+        // Compare normalized labels so casing and extra spaces do not make the same topic look historical.
         var earlier = !string.Equals(
             Normalize(queried),
             Normalize(acceptedTopic),
@@ -181,6 +185,7 @@ internal static class ContextTitlePresentation
     internal static string UniqueDetail(string? summary, params string?[] titles)
     {
         var detail = Clean(summary);
+        // Retrieval boilerplate and a repeated title add no useful source detail.
         if (detail.Length == 0 ||
             detail.StartsWith("WorkIQ retrieval identified this ", StringComparison.OrdinalIgnoreCase))
             return string.Empty;

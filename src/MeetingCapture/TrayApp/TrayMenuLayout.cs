@@ -27,6 +27,7 @@ internal static class TrayMenuLayout
         IEnumerable<double> visibleRowHeightsDip, int dpi, WindowBounds workArea)
     {
         var scale = ScaleFor(dpi);
+        // Measure visible items, add menu chrome, and clamp the result to this monitor's usable area.
         var contentDip = Math.Min(visibleRowHeightsDip.Sum() + ChromeDip, MaxHeightDip);
         var width = (int)Math.Round(MenuWidthDip * scale) + FrameSlackPx;
         var height = (int)Math.Round(contentDip * scale) + FrameSlackPx;
@@ -41,6 +42,7 @@ internal static class TrayMenuLayout
     /// </summary>
     internal static WindowBounds Place(int cursorX, int cursorY, int width, int height, WindowBounds workArea)
     {
+        // Align the right edge to the cursor and prefer opening upward, like a standard taskbar menu.
         var right = workArea.X + workArea.Width;
         var bottom = workArea.Y + workArea.Height;
 

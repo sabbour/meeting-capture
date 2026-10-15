@@ -42,14 +42,17 @@ internal static class AboutInfo
     internal static string Version()
     {
         var assembly = typeof(AboutInfo).Assembly;
+        // Use the release label when present, with the assembly version as a fallback for local builds.
         var informational = assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
         var version = string.IsNullOrWhiteSpace(informational) ? assembly.GetName().Version?.ToString() : informational;
         if (string.IsNullOrWhiteSpace(version)) return "Development build";
+        // Informational versions can include a source-control hash after '+', which is not useful in the About dialog.
         var build = version.IndexOf('+');
         return build > 0 ? version[..build] : version;
     }
 
     /// <summary>The credit that covers a package id, or null when the dependency is uncredited.</summary>
     internal static AboutCredit? CreditFor(string packageId)
+        // Package-id prefixes let one credit cover related packages without listing every id.
         => Credits.FirstOrDefault(c => packageId.StartsWith(c.PackagePrefix, StringComparison.OrdinalIgnoreCase));
 }

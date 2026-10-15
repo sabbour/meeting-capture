@@ -14,6 +14,7 @@ public sealed partial class MainWindow
     /// <summary>Recomputes every speaker's timeline row from the pipeline transcript, updating rows in place.</summary>
     private void RefreshSpeakerTimeline()
     {
+        // Use only transcript data belonging to the active UI session; a late completion from another session is ignored.
         if (_sessionId is null ||
             (_pipeline.CurrentTranscript ?? _pipeline.LastCompletedTranscript) is not { } transcript ||
             transcript.SessionId != _sessionId)
@@ -24,6 +25,7 @@ public sealed partial class MainWindow
         var resolver = _pipeline.SpeakerResolver;
         var existing = _speakerBalance.ToDictionary(row => row.SpeakerId, StringComparer.OrdinalIgnoreCase);
         var rows = new List<SpeakerBalance>(model.Rows.Count);
+        // Reuse row view models so changing spans or a resolved name does not rebuild the whole panel.
         foreach (var item in model.Rows)
         {
             if (!existing.TryGetValue(item.SpeakerId, out var row))
@@ -89,6 +91,7 @@ public sealed partial class MainWindow
             keep.Items.Clear();
             foreach (var row in chosen)
                 keep.Items.Add(new ComboBoxItem { Content = row.Name, Tag = row });
+            // Preserve the user's current choice when possible; otherwise keep a resolved name before an unknown label.
             var preferred = chosen.FirstOrDefault(row => ReferenceEquals(row, previous)) ??
                 chosen.FirstOrDefault(row => resolver.IsResolved(row.SpeakerId)) ?? chosen.FirstOrDefault();
             if (preferred is not null) keep.SelectedIndex = chosen.IndexOf(preferred);
@@ -129,6 +132,7 @@ public sealed partial class MainWindow
         if (plan is null) return;
         var sessionId = _sessionId;
         Exception? failure = null;
+        // The pipeline owns transcript/storage changes; update this window only after the resolver confirms the merge.
         try { await _pipeline.MergeSpeakersAsync(speakerIds, keptId); }
         catch (Exception ex) when (ex is not OutOfMemoryException) { failure = ex; }
 
@@ -151,6 +155,7 @@ public sealed partial class MainWindow
 
     private void ApplySpeakerMergeToUi(SpeakerMergePlan plan)
     {
+        // Repoint existing rows instead of recreating them so transcript order and current scroll position stay intact.
         var resolver = _pipeline.SpeakerResolver;
         var display = resolver.GetDisplayName(plan.KeptId);
         var avatar = SpeakerAvatarPresentation.Create(display, resolver.IsResolved(plan.KeptId));

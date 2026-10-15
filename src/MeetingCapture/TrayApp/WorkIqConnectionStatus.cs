@@ -26,6 +26,7 @@ public sealed class WorkIqConnectionStatus
 
     public bool AuthenticationChanged(bool authenticated, long revision)
     {
+        // Ignore late auth events so an older sign-in result cannot overwrite the current connection state.
         if (revision <= _authRevision) return false;
         _authRevision = revision;
         LastSuccessfulRefresh = null;
@@ -44,6 +45,7 @@ public sealed class WorkIqConnectionStatus
     public void BeginCalendar(int cachedMeetingCount = 0)
     {
         if (cachedMeetingCount < 0) throw new ArgumentOutOfRangeException(nameof(cachedMeetingCount));
+        // Keep already loaded meetings available while refresh runs, but tell the user their times may be stale.
         IsRefreshing = true;
         Message = CalendarConnected ? "WorkIQ connected; refreshing calendar..."
             : "WorkIQ signed in; connecting calendar...";
@@ -56,6 +58,7 @@ public sealed class WorkIqConnectionStatus
     public void CalendarSucceeded(int count, DateTimeOffset at)
     {
         if (count < 0) throw new ArgumentOutOfRangeException(nameof(count));
+        // Only a successful response establishes the connected state and replaces the freshness timestamp.
         CalendarConnected = true;
         IsRefreshing = false;
         LastSuccessfulRefresh = at;

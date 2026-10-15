@@ -11,6 +11,7 @@ public sealed record RecordingViewState(
         bool followLatest, bool summaryFailed, bool summaryBusy)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(finalizedSegments);
+        // Compute the page controls from pipeline state and retained speech in one place.
         var hasSpeech = finalizedSegments > 0;
         var recording = state == PipelineState.Recording;
         return new(
@@ -31,6 +32,7 @@ public sealed record RecordingViewState(
     public static (bool Visible, bool Enabled, string Message) NewRecordingAction(
         PipelineStatus status, bool canStart, bool preparingExit, bool retryBusy, bool previewBusy)
     {
+        // Keep the action visible for completed/failed sessions, but disable it while work could conflict.
         var visible = canStart || status.State is PipelineState.Saved or PipelineState.Discarded or PipelineState.Failed;
         var enabled = canStart && !preparingExit && !retryBusy && !previewBusy;
         var message = preparingExit ? "The app is exiting. Reopen it to start a new recording."

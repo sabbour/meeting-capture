@@ -9,6 +9,7 @@ internal sealed class RelayCommand : ICommand
 
     public RelayCommand(Action execute) => _execute = execute;
 
+    // Tray commands are always available; each action checks its own current state before doing work.
     public bool CanExecute(object? parameter) => true;
 
 #pragma warning disable CS0067 // Required by ICommand; not raised because CanExecute is constant.

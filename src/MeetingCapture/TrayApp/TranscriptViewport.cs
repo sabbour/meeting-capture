@@ -15,6 +15,7 @@ public sealed class TranscriptViewport
     /// <summary>Recomputes the visible range for a transcript with <paramref name="total"/> rows.</summary>
     public (int Start, int Count) Update(int total)
     {
+        // FollowLatest tracks the tail; a paused viewport keeps its requested page inside the new transcript bounds.
         if (FollowLatest) Start = Math.Max(0, total - Capacity);
         Start = Math.Clamp(Start, 0, Math.Max(0, total - 1));
         return (Start, Math.Min(Capacity, total - Start));

@@ -179,6 +179,7 @@ internal sealed record MeetingBrainMapLayout(
         var rows = leafCounts.Count == 0
             ? 0
             : (leafCounts.Count + columns - 1) / columns;
+        // Each row must fit its tallest topic and leaf stack before the next row begins.
         var rowHeights = new double[rows];
         for (var row = 0; row < rows; row++)
         {
@@ -454,6 +455,7 @@ internal static class TopicMapState
         string Display(string? text) =>
             MeetingNotesText.WithoutSegmentOrdinals(ProjectSpeakers(text, speakers).Trim());
         var latestTopicId = document.TopicTrail.LastOrDefault()?.TopicId;
+        // A stale selection can outlive a document revision, so fall back to a topic that still exists.
         var current = currentTopicId is not null && topics.ContainsKey(currentTopicId)
             ? currentTopicId
             : latestTopicId is not null && topics.ContainsKey(latestTopicId)
@@ -535,6 +537,7 @@ internal static class TopicMapState
 
         var trail = new List<TrailItemViewModel>();
         var seenTrailTopics = new HashSet<string>(StringComparer.Ordinal);
+        // Collapse only adjacent updates; a later return to the same topic remains a separate trail step.
         for (var index = 0; index < document.TopicTrail.Count;)
         {
             var first = document.TopicTrail[index];
@@ -601,6 +604,7 @@ internal static class TopicMapState
             ? BuildMeetingNotesViewModel(
                 MeetingTopicNotesBuilder.Build(document), document, selected, current)
             : null;
+        // Only transcript segments cited by evidence affect the pane fingerprint.
         var referencedSegmentOrdinals = document.Evidence
             .Where(item => item.SegmentOrdinal is not null)
             .Select(item => item.SegmentOrdinal!.Value)
@@ -704,6 +708,7 @@ internal static class TopicMapState
         IReadOnlyDictionary<string, int> occurrenceCounts,
         Func<string?, string> display)
     {
+        // Keep meeting evidence limited to cited transcript facts; related-workplace suggestions are added separately below.
         var transcriptEvidence = document.Evidence
             .Where(item =>
                 (item.Origin is EvidenceOrigin.Transcript or EvidenceOrigin.Analysis) &&
@@ -840,6 +845,7 @@ internal static class TopicMapState
         {
             if (StringComparer.Ordinal.Equals(assignedTopicId, topicId))
                 return true;
+            // Unassigned details can be placed only when their cited transcript evidence identifies a topic.
             return assignedTopicId is null && evidenceIds.Any(id =>
                 transcriptEvidence.TryGetValue(id, out var evidenceItem) &&
                 StringComparer.Ordinal.Equals(evidenceItem.TopicId, topicId));
@@ -847,6 +853,7 @@ internal static class TopicMapState
 
         string EvidenceDetail(IEnumerable<string> evidenceIds)
         {
+            // Use the earliest cited segment as a compact speaker-and-time anchor for this detail.
             var cited = evidenceIds
                 .Where(transcriptEvidence.ContainsKey)
                 .Select(id => transcriptEvidence[id])
@@ -862,6 +869,7 @@ internal static class TopicMapState
             return $"{speaker} · {segment.Timestamp.LocalDateTime:HH:mm:ss}";
         }
 
+        // Suggestions are excluded here: leaves represent details established by this meeting's transcript.
         var projectedTopics = orderedTopics.Select(topic =>
         {
             var leaves = new List<MeetingBrainMapLeafViewModel>();
@@ -966,6 +974,7 @@ internal static class TopicMapState
         TopicContextStatusViewModel contextStatus,
         Func<string?, string> display)
     {
+        // Facts, relationships, and checklist items below require cited transcript evidence.
         var segmentByOrdinal = document.Segments.ToDictionary(item => item.Ordinal);
         var transcriptEvidence = document.Evidence
             .Where(item =>
@@ -1184,6 +1193,7 @@ internal static class TopicMapState
         var selected = new List<VisualizationEvidence>();
         var families = ordered.GroupBy(item => item.SourceType)
             .Select(group => new Queue<VisualizationEvidence>(group)).ToArray();
+        // Take two passes across source families first, so one family cannot fill the list when alternatives exist.
         for (var round = 0; round < 2 && selected.Count < maxTotal; round++)
         {
             foreach (var family in families)
@@ -1237,6 +1247,7 @@ internal static class TopicMapState
         IReadOnlyDictionary<string, string> speakers)
     {
         var projected = text ?? string.Empty;
+        // Replace longer IDs first and only at token boundaries to avoid partial or overlapping matches.
         foreach (var speaker in speakers.OrderByDescending(item => item.Key.Length))
             projected = Regex.Replace(
                 projected,

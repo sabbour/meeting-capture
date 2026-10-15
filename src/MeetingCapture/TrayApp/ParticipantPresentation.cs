@@ -40,6 +40,7 @@ internal static class ParticipantPresentation
         int limit = PreviewLimit)
     {
         ArgumentNullException.ThrowIfNull(names);
+        // Limit the visible chips but retain the full count in Overflow; the caller supplies whether they are verified.
         var shown = names.Take(limit).Select(name => new ParticipantChip(
             SpeakerAvatarPresentation.Create(name, isResolved: true).Initials,
             name,
@@ -74,6 +75,7 @@ internal static class ParticipantPresentation
                 checkedAt is { } pending ? $"Last checked {Moment(pending)}." : string.Empty,
                 string.Empty);
 
+        // Only a provider's verified-live result is described as joined; an unavailable probe stays explicit.
         var status = snapshot.Availability switch
         {
             ActiveRosterAvailability.VerifiedLive when memberCount == 0 =>
@@ -85,6 +87,7 @@ internal static class ParticipantPresentation
             _ => "Live participants could not be verified.",
         };
         var source = snapshot.Source == ActiveRosterSource.WorkIq ? "WorkIQ" : "Teams accessibility";
+        // Keep observation time separate from the last refresh time so older cached observations are clear.
         var freshness = $"{source} \u00b7 observed {Moment(snapshot.ObservedAt)}" +
             (snapshot.IsPartial ? " \u00b7 partial coverage" : string.Empty) +
             (checkedAt is { } moment ? $" \u00b7 last checked {Moment(moment)}" : string.Empty);

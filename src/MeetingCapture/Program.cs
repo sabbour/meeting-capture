@@ -23,12 +23,14 @@ internal static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        // This child process is launched only to inspect Teams UI state; it exits without starting the tray app.
         if (args.Length == 1 && args[0] == "--teams-roster-helper")
         {
             Console.Out.Write(WorkIq.TeamsUiAutomationRosterHelper.Inspect());
             return;
         }
 
+        // Restore normal scheduling before WinUI starts so startup work is not delayed by a launcher priority.
         StartupPriority.StartKeepingNormalScheduling();
         WinRT.ComWrappersSupport.InitializeComWrappers();
 
@@ -41,6 +43,7 @@ internal static class Program
             // A crashed instance can leave an AppInstance registration behind briefly. Never
             // wait indefinitely for that stale activation target: start a recovery UI instead.
             var activationArgs = AppInstance.GetCurrent().GetActivatedEventArgs();
+            // Bound the redirect: a stale registration must not strand the user's second launch indefinitely.
             var redirect = mainInstance.RedirectActivationToAsync(activationArgs).AsTask();
             if (Task.WhenAny(redirect, Task.Delay(ActivationRedirectTimeout))
                     .GetAwaiter().GetResult() == redirect)
@@ -56,6 +59,7 @@ internal static class Program
         // We are the main instance. Listen for re-activation by subsequent instances.
         mainInstance.Activated += OnReactivated;
 
+        // Begin measuring startup before constructing the UI and keep diagnostics alive for the app lifetime.
         using var responsiveness = new ResponsivenessDiagnostics(GetCurrentThreadId());
         using var startup = responsiveness.BeginUiPhase(ResponsivenessPhase.ApplicationStart);
         Application.Start(p =>
@@ -64,6 +68,7 @@ internal static class Program
             var dispatcher = DispatcherQueue.GetForCurrentThread();
             responsiveness.StartMonitor(action =>
                 dispatcher.TryEnqueue(DispatcherQueuePriority.Normal, action.Invoke));
+            // Capture WinUI's synchronization context so async UI event handlers resume on this dispatcher.
             var ctx = new DispatcherQueueSynchronizationContext(
                 dispatcher);
             SynchronizationContext.SetSynchronizationContext(ctx);
@@ -80,6 +85,7 @@ internal static class Program
         if (Application.Current is not App app)
             return;
 
+        // The activation event can run off-thread; only the main instance's dispatcher may touch its window.
         app.AppDispatcherQueue.TryEnqueue(
             DispatcherQueuePriority.Normal,
             () => app.ShowMainWindow());

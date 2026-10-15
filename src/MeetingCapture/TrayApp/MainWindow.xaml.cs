@@ -245,6 +245,7 @@ public sealed partial class MainWindow : Window
             InitializeSettingsEditor();
 
         TranscriptList.ItemsSource = _transcript;
+        // User scrolling pauses follow-latest so new speech does not pull the view away.
         TranscriptList.AddHandler(UIElement.PointerPressedEvent,
             new PointerEventHandler((_, _) => _viewport.Pause()), true);
         TranscriptList.AddHandler(UIElement.PointerWheelChangedEvent,
@@ -332,6 +333,7 @@ public sealed partial class MainWindow : Window
 
         _workIq.AuthStateChanged += OnWorkIqAuthStateChanged;
         _settingsManager.SettingsSaved += OnSettingsSaved;
+        // Run lightweight status refreshes on the UI thread; only refresh calendar rows when its idle panel is visible.
         _healthTimer = _dispatcherQueue.CreateTimer();
         _healthTimer.Interval = TimeSpan.FromSeconds(1);
         _healthTimer.Tick += (_, _) =>
@@ -916,6 +918,7 @@ public sealed partial class MainWindow : Window
     {
         if (!_preparingExit) PrepareForExit();
         _allowClose = true;
+        // Unsubscribe before closing so late service events cannot update the closing window.
         AppTitleBar.SizeChanged -= OnTitleBarSizeChanged;
         TitleBarActions.LayoutUpdated -= OnTitleBarActionsLayoutUpdated;
         Activated -= OnWindowActivated;
@@ -963,6 +966,7 @@ public sealed partial class MainWindow : Window
 
     public void PrepareForExit()
     {
+        // Keep the window available while capture is finalized, but stop UI timers and optional work.
         _preparingExit = true;
         ClearStopCountdown();
         _healthTimer?.Stop();
@@ -1151,6 +1155,7 @@ public sealed partial class MainWindow : Window
         }
         StartButton.IsEnabled = NewRecordingButton.IsEnabled = false;
         var title = $"Manual Recording \u2014 {DateTime.Now:yyyy-MM-dd HH:mm}";
+        // Device startup can take time; keep it off the UI thread and marshal the control update back.
         _ = Task.Run(async () =>
         {
             try
@@ -1222,6 +1227,7 @@ public sealed partial class MainWindow : Window
         {
             if (_stopCountdownTimer is null)
             {
+                // The dispatcher timer keeps countdown progress and button labels on the UI thread.
                 _stopCountdownTimer = _dispatcherQueue.CreateTimer();
                 _stopCountdownTimer.Interval = TimeSpan.FromMilliseconds(200);
                 _stopCountdownTimer.IsRepeating = true;
@@ -1238,6 +1244,7 @@ public sealed partial class MainWindow : Window
 
     private void OnStopCountdownTick()
     {
+        // Recheck session and stop eligibility on every tick so an ended recording is never stopped late.
         if (_stopCountdown.ClearIfRecordingEnded(!_preparingExit && _pipeline.CanStop, _pipeline.CurrentSession))
         {
             OnStopCountdownChanged();
@@ -1257,6 +1264,7 @@ public sealed partial class MainWindow : Window
         var presentation = _stopCountdown.Present(DateTimeOffset.UtcNow);
         StopCountdownFillTransform.ScaleX = presentation.Progress;
         StopButtonLabel.Text = presentation.ButtonText;
+        // Expose the same changing Stop/Cancel instruction to screen readers as to sighted users.
         AutomationProperties.SetName(StopButton, presentation.AccessibleName);
         PreferencesStopButton.Content = presentation.IsActive ? presentation.ButtonText : "Stop recording";
         AutomationProperties.SetName(PreferencesStopButton, presentation.AccessibleName);
@@ -1269,6 +1277,7 @@ public sealed partial class MainWindow : Window
         StopButton.IsEnabled = PreferencesStopButton.IsEnabled = false;
         LifecycleText.Text = "Stopping capture...";
         StopRecordingTimer();
+        // Finalizing capture and saving may be slow; leave the window responsive until the result arrives.
         _ = Task.Run(async () =>
         {
             try
@@ -1481,6 +1490,7 @@ public sealed partial class MainWindow : Window
 
     private void OnTranscriptSegmentReceived(object? sender, SessionTranscriptSegment update)
     {
+        // Pipeline events may arrive off-thread; apply only current, non-stale revisions on the UI thread.
         InvokeOnUi(() =>
         {
             if (update.SessionId != _sessionId || update.Revision < _transcriptRevision) return;
@@ -1499,12 +1509,14 @@ public sealed partial class MainWindow : Window
     {
         if (string.IsNullOrWhiteSpace(update.Partial.Text))
             return;
+        // Keep only the newest partial until the UI can render it; interim speech changes quickly.
         Interlocked.Exchange(ref _pendingPartialTranscript, update);
         QueuePartialTranscriptRender();
     }
 
     private void QueuePartialTranscriptRender()
     {
+        // Coalesce bursts into one dispatcher callback instead of queuing every partial update.
         if (Interlocked.Exchange(ref _partialUiUpdateQueued, 1) != 0)
             return;
         if (!_dispatcherQueue.TryEnqueue(RenderLatestPartialTranscript))
@@ -1521,6 +1533,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Partials are transient; skip them when the user is reading older text or capture has ended.
         if (update.SessionId != _sessionId || !_viewport.FollowLatest ||
             _pipeline.State != PipelineState.Recording)
         {
@@ -1534,6 +1547,7 @@ public sealed partial class MainWindow : Window
         var remainingMilliseconds = 150 - (now - _lastPartialUiUpdate).TotalMilliseconds;
         if (remainingMilliseconds > 0)
         {
+            // Limit partial-line redraws to about six per second while retaining the latest text.
             Interlocked.CompareExchange(ref _pendingPartialTranscript, update, null);
             SchedulePartialTranscriptRetry(TimeSpan.FromMilliseconds(remainingMilliseconds));
             return;
@@ -1588,10 +1602,12 @@ public sealed partial class MainWindow : Window
 
     private void HandleStatusChange(PipelineStatus status)
     {
+        // Status sequences can be delivered late; ignore older updates before changing visible state.
         if (status.Sequence <= _statusSequence) return;
         _statusSequence = status.Sequence;
         if (status.SessionId != null && status.SessionId != _sessionId)
         {
+            // A new session must not inherit transcript rows, partials, prompts, or analysis from the last one.
             StopRecordingTimer();
             _sessionId = status.SessionId;
             _showCompletedSession = true;
@@ -1677,6 +1693,7 @@ public sealed partial class MainWindow : Window
 
     private void ShowState(bool recording)
     {
+        // Keep idle meeting controls and recording controls mutually exclusive.
         if (PreferencesPanel.Visibility == Visibility.Visible)
             CancelSettingsEditorLifetime();
         PreferencesPanel.Visibility = Visibility.Collapsed;
@@ -1790,6 +1807,7 @@ public sealed partial class MainWindow : Window
         _recordingCts = new CancellationTokenSource();
         UpdateTimeIndicator();
 
+        // Dispatcher timers update UI-bound time and kick off cancellable analysis at separate intervals.
         _recordingTimer = _dispatcherQueue.CreateTimer();
         _recordingTimer.Interval = TimeSpan.FromSeconds(30);
         _recordingTimer.IsRepeating = true;
@@ -4373,6 +4391,7 @@ public sealed partial class MainWindow : Window
             if (photo is null)
                 return;
 
+            // A fetch or decode may finish after a new session or rename; do not apply stale photos.
             if (_sessionId != sessionId ||
                 _speakerAvatarRevisions.GetValueOrDefault(speakerId) != revision)
                 return;

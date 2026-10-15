@@ -24,6 +24,7 @@ internal static class WindowPlacement
     {
         var scale = DpiScale(dpi);
         var margin = Scale(Margin, scale);
+        // Scale the preferred size for this monitor, then leave a visible margin inside its work area.
         return (
             Math.Min(Scale(DefaultWidth, scale), Math.Max(1, workArea.Width - 2 * margin)),
             Math.Min(Scale(DefaultHeight, scale), Math.Max(1, workArea.Height - 2 * margin)));
@@ -32,6 +33,7 @@ internal static class WindowPlacement
     internal static WindowBounds Anchor(WindowBounds workArea, int width, int height, int dpi, bool taskbarAtTop)
     {
         var margin = Scale(Margin, DpiScale(dpi));
+        // Clamp both dimensions before anchoring so a small display never places part of the window off-screen.
         width = Math.Min(Math.Max(1, width), Math.Max(1, workArea.Width - 2 * margin));
         height = Math.Min(Math.Max(1, height), Math.Max(1, workArea.Height - 2 * margin));
         return new(
@@ -59,6 +61,7 @@ internal static class WindowPlacement
         }
 
         var width = current.Width + addedWidth;
+        // Keep the old right edge where possible so opening the side pane grows the window to the left.
         var right = Math.Min(
             workArea.X + workArea.Width - margin,
             current.X + current.Width);
@@ -95,6 +98,7 @@ internal static class WindowPlacement
         int frameX,
         int frameY)
     {
+        // Windows expects coordinates relative to the monitor and a small offset for the hidden resize frame.
         frameX = Math.Max(0, frameX);
         frameY = Math.Max(0, frameY);
         return new(

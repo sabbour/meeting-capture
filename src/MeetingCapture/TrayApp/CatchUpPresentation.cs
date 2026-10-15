@@ -26,6 +26,7 @@ internal static class CatchUpPresentation
         IEnumerable<string> openActions)
     {
         var sections = new List<CatchUpSection>();
+        // This recap only combines accepted session data; it does not make another service request.
         Add(sections, "Earlier points", EarlierTopics(document, currentTopic));
         Add(sections, "Decisions", document?.Decisions.Select(item => item.Text) ?? []);
         Add(sections, "Unresolved questions", Merge(
@@ -49,6 +50,7 @@ internal static class CatchUpPresentation
             return [];
         var current = Normalize(currentTopic);
         var labels = new List<string>();
+        // Walk backward so the most recently discussed earlier topic appears first.
         foreach (var occurrence in document.TopicTrail.Reverse())
         {
             var label = Clean(occurrence.LabelAtTime);
@@ -61,11 +63,13 @@ internal static class CatchUpPresentation
     }
 
     private static IEnumerable<string> Merge(IEnumerable<string> grounded, IEnumerable<string> live)
+        // Preserve both stored analysis and live checklist items; Add removes duplicates before display.
         => grounded.Concat(live);
 
     private static void Add(List<CatchUpSection> sections, string heading, IEnumerable<string> items)
     {
         var bounded = new List<string>();
+        // Normalize whitespace and cap each section so one long meeting cannot dominate the catch-up panel.
         foreach (var item in items)
         {
             var value = Clean(item);

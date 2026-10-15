@@ -12,6 +12,7 @@ internal static class CopilotModelPresentation
         IReadOnlyList<CopilotModelOption> available,
         params string[] configuredIds)
     {
+        // Start with the service catalog, then retain saved ids that disappeared so opening settings never erases them.
         var choices = available
             .Select(model => new CopilotModelChoice(
                 model.Id,
@@ -26,6 +27,7 @@ internal static class CopilotModelPresentation
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .Reverse())
         {
+            // Add missing ids in reverse insertion order so their original configured order is preserved.
             if (choices.All(choice => !string.Equals(choice.Id, id, StringComparison.OrdinalIgnoreCase)))
                 choices.Insert(0, new(id, $"{id} (configured; not currently available)", false));
         }

@@ -20,10 +20,12 @@ internal readonly record struct SaveReviewPresentation(
         if (!isReviewing)
             return new(false, false, 0, 0, string.Empty, string.Empty);
 
+        // A missing deadline means saving has not supplied a countdown yet, so offer Save now without enabling decisions.
         if (deadline is null)
             return new(true, false, 0, 0, "Save now", "Save recording now. Preparing automatic save.");
 
         var remaining = deadline.Value - now;
+        // Progress grows from zero to one as the fixed review interval runs down.
         var progress = Math.Clamp(
             1 - (remaining.TotalMilliseconds / ReviewDuration.TotalMilliseconds),
             0,
@@ -32,6 +34,7 @@ internal readonly record struct SaveReviewPresentation(
         if (decisionSubmitted)
             return new(true, false, 0, progress, "Waiting...", "Waiting for recording status.");
 
+        // Once the deadline passes, the pipeline owns the automatic save; this panel becomes read-only.
         if (remaining <= TimeSpan.Zero)
             return new(true, false, 0, 1, "Saving...", "Automatic save is starting.");
 
