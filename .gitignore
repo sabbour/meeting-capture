@@ -36,3 +36,7 @@ Thumbs.db
 .impeccable/
 run_stdout.txt
 .dockerignore
+
+# Local team state and planning
+/.squad/
+/IMPROVEMENT-PLAN.md
