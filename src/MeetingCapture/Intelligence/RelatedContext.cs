@@ -14,7 +14,9 @@ public enum ClaimKind { HistoricalFact, InferredConnection }
 
 public enum ContextSourceType
 {
-    TeamsMessage, TeamsChannel, OutlookMail, Calendar, Document, MeetingArtifact, LocalTranscript
+    TeamsMessage, TeamsChannel, OutlookMail, Calendar, Document, MeetingArtifact, LocalTranscript,
+    // Appended last so persisted numeric values stay stable.
+    TeamsGroupChat
 }
 
 public enum ContextInvolvementRole

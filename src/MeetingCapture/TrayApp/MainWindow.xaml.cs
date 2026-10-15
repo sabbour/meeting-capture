@@ -4011,7 +4011,7 @@ public sealed partial class MainWindow : Window
 
     private void OnOpenContextSourceClick(object sender, RoutedEventArgs e)
     {
-        if (sender is not Button { Tag: string value } ||
+        if (sender is not FrameworkElement { Tag: string value } ||
             !Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
             uri.Scheme != Uri.UriSchemeHttps ||
             string.IsNullOrWhiteSpace(uri.Host) ||
@@ -4102,7 +4102,7 @@ public sealed partial class MainWindow : Window
         TopicBriefSourcesList.ItemsSource = brief.WorkIqSources;
         var overflow = brief.WorkIqVerifiedTotal - brief.WorkIqSources.Count;
         TopicBriefSourcesSection.Visibility = Visibility.Visible;
-        TopicBriefSourcesOverflowText.Text = overflow > 0 ? $"+{overflow} verified suggestions" : string.Empty;
+        TopicBriefSourcesOverflowText.Text = overflow > 0 ? $"+{overflow} related suggestions" : string.Empty;
         TopicBriefSourcesOverflowText.Visibility = overflow > 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 

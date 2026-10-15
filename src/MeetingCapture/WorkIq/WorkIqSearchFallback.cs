@@ -13,8 +13,8 @@ public sealed record WorkIqMeetingSubject(string Subject, string? Summary);
 
 /// <summary>
 /// Fallback used when WorkIQ's "retrieve" tool declines related-source requests. It runs a
-/// bounded keyword search, then reads each hit's own participant metadata so the same typed
-/// participation proof used for retrieval still decides what is shown. Read-only.
+/// bounded keyword search of accessible sources. Participant metadata establishes involvement
+/// when available; access alone never establishes participation. Read-only.
 /// </summary>
 public sealed partial class WorkIqMcpClient
 {
@@ -48,7 +48,7 @@ public sealed partial class WorkIqMcpClient
 
     public static JsonObject SearchArguments(string entityType, IReadOnlyList<string> keywords, int size)
     {
-        if (entityType is not ("event" or "chatMessage") || size is < 1 or > MaxSearchHits ||
+        if (entityType is not ("event" or "chatMessage" or "driveItem") || size is < 1 or > MaxSearchHits ||
             keywords.Count == 0)
             throw new ArgumentException("Unsupported search request.", nameof(entityType));
         return new JsonObject
@@ -69,7 +69,7 @@ public sealed partial class WorkIqMcpClient
 
     public static string EmailSearchPath(IReadOnlyList<string> keywords)
         => "/me/messages?$search=" + Uri.EscapeDataString("\"" + string.Join(" ", keywords) + "\"") +
-            "&$select=subject,webLink,receivedDateTime,bodyPreview,sender,toRecipients,ccRecipients,bccRecipients" +
+            "&$select=subject,webLink,receivedDateTime,bodyPreview,conversationId,sender,toRecipients,ccRecipients,bccRecipients" +
             "&$top=" + MaxEmailResults.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>Past occurrences with this exact subject. Search often returns only future
@@ -145,6 +145,14 @@ public sealed partial class WorkIqMcpClient
                     ? null
                     : await FetchManyAsync(token, paths, ct).ConfigureAwait(false);
                 return TeamsSearchContext(hits, paths, members, retrievedAt, currentIdentity);
+            }
+            case "OneDriveAndSharePoint":
+            {
+                if (!_searchAvailable)
+                    throw new WorkIqException(WorkIqFailure.Unsupported, "shape:searchTool");
+                return DocumentSearchContext(
+                    ParseSearchHits(await SearchAsync(token, "driveItem", keywords, ct).ConfigureAwait(false)),
+                    retrievedAt, currentIdentity);
             }
             default:
                 throw new WorkIqException(WorkIqFailure.Unsupported, "shape:searchCapability");
@@ -238,8 +246,12 @@ public sealed partial class WorkIqMcpClient
         var entry = ParseFetchEntries(fetchResult, 1)[0];
         EnsureStatus(entry.Status, includeHttpCode: true);
         var hits = new JsonArray();
+        var seenConversations = new HashSet<string>(StringComparer.Ordinal);
         foreach (var message in ValueArray(entry.Data).Take(MaxEmailResults))
         {
+            // Keep only the top-ranked message of a thread; messages without a thread id stay.
+            if (BoundedId(message, "conversationId") is { } conversation && !seenConversations.Add(conversation))
+                continue;
             var email = new JsonObject();
             foreach (var field in new[] { "sender", "toRecipients", "ccRecipients", "bccRecipients" })
                 if (message.TryGetProperty(field, out var value))
@@ -329,14 +341,22 @@ public sealed partial class WorkIqMcpClient
         foreach (var hit in searchHits)
         {
             var resource = hit.Resource;
+            var channel0 = resource.TryGetProperty("channelIdentity", out var identity) &&
+                identity.ValueKind == JsonValueKind.Object &&
+                BoundedId(identity, "teamId") is not null && BoundedId(identity, "channelId") is not null;
             var teams = new JsonObject();
             if (resource.TryGetProperty("from", out var from))
                 teams["author"] = JsonNode.Parse(from.GetRawText());
             if (TeamsMembersPath(resource) is { } path && members.TryGetValue(path, out var memberList))
+            {
                 teams["members"] = JsonNode.Parse(memberList.GetRawText());
-            var channel = resource.TryGetProperty("channelIdentity", out var identity) &&
-                identity.ValueKind == JsonValueKind.Object &&
-                BoundedId(identity, "teamId") is not null && BoundedId(identity, "channelId") is not null;
+                if (!channel0 && !resource.TryGetProperty("chatType", out _) &&
+                    memberList.GetArrayLength() >= 2)
+                    teams["chatType"] = memberList.GetArrayLength() > 2 ? "group" : "oneOnOne";
+            }
+            if (resource.TryGetProperty("chatType", out var chatType) && chatType.ValueKind == JsonValueKind.String)
+                teams["chatType"] = chatType.GetString();
+            var channel = channel0;
             var messageId = OptionalBoundedString(resource, "id", 256);
             var chatId = BoundedId(resource, "chatId");
             hits.Add(SearchRetrievalHit(
@@ -346,6 +366,26 @@ public sealed partial class WorkIqMcpClient
                 OptionalBoundedString(resource, "subject", 300) ?? Compact(hit.Summary, 80),
                 OptionalBoundedString(resource, "createdDateTime", 64),
                 hit.Summary, "teams", teams));
+        }
+        return SearchContext(hits, retrievedAt, currentIdentity);
+    }
+
+    /// <summary>OneDrive/SharePoint files Microsoft 365 search returned for the signed-in user.
+    /// Access is not authorship, so no involvement is recorded.</summary>
+    public static RelatedContextSnapshot DocumentSearchContext(
+        IReadOnlyList<WorkIqSearchHit> searchHits, DateTimeOffset retrievedAt,
+        WorkIqCurrentIdentity currentIdentity)
+    {
+        var hits = new JsonArray();
+        foreach (var hit in searchHits)
+        {
+            var resource = hit.Resource;
+            hits.Add(SearchRetrievalHit(
+                OptionalBoundedString(resource, "webUrl", 2048), "driveItem",
+                OptionalBoundedString(resource, "id", 512),
+                OptionalBoundedString(resource, "name", 300),
+                OptionalBoundedString(resource, "lastModifiedDateTime", 64),
+                hit.Summary, "document", new JsonObject()));
         }
         return SearchContext(hits, retrievedAt, currentIdentity);
     }
@@ -363,7 +403,8 @@ public sealed partial class WorkIqMcpClient
             }
         };
         using var document = JsonDocument.Parse(envelope.ToJsonString());
-        return ParseRetrievedContext(document.RootElement, retrievedAt, currentIdentity, SearchMatchedBy);
+        return ParseRetrievedContext(document.RootElement, retrievedAt, currentIdentity, SearchMatchedBy,
+            allowSearchReturned: true);
     }
 
     private static JsonObject SearchRetrievalHit(

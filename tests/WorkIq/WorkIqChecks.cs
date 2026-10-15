@@ -660,7 +660,7 @@ internal static class WorkIqChecks
             Check.Equal(1, snapshot.Items.Count);
             Check.Equal("initialize,notifications/initialized,tools/list,tools/call",
                 string.Join(",", handler.Methods));
-            Check.Equal("Meetings,TeamsMessages,Email",
+            Check.Equal("Meetings,TeamsMessages,Email,OneDriveAndSharePoint",
                 string.Join(",", WorkIqService.RelatedContextCapabilities));
         });
         yield return ("WorkIQ retrieve maps only cited supported hits and actual dates", () => Run(() =>
@@ -965,7 +965,8 @@ internal static class WorkIqChecks
             Check.Equal("event", (string?)request["entityTypes"]![0]);
             Check.Equal("Kubernetes upgrade rollout", (string?)request["query"]!["queryString"]);
             Check.Equal(25, (int)request["size"]!);
-            Check.Throws<ArgumentException>(() => WorkIqMcpClient.SearchArguments("driveItem", words, 5));
+            Check.Throws<ArgumentException>(() => WorkIqMcpClient.SearchArguments("user", words, 5));
+            Check.Equal("driveItem", (string?)WorkIqMcpClient.SearchArguments("driveItem", words, 15)["jsonBody"]!["requests"]![0]!["entityTypes"]![0]);
             var path = WorkIqMcpClient.EmailSearchPath(words);
             Check.True(path.StartsWith("/me/messages?$search=%22Kubernetes%20upgrade%20rollout%22&", StringComparison.Ordinal));
             Check.True(path.Contains("toRecipients", StringComparison.Ordinal));
@@ -1008,10 +1009,16 @@ internal static class WorkIqChecks
                   "sender":{"emailAddress":{"address":"me@contoso.example"}}}]}
                 """), Now, SelfIdentity);
             Check.Equal(RelatedContextAvailability.Available, snapshot.Availability);
-            var item = snapshot.Items.Single();
+            var item = snapshot.Items[0];
+            Check.Equal(2, snapshot.Items.Count);
             Check.Equal("Upgrade plan", item.Title);
             Check.Equal(ContextSourceType.OutlookMail, item.Sources.Single().SourceType);
             Check.Equal(ContextInvolvementRole.EmailToRecipient, item.Sources.Single().InvolvementRole);
+            var listMail = snapshot.Items[1].Sources.Single();
+            Check.Equal("List mail", snapshot.Items[1].Title);
+            Check.True(listMail.InvolvementRole is null);
+            Check.True(listMail.InvolvementMatchKind is null);
+            Check.True(listMail.InvolvementRationale!.Contains("does not show you attended", StringComparison.Ordinal));
             Check.True(item.RelevanceRationale!.StartsWith(WorkIqMcpClient.SearchMatchedBy, StringComparison.Ordinal));
             Check.Equal(WorkIqFailure.Denied, Check.Throws<WorkIqException>(() =>
                 WorkIqMcpClient.EmailSearchContext(FetchOne("{}", 403), Now, SelfIdentity)).Kind);
@@ -1052,10 +1059,13 @@ internal static class WorkIqChecks
                     "organizer":{"emailAddress":{"address":"other@example.invalid"}},
                     "attendees":[{"emailAddress":{"address":"someone@example.invalid"}}]}]}}]},"isError":false}
                 """), Now, Now, SelfIdentity);
-            var item = snapshot.Items.Single();
+            Check.Equal(2, snapshot.Items.Count);
+            var item = snapshot.Items[0];
             Check.Equal("Upgrade review", item.Title);
             Check.Equal(ContextSourceType.Calendar, item.Sources.Single().SourceType);
             Check.Equal(ContextInvolvementRole.MeetingAttendee, item.Sources.Single().InvolvementRole);
+            Check.Equal("Other sync", snapshot.Items[1].Title);
+            Check.True(snapshot.Items[1].Sources.Single().InvolvementRole is null);
             Check.Equal(WorkIqFailure.Malformed, Check.Throws<WorkIqException>(() =>
                 WorkIqMcpClient.MeetingSearchContext(subjects, FetchOne("{}"), Now, Now, SelfIdentity)).Kind);
             Check.Equal(WorkIqFailure.Denied, Check.Throws<WorkIqException>(() =>
@@ -1081,12 +1091,118 @@ internal static class WorkIqChecks
                  {"statusCode":429,"data":{}},
                  {"statusCode":200,"data":{"value":[]}}]},"isError":false}
                 """), Now, SelfIdentity);
-            Check.Equal(2, snapshot.Items.Count);
+            Check.Equal(3, snapshot.Items.Count);
             Check.Equal(ContextInvolvementRole.TeamsMember, snapshot.Items[0].Sources.Single().InvolvementRole);
             Check.Equal("19:chat-a:1", snapshot.Items[0].Sources.Single().SourceId);
-            Check.Equal(ContextInvolvementRole.TeamsAuthor, snapshot.Items[1].Sources.Single().InvolvementRole);
+            Check.True(snapshot.Items[1].Sources.Single().InvolvementRole is null);
+            Check.Equal(ContextInvolvementRole.TeamsAuthor, snapshot.Items[2].Sources.Single().InvolvementRole);
             Check.Equal(WorkIqFailure.Authentication, Check.Throws<WorkIqException>(() =>
                 WorkIqMcpClient.TeamsSearchContext(hits, ["/chats/x/members"], FetchOne("{}", 401), Now, SelfIdentity)).Kind);
+        }));
+        yield return ("WorkIQ email search collapses a thread to its top-ranked message only", () => Run(() =>
+        {
+            var snapshot = WorkIqMcpClient.EmailSearchContext(FetchOne("""
+                {"value":[
+                 {"id":"a1","conversationId":"c1","subject":"Same subject","webLink":"https://outlook.office365.com/owa/?ItemID=a1","sender":{"emailAddress":{"address":"me@contoso.example"}}},
+                 {"id":"a2","conversationId":"c1","subject":"Same subject","webLink":"https://outlook.office365.com/owa/?ItemID=a2","sender":{"emailAddress":{"address":"me@contoso.example"}}},
+                 {"id":"b1","conversationId":"c2","subject":"Same subject","webLink":"https://outlook.office365.com/owa/?ItemID=b1","sender":{"emailAddress":{"address":"me@contoso.example"}}},
+                 {"id":"n1","subject":"No thread","webLink":"https://outlook.office365.com/owa/?ItemID=n1","sender":{"emailAddress":{"address":"me@contoso.example"}}},
+                 {"id":"n2","subject":"No thread","webLink":"https://outlook.office365.com/owa/?ItemID=n2","sender":{"emailAddress":{"address":"me@contoso.example"}}}]}
+                """), Now, SelfIdentity);
+            Check.Equal("a1,b1,n1,n2", string.Join(",", snapshot.Items.Select(item => item.Sources.Single().SourceId)));
+            Check.True(WorkIqMcpClient.EmailSearchPath(["x"]).Contains("conversationId", StringComparison.Ordinal));
+        }));
+        yield return ("WorkIQ search labels group chats only from provider chat type or member count", () => Run(() =>
+        {
+            var hits = WorkIqMcpClient.ParseSearchHits(Json("""
+                {"structuredContent":{"statusCode":200,"data":{"value":[{"hitsContainers":[{"hits":[
+                  {"summary":"g","resource":{"id":"1","chatId":"19:g","webLink":"https://teams.microsoft.com/l/message/g",
+                   "from":{"emailAddress":{"address":"other@example.invalid"}}}},
+                  {"summary":"d","resource":{"id":"2","chatId":"19:d","webLink":"https://teams.microsoft.com/l/message/d",
+                   "from":{"emailAddress":{"address":"other@example.invalid"}}}},
+                  {"summary":"u","resource":{"id":"3","chatId":"19:u","webLink":"https://teams.microsoft.com/l/message/u",
+                   "from":{"emailAddress":{"address":"other@example.invalid"}}}},
+                  {"summary":"c","resource":{"id":"4","chatId":"19:c","webLink":"https://teams.microsoft.com/l/message/c",
+                   "channelIdentity":{"teamId":"t","channelId":"19:c"},
+                   "from":{"emailAddress":{"address":"other@example.invalid"}}}}]}]}]}},"isError":false}
+                """));
+            var paths = hits.Select(hit => WorkIqMcpClient.TeamsMembersPath(hit.Resource)).OfType<string>().ToArray();
+            var snapshot = WorkIqMcpClient.TeamsSearchContext(hits, paths, Json("""
+                {"structuredContent":{"results":[
+                 {"statusCode":200,"data":{"value":[{"userId":"a"},{"userId":"b"},{"userId":"c"}]}},
+                 {"statusCode":200,"data":{"value":[{"userId":"a"},{"userId":"b"}]}},
+                 {"statusCode":403,"data":{}},
+                 {"statusCode":200,"data":{"value":[{"userId":"a"},{"userId":"b"},{"userId":"c"}]}}]},"isError":false}
+                """), Now, SelfIdentity);
+            Check.Equal(4, snapshot.Items.Count);
+            Check.Equal(ContextSourceType.TeamsGroupChat, snapshot.Items[0].Sources.Single().SourceType);
+            Check.Equal(ContextSourceType.TeamsMessage, snapshot.Items[1].Sources.Single().SourceType);
+            Check.Equal(ContextSourceType.TeamsMessage, snapshot.Items[2].Sources.Single().SourceType);
+            Check.Equal(ContextSourceType.TeamsChannel, snapshot.Items[3].Sources.Single().SourceType);
+            Check.True(snapshot.Items.All(item => item.Sources.Single().InvolvementRole is null));
+            var typed = WorkIqMcpClient.ParseRetrievedContext(Json("""
+                {"structuredContent":{"application/vnd.ms-workiq.retrieval":{"retrievalHits":[
+                 {"webUrl":"https://teams.microsoft.com/l/message/m","entityType":"ChatMessage",
+                  "resourceMetadata":{"general":{"title":"Meeting chat"},
+                   "teams":{"chatType":"meeting","author":{"user":{"id":"user-123"}}}}}]}}}
+                """), Now, SelfIdentity);
+            Check.Equal(ContextSourceType.TeamsGroupChat, typed.Items.Single().Sources.Single().SourceType);
+            Check.Equal(ContextInvolvementRole.TeamsAuthor, typed.Items.Single().Sources.Single().InvolvementRole);
+        }));
+        yield return ("WorkIQ retrieve stays strict while search-returned hits never claim participation", () => Run(() =>
+        {
+            const string payload = """
+                {"structuredContent":{"application/vnd.ms-workiq.retrieval":{"retrievalHits":[
+                 {"webUrl":"https://outlook.office365.com/owa/?ItemID=9","entityType":"Email",
+                  "resourceMetadata":{"general":{"title":"Group list"},
+                   "email":{"sender":{"emailAddress":{"address":"other@example.invalid"}}}}}]}}}
+                """;
+            var strict = WorkIqMcpClient.ParseRetrievedContext(Json(payload), Now, SelfIdentity);
+            Check.Equal(0, strict.Items.Count);
+            var loose = WorkIqMcpClient.ParseRetrievedContext(
+                Json(payload), Now, SelfIdentity, WorkIqMcpClient.SearchMatchedBy, allowSearchReturned: true);
+            Check.Equal(1, loose.Items.Count);
+            Check.True(loose.Items[0].Sources.Single().InvolvementRole is null);
+        }));
+        yield return ("WorkIQ document search parses OneDrive and SharePoint files without involvement", () => Run(() =>
+        {
+            var hits = WorkIqMcpClient.ParseSearchHits(Json("""
+                {"structuredContent":{"statusCode":200,"data":{"value":[{"hitsContainers":[{"hits":[
+                  {"summary":"<c0>Roadmap</c0> deck","resource":{"id":"f1","name":"Roadmap.pptx",
+                   "webUrl":"https://contoso.sharepoint.com/sites/x/Roadmap.pptx","lastModifiedDateTime":"2026-09-20T10:00:00Z"}},
+                  {"resource":{"id":"f2","name":"Unsafe","webUrl":"http://contoso.sharepoint.com/u"}},
+                  {"resource":{"id":"f3","name":"No link"}}]}]}]}},"isError":false}
+                """));
+            var snapshot = WorkIqMcpClient.DocumentSearchContext(hits, Now, SelfIdentity);
+            var item = snapshot.Items.Single();
+            Check.Equal("Roadmap.pptx", item.Title);
+            var source = item.Sources.Single();
+            Check.Equal(ContextSourceType.Document, source.SourceType);
+            Check.True(source.InvolvementRole is null);
+            Check.Equal(new DateTimeOffset(2026, 9, 20, 10, 0, 0, TimeSpan.Zero), source.ActualSourceDate);
+            Check.Equal(RelatedContextAvailability.NoEvidence,
+                WorkIqMcpClient.DocumentSearchContext([], Now, SelfIdentity).Availability);
+        }));
+        yield return ("WorkIQ merge mixes teams, meetings, email and docs and dedups across families", () => Run(() =>
+        {
+            RelatedContextSnapshot Family(ContextSourceType type, string name, int count, string? sharedUrl = null) =>
+                new(Now, Enumerable.Range(1, count).Select(index => new RelatedContextItem(
+                    $"{name} {index}", "Relevant source suggestion.", ClaimKind.InferredConnection,
+                    [new($"{name} {index}", index == 1 && sharedUrl is not null
+                        ? sharedUrl : $"https://example.invalid/{name}/{index}", type, null)])).ToArray(),
+                    RelatedContextAvailability.Available);
+            var failed = new RelatedContextSnapshot(Now, [], RelatedContextAvailability.Unavailable, "denied");
+            var merged = WorkIqMcpClient.MergeRetrievedContexts(
+                [Family(ContextSourceType.Calendar, "M", 4), Family(ContextSourceType.TeamsGroupChat, "T", 4),
+                 failed, Family(ContextSourceType.Document, "D", 4, "https://example.invalid/M/1")], Now);
+            Check.Equal(5, merged.Items.Count);
+            var types = merged.Items.Select(item => item.Sources.Single().SourceType).ToArray();
+            Check.True(types.Contains(ContextSourceType.Calendar));
+            Check.True(types.Contains(ContextSourceType.TeamsGroupChat));
+            Check.True(types.Contains(ContextSourceType.Document));
+            Check.Equal(5, merged.Items.Select(item => item.Sources.Single().Url).Distinct().Count());
+            Check.True(merged.Items.Count(item => item.Sources.Single().SourceType == ContextSourceType.Calendar) <= 2);
+            Check.True(merged.Detail is not null);
         }));
         yield return ("WorkIQ falls back to search only when retrieve is declined", async () =>
         {

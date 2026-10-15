@@ -2265,20 +2265,31 @@
                                                 <ItemsControl ItemsSource="{Binding Suggestions}">
                                                     <ItemsControl.ItemTemplate>
                                                         <DataTemplate>
-                                                            <StackPanel Spacing="3" Margin="8,0,0,6">
-                                                                <TextBlock Text="{Binding SourceType}"
-                                                                           Style="{StaticResource CaptionTextBlockStyle}"
-                                                                           Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
-                                                                <TextBlock Text="{Binding Title}"
-                                                                           TextWrapping="Wrap"
-                                                                           FontWeight="SemiBold"/>
-                                                                <Button Content="Open source"
+                                                            <Grid ColumnSpacing="8" Margin="8,0,0,6">
+                                                                <Grid.ColumnDefinitions>
+                                                                    <ColumnDefinition Width="Auto"/>
+                                                                    <ColumnDefinition Width="*"/>
+                                                                </Grid.ColumnDefinitions>
+                                                                <FontIcon Glyph="{Binding Glyph}"
+                                                                         FontSize="14"
+                                                                         Margin="0,3,0,0"
+                                                                         VerticalAlignment="Top"
+                                                                         ToolTipService.ToolTip="{Binding SourceType}"
+                                                                         AutomationProperties.Name="{Binding SourceType}"/>
+                                                                <HyperlinkButton Grid.Column="1"
                                                                         Tag="{Binding SourceUrl}"
                                                                         Click="OnOpenContextSourceClick"
-                                                                        Visibility="{Binding CanOpen, Converter={StaticResource BoolToVisibleConverter}}"
-                                                                        HorizontalAlignment="Left"
-                                                                        AutomationProperties.Name="{Binding OpenActionName}"/>
-                                                            </StackPanel>
+                                                                        IsEnabled="{Binding CanOpen}"
+                                                                        Padding="0"
+                                                                        HorizontalAlignment="Stretch"
+                                                                        HorizontalContentAlignment="Left"
+                                                                        ToolTipService.ToolTip="{Binding SourceType}"
+                                                                        AutomationProperties.Name="{Binding OpenActionName}">
+                                                                    <TextBlock Text="{Binding Title}"
+                                                                              TextWrapping="Wrap"
+                                                                              FontWeight="SemiBold"/>
+                                                                </HyperlinkButton>
+                                                            </Grid>
                                                         </DataTemplate>
                                                     </ItemsControl.ItemTemplate>
                                                 </ItemsControl>

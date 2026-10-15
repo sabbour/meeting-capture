@@ -384,7 +384,7 @@ UNTRUSTED_TOPIC_JSON:
 
     public static RelatedContextSnapshot ParseRetrievedContext(
         JsonElement result, DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity,
-        string matchedBy = "WorkIQ semantic retrieval")
+        string matchedBy = "WorkIQ semantic retrieval", bool allowSearchReturned = false)
     {
         try
         {
@@ -452,12 +452,16 @@ UNTRUSTED_TOPIC_JSON:
                     metadataValue.ValueKind == JsonValueKind.Object
                     ? metadataValue
                     : default;
-                // Strict participation/relevance boundary: a hit is only included when typed
-                // provider metadata proves the signed-in user is a participant. Missing, ambiguous,
-                // or display-name-only participation is always an omission, never an inference.
-                if (!WorkIqParticipation.TryGetCurrentUserInvolvement(
+                // Typed retrieval requires participation proof; search can return accessible
+                // sources without claiming participation. Display names alone never prove it.
+                sourceType = ClassifyTeamsChat(sourceType, metadata);
+                var proven = WorkIqParticipation.TryGetCurrentUserInvolvement(
                     metadata, sourceType, currentIdentity, out var involvementRole,
-                    out var involvementMatchKind))
+                    out var involvementMatchKind);
+                // Search results are items Microsoft 365 returned for this user (including
+                // group-list mail and shared chats/files). They are shown without claiming
+                // participation: no role or match kind is recorded.
+                if (!proven && !allowSearchReturned)
                 {
                     unverifiedParticipation++;
                     continue;
@@ -483,9 +487,10 @@ UNTRUSTED_TOPIC_JSON:
                     OptionalBoundedString(hit, "resourceId", 512) ??
                     canonicalUrl;
                 var snippet = RetrievedSnippet(metadata);
-                var involvementRationale =
-                    $"Verified {InvolvementRoleLabel(involvementRole!.Value)} by " +
-                    $"{InvolvementMatchLabel(involvementMatchKind!.Value)}.";
+                var involvementRationale = proven
+                    ? $"Verified {InvolvementRoleLabel(involvementRole!.Value)} by " +
+                        $"{InvolvementMatchLabel(involvementMatchKind!.Value)}."
+                    : "Returned by your Microsoft 365 search; access does not show you attended or took part.";
                 var source = new ContextEvidenceSource(title.Trim(), canonicalUrl,
                     sourceType, sourceDate, sourceId, involvementRationale,
                     involvementRole, involvementMatchKind);
@@ -851,6 +856,20 @@ UNTRUSTED_TOPIC_JSON:
         return true;
     }
 
+    /// <summary>Group and meeting chats are only labelled as such when the provider's chat
+    /// type says so; a missing or unknown type stays the generic Teams message.</summary>
+    private static ContextSourceType ClassifyTeamsChat(ContextSourceType sourceType, JsonElement metadata)
+    {
+        if (sourceType != ContextSourceType.TeamsMessage ||
+            metadata.ValueKind != JsonValueKind.Object ||
+            !metadata.TryGetProperty("teams", out var teams) || teams.ValueKind != JsonValueKind.Object ||
+            !teams.TryGetProperty("chatType", out var chatType) || chatType.ValueKind != JsonValueKind.String)
+            return sourceType;
+        return chatType.GetString()?.ToLowerInvariant() is "group" or "meeting"
+            ? ContextSourceType.TeamsGroupChat
+            : sourceType;
+    }
+
     private static DateTimeOffset? ActualSourceDate(JsonElement metadata)
     {
         if (metadata.ValueKind != JsonValueKind.Object)
@@ -944,6 +963,7 @@ UNTRUSTED_TOPIC_JSON:
     {
         ContextSourceType.TeamsMessage => "Teams message",
         ContextSourceType.TeamsChannel => "Teams channel result",
+        ContextSourceType.TeamsGroupChat => "Teams group chat message",
         ContextSourceType.OutlookMail => "Outlook message",
         ContextSourceType.Calendar => "calendar item",
         ContextSourceType.Document => "document",

@@ -230,6 +230,7 @@ public sealed class ContextEvidenceSourceViewModel
         Source = source.SourceType switch
         {
             ContextSourceType.TeamsMessage => "Teams message",
+            ContextSourceType.TeamsGroupChat => "Teams group chat",
             ContextSourceType.TeamsChannel => "Teams channel",
             ContextSourceType.OutlookMail => "Outlook mail",
             ContextSourceType.Calendar => "Calendar",

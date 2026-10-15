@@ -15,7 +15,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     internal const string RedirectUri = "http://localhost";
     public static readonly string[] Scopes = ["fdcc1f02-fc51-4226-8753-f668596af7f7/WorkIQAgent.Ask"];
     internal static readonly string[] RelatedContextCapabilities =
-        ["Meetings", "TeamsMessages", "Email"];
+        ["Meetings", "TeamsMessages", "Email", "OneDriveAndSharePoint"];
     private const int MaxPhotoCacheEntries = 64;
     private sealed record AuthStateSnapshot(bool IsAuthenticated, long Revision);
     private readonly ILogger<WorkIqService> _logger;
@@ -350,6 +350,8 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                     {
                         bool skipRetrieve;
                         lock (_gate) skipRetrieve = _retrieveDeclinedRevision == revision;
+                        // Retrieved documents carry no participation proof, so files come from search.
+                        skipRetrieve |= capability == "OneDriveAndSharePoint" && client.SearchAvailable;
                         var family = await RetrieveFamilyWithFallbackAsync(
                             async ct => WorkIqMcpClient.ParseRetrievedContext(
                                 await client.RetrieveRelatedContextResultAsync(
@@ -379,6 +381,9 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                     catch (Exception ex) when (!token.IsCancellationRequested)
                     {
                         var familyFailure = Failure(ex);
+                        _logger.LogWarning(
+                            "WorkIQ related-context family failed: {Capability} {Reason}; other families continue.",
+                            capability, DiagnosticFailureReason(familyFailure));
                         familyPhase?.Fail(familyFailure, DiagnosticFailureReason(familyFailure));
                         throw familyFailure;
                     }

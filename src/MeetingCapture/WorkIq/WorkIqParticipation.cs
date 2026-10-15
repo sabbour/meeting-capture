@@ -37,7 +37,8 @@ internal static class WorkIqParticipation
                 ("email", "ccRecipients", ContextInvolvementRole.EmailCcRecipient),
                 ("email", "bccRecipients", ContextInvolvementRole.EmailBccRecipient)
             },
-            ContextSourceType.TeamsMessage or ContextSourceType.TeamsChannel => new[]
+            ContextSourceType.TeamsMessage or ContextSourceType.TeamsChannel or
+                ContextSourceType.TeamsGroupChat => new[]
             {
                 ("teams", "author", ContextInvolvementRole.TeamsAuthor),
                 ("teams", "participants", ContextInvolvementRole.TeamsParticipant),

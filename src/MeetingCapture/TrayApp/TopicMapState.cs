@@ -66,9 +66,11 @@ internal sealed record MeetingTopicSuggestionViewModel(
     string Title,
     string SourceType,
     string SourceUrl,
-    bool CanOpen)
+    bool CanOpen,
+    ContextSourceType? SourceKind = null)
 {
     public string OpenActionName => $"Open {SourceType}: {Title}";
+    public string Glyph => TopicMapState.SourceTypeGlyph(SourceKind);
 }
 
 internal sealed record MeetingBrainMapViewModel(
@@ -368,15 +370,7 @@ internal sealed record TopicBriefSourceViewModel(
     public bool HasTimestamp => Timestamp.Length > 0;
     public string OpenActionName => $"Open {Family}: {Title}";
 
-    public string Glyph => SourceType switch
-    {
-        ContextSourceType.TeamsMessage or ContextSourceType.TeamsChannel => "\uE8BD",
-        ContextSourceType.OutlookMail => "\uE715",
-        ContextSourceType.Calendar or ContextSourceType.MeetingArtifact => "\uE787",
-        ContextSourceType.Document => "\uE8A5",
-        ContextSourceType.LocalTranscript => "\uE8F1",
-        _ => "\uE946",
-    };
+    public string Glyph => TopicMapState.SourceTypeGlyph(SourceType);
 }
 
 /// <summary>
@@ -633,6 +627,10 @@ internal static class TopicMapState
         string? currentTopicId = null)
     {
         ArgumentNullException.ThrowIfNull(topicNotes);
+        var topicSources = (document?.Evidence ?? [])
+            .Where(item => item.Origin == EvidenceOrigin.RelatedContext &&
+                item.Provenance == VisualizationProvenance.RelatedSourceSuggestion)
+            .ToLookup(item => item.TopicId, StringComparer.Ordinal);
         var topics = topicNotes
             .Select(topic => new MeetingTopicNotesViewModel(
                 topic.TopicId,
@@ -640,10 +638,7 @@ internal static class TopicMapState
                 topic.Bullets.Select(MeetingNotesText.WithoutSegmentOrdinals).ToArray(),
                 document is null
                     ? []
-                    : SelectBoundedWorkIqSources(document.Evidence.Where(item =>
-                            item.TopicId == topic.TopicId &&
-                            item.Origin == EvidenceOrigin.RelatedContext &&
-                            item.Provenance == VisualizationProvenance.RelatedSourceSuggestion))
+                    : SelectBoundedWorkIqSources(topicSources[topic.TopicId])
                         .Selected
                         .Select(source =>
                         {
@@ -659,7 +654,8 @@ internal static class TopicMapState
                                 MeetingNotesText.WithoutSegmentOrdinals(title),
                                 SourceTypeLabel(source.SourceType),
                                 canOpen ? uri!.AbsoluteUri : string.Empty,
-                                canOpen);
+                                canOpen,
+                                source.SourceType);
                         })
                         .ToArray(),
                 StringComparer.Ordinal.Equals(topic.TopicId, currentTopicId),
@@ -1072,7 +1068,7 @@ internal static class TopicMapState
                 : $"Why relevant: {relevance}";
             var involvementText = source.InvolvementRole is { } role
                 ? $"Your involvement: {InvolvementRoleLabel(role)}"
-                : "Your involvement: Verified role was not retained.";
+                : "Your involvement: Not established; access does not show participation.";
             var accessibleDetails = string.Join(". ", new[]
             {
                 sourceDetail,
@@ -1153,10 +1149,7 @@ internal static class TopicMapState
     }
 
     /// <summary>
-    /// Bounds a topic's participation-verified WorkIQ sources to at most 5, capping any one
-    /// family at 2 while alternatives exist so the visible set stays family-diverse. Preserves
-    /// provider rank as relevance (already the incoming order). The dropped remainder is reported
-    /// as an honest total for a "+N verified suggestions" caption, never silently discarded.
+    /// Takes two rounds across source families before filling remaining slots by provider rank.
     /// </summary>
     private static (IReadOnlyList<VisualizationEvidence> Selected, int TotalVerified) SelectBoundedWorkIqSources(
         IEnumerable<VisualizationEvidence> sourceItems)
@@ -1166,33 +1159,48 @@ internal static class TopicMapState
             .Select(group => group.First())
             .ToArray();
         const int maxTotal = 5;
-        const int maxPerFamily = 2;
-        var familyCount = ordered.Select(item => item.SourceType).Distinct().Count();
         var selected = new List<VisualizationEvidence>();
-        var perFamily = new Dictionary<string, int>(StringComparer.Ordinal);
-        foreach (var item in ordered)
+        var families = ordered.GroupBy(item => item.SourceType)
+            .Select(group => new Queue<VisualizationEvidence>(group)).ToArray();
+        for (var round = 0; round < 2 && selected.Count < maxTotal; round++)
         {
-            if (selected.Count >= maxTotal)
-                break;
-            var familyKey = item.SourceType?.ToString() ?? "none";
-            var count = perFamily.GetValueOrDefault(familyKey);
-            if (familyCount > 1 && count >= maxPerFamily)
-                continue;
-            perFamily[familyKey] = count + 1;
-            selected.Add(item);
+            foreach (var family in families)
+            {
+                if (family.TryDequeue(out var item))
+                    selected.Add(item);
+                if (selected.Count == maxTotal)
+                    break;
+            }
         }
+        var selectedIds = selected.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        selected.AddRange(ordered.Where(item => !selectedIds.Contains(item.Id))
+            .Take(maxTotal - selected.Count));
         return (selected, ordered.Length);
     }
 
     private static string SourceIdentity(VisualizationEvidence evidence) =>
         Uri.TryCreate(evidence.SourceUrl, UriKind.Absolute, out var uri) &&
         uri.Scheme == Uri.UriSchemeHttps
-            ? uri.AbsoluteUri
-            : evidence.Id;
+            ? "url:" + uri.AbsoluteUri
+            : $"title:{evidence.SourceType}:" + RelatedContextTitle.Clean(
+                evidence.SourceTitle, evidence.SourceType);
+
+    internal static string SourceTypeGlyph(ContextSourceType? sourceType) => sourceType switch
+    {
+        ContextSourceType.TeamsMessage => "\uE8BD",
+        ContextSourceType.TeamsGroupChat => "\uE902",
+        ContextSourceType.TeamsChannel => "\uE8A4",
+        ContextSourceType.OutlookMail => "\uE715",
+        ContextSourceType.Calendar or ContextSourceType.MeetingArtifact => "\uE787",
+        ContextSourceType.Document => "\uE8A5",
+        ContextSourceType.LocalTranscript => "\uE8F1",
+        _ => "\uE946",
+    };
 
     internal static string SourceTypeLabel(ContextSourceType? sourceType) => sourceType switch
     {
         ContextSourceType.TeamsMessage => "Teams message",
+        ContextSourceType.TeamsGroupChat => "Teams group chat",
         ContextSourceType.TeamsChannel => "Teams channel",
         ContextSourceType.OutlookMail => "Outlook mail",
         ContextSourceType.Calendar => "Calendar",

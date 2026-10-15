@@ -76,6 +76,8 @@ internal static class UiStateChecks
         yield return ("topic map preserves relations selection navigation and scroll", () => Run(TopicTimeline));
         yield return ("whole-meeting topic map lays out 8-15 topic branches and grounded leaves", () => Run(WholeMeetingBrainMapLayout));
         yield return ("topic collapse frees layout space and persists across live updates", () => Run(TopicCollapseFreesSpaceAndPersists));
+        yield return ("Work IQ titles are accessible links with distinct inline source icons", () => Run(WorkIqSuggestionLinks));
+        yield return ("Work IQ notes remove duplicates before bounding and preserve other topic associations", () => Run(WorkIqSuggestionDeduplication));
         yield return ("topic map and meeting notes share the full width through a bounded splitter", () => Run(TopicPaneSplitFillsWidth));
         yield return ("whole-meeting topic map assigns uncategorized items from cited transcript evidence", () => Run(UnassignedMeetingItemsUseCitations));
         yield return ("topic map nodes own Canvas insertion without re-adding the root", () => Run(BrainMapCanvasOwnership));
@@ -1462,7 +1464,9 @@ internal static class UiStateChecks
         }, "topic-0001").TopicBrief!;
         Check.Equal("\uE715", typedSources.WorkIqSources.Single(item => item.Id == "typed-mail").Glyph);
         Check.Equal("\uE8A5", typedSources.WorkIqSources.Single(item => item.Id == "typed-doc").Glyph);
-        Check.Equal("\uE8BD", typedSources.WorkIqSources.Single(item => item.Id == "typed-channel").Glyph);
+        Check.Equal("Your involvement: Not established; access does not show participation.",
+            typedSources.WorkIqSources.Single(item => item.Id == "typed-doc").InvolvementText);
+        Check.Equal("\uE8A4", typedSources.WorkIqSources.Single(item => item.Id == "typed-channel").Glyph);
 
         var unsafeSource = TopicMapState.Project(document with
         {
@@ -2041,6 +2045,105 @@ internal static class UiStateChecks
         Check.Equal(2, mid.Topics.Select(item => item.Topic.X).Distinct().Count());
         var huge = MeetingBrainMapLayout.Calculate(1500, Enumerable.Repeat(2, 8).ToArray());
         Check.Equal(4, huge.Topics.Select(item => item.Topic.X).Distinct().Count());
+    }
+
+    private static void WorkIqSuggestionLinks()
+    {
+        var types = new[]
+        {
+            ContextSourceType.TeamsMessage, ContextSourceType.TeamsGroupChat,
+            ContextSourceType.TeamsChannel, ContextSourceType.Calendar,
+            ContextSourceType.OutlookMail, ContextSourceType.Document
+        };
+        Check.Equal(types.Length, types.Select(type => TopicMapState.SourceTypeGlyph(type)).Distinct().Count());
+        foreach (var type in types)
+        {
+            var suggestion = new MeetingTopicSuggestionViewModel(
+                "source", "A source title", TopicMapState.SourceTypeLabel(type),
+                "https://example.test/source", true, type);
+            Check.Equal(TopicMapState.SourceTypeGlyph(type), suggestion.Glyph);
+            Check.Equal($"Open {TopicMapState.SourceTypeLabel(type)}: A source title",
+                suggestion.OpenActionName);
+        }
+
+        var document = XDocument.Load(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml"));
+        var suggestions = document.Descendants().Single(element =>
+            element.Name.LocalName == "ItemsControl" &&
+            (string?)element.Attribute("ItemsSource") == "{Binding Suggestions}");
+        var grid = suggestions.Descendants().Single(element => element.Name.LocalName == "Grid");
+        var icon = grid.Elements().Single(element => element.Name.LocalName == "FontIcon");
+        Check.Equal("{Binding Glyph}", (string?)icon.Attribute("Glyph"));
+        Check.Equal("{Binding SourceType}", (string?)icon.Attribute("ToolTipService.ToolTip"));
+        Check.Equal("{Binding SourceType}", (string?)icon.Attribute("AutomationProperties.Name"));
+        var link = grid.Elements().Single(element => element.Name.LocalName == "HyperlinkButton");
+        Check.Equal("1", (string?)link.Attribute("Grid.Column"));
+        Check.Equal("{Binding SourceUrl}", (string?)link.Attribute("Tag"));
+        Check.Equal("OnOpenContextSourceClick", (string?)link.Attribute("Click"));
+        Check.Equal("{Binding CanOpen}", (string?)link.Attribute("IsEnabled"));
+        Check.Equal("{Binding OpenActionName}", (string?)link.Attribute("AutomationProperties.Name"));
+        Check.Equal("{Binding Title}", (string?)link.Elements().Single().Attribute("Text"));
+        Check.True(!suggestions.Descendants().Any(element => element.Name.LocalName == "Button"));
+        Check.True(!suggestions.Descendants().Any(element =>
+            (string?)element.Attribute("Text") == "{Binding SourceType}"));
+        var source = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "MainWindow.xaml.cs.txt"));
+        Check.True(source.Contains("sender is not FrameworkElement { Tag: string value }",
+            StringComparison.Ordinal));
+    }
+
+    private static void WorkIqSuggestionDeduplication()
+    {
+        static VisualizationEvidence Source(
+            string id, string topic, string title, string? url,
+            ContextSourceType type = ContextSourceType.OutlookMail) =>
+            new(id, EvidenceOrigin.RelatedContext, VisualizationProvenance.RelatedSourceSuggestion,
+                null, topic, title, url, type, null, "Search result");
+
+        MeetingTopicNotes[] topics =
+        [
+            new("first", "General planning", []),
+            new("best", "Application modernisation", [])
+        ];
+        var document = new MeetingVisualizationDocument(
+            1, "dedup-session", "Meeting", DateTimeOffset.UtcNow, null, 0, false,
+            [], [], [], [], [],
+            [
+                Source("overlap-first", "first", "Application modernisation", "https://example.test/shared"),
+                Source("repeat-1", "best", "Application modernisation", "https://example.test/shared"),
+                Source("repeat-2", "best", "APPLICATION MODERNISATION", "https://example.test/shared"),
+                Source("repeat-3", "best", "Application modernisation", "https://example.test/shared"),
+                Source("repeat-4", "best", "Application modernisation", "https://example.test/shared"),
+                Source("title-first", "first", " Weekly   review ", null),
+                Source("title-duplicate", "first", "weekly review", ""),
+                Source("title-other-topic", "best", "WEEKLY REVIEW", null),
+                Source("different-type", "first", "Weekly review", null, ContextSourceType.Document),
+                Source("tie-first", "first", "Budget review", "https://example.test/tie"),
+                Source("tie-second", "best", "Budget review", "https://example.test/tie"),
+                Source("different-url", "best", "Application modernisation", "https://example.test/distinct"),
+                Source("unique-after-duplicates", "best", "Deployment chat", "https://example.test/chat",
+                    ContextSourceType.TeamsGroupChat),
+                Source("meeting-fact", "first", "Not a suggestion", "https://example.test/fact") with
+                {
+                    Origin = EvidenceOrigin.Transcript,
+                    Provenance = VisualizationProvenance.TranscriptFact
+                },
+                Source("absent-topic", "missing", "Application modernisation", "https://example.test/shared")
+            ], []);
+        var notes = TopicMapState.BuildMeetingNotesViewModel(topics, document);
+        var first = notes.Topics[0].Suggestions;
+        var best = notes.Topics[1].Suggestions;
+        Check.Equal(4, first.Count);
+        Check.Equal(5, best.Count);
+        Check.True(best.Any(item => item.Id == "repeat-1"));
+        Check.True(first.Any(item => item.Id == "overlap-first"));
+        Check.True(first.Any(item => item.Id == "title-first" && !item.CanOpen));
+        Check.True(first.Any(item => item.Id == "different-type"));
+        Check.True(first.Any(item => item.Id == "tie-first"));
+        Check.True(best.Any(item => item.Id == "tie-second"));
+        Check.True(best.Any(item => item.Id == "title-other-topic"));
+        Check.True(best.Any(item => item.Id == "different-url"));
+        Check.True(best.Any(item => item.Id == "unique-after-duplicates"));
+        Check.Equal(2, document.Evidence.Count(item => item.Id.StartsWith("tie-", StringComparison.Ordinal)));
+        Check.Equal(0, TopicMapState.BuildMeetingNotesViewModel(topics).Topics[0].Suggestions.Count);
     }
 
     private static void TopicCollapseFreesSpaceAndPersists()
