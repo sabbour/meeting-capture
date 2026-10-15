@@ -1349,10 +1349,10 @@ internal static class UiStateChecks
         Check.Equal("Customer follow-up link", projection.TopicBrief.Facts.Single().Title);
         Check.Equal("Release readiness supports customer follow-up.",
             projection.TopicBrief.Facts.Single().EvidenceText);
-        Check.Equal("18:00:10", projection.TopicBrief.Facts.Single().Metadata);
+        Check.Equal(localDiscussionTime, projection.TopicBrief.Facts.Single().Metadata);
         Check.Equal(4, projection.TopicBrief.Relationships.Count);
         Check.True(projection.TopicBrief.Relationships.All(item =>
-            item.Detail.Contains("18:00:10", StringComparison.Ordinal) &&
+            item.Detail.Contains(localDiscussionTime, StringComparison.Ordinal) &&
             !item.Detail.Contains("segment", StringComparison.OrdinalIgnoreCase)));
         Check.True(projection.TopicBrief.Questions.Single() is { Id: "question-1", Answered: false });
 
