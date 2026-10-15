@@ -942,6 +942,192 @@ internal static class WorkIqChecks
                 TimeSpan.FromSeconds(10), Now, CancellationToken.None);
             Check.Equal(RelatedContextAvailability.Unavailable, unsupported.Single().Availability);
         });
+        yield return ("WorkIQ retrieve AccessDenied keeps its error code in the log", () => Run(() =>
+        {
+            var denied = Check.Throws<WorkIqException>(() => WorkIqMcpClient.ParseRetrievedContext(Json(
+                """{"isError":true,"content":[{"type":"text","text":"{\"errorCode\":\"AccessDenied\",\"message\":\"dependency denied access\"}"}]}"""),
+                Now, SelfIdentity));
+            Check.Equal(WorkIqFailure.ServiceDeclined, denied.Kind);
+            Check.Equal("tool-error:AccessDenied", denied.Code);
+            var line = MeetingCapture.Diagnostics.RelatedDiagnostics.Format("related", true, denied);
+            Check.True(line.Contains("tool-error:AccessDenied", StringComparison.Ordinal));
+            Check.True(!line.Contains("dependency denied", StringComparison.Ordinal));
+        }));
+        yield return ("WorkIQ search fallback requests are bounded plain keyword searches", () => Run(() =>
+        {
+            var words = WorkIqMcpClient.RelatedContextKeywords("Kubernetes AND \"upgrade\" OR (rollout) kubernetes");
+            Check.Equal("Kubernetes upgrade rollout", string.Join(" ", words));
+            Check.Equal(WorkIqFailure.Unsupported,
+                Check.Throws<WorkIqException>(() => WorkIqMcpClient.RelatedContextKeywords("AND - OR")).Kind);
+            var args = WorkIqMcpClient.SearchArguments("event", words, 25);
+            Check.Equal("/search/query", (string?)args["actionUrl"]);
+            var request = args["jsonBody"]!["requests"]![0]!;
+            Check.Equal("event", (string?)request["entityTypes"]![0]);
+            Check.Equal("Kubernetes upgrade rollout", (string?)request["query"]!["queryString"]);
+            Check.Equal(25, (int)request["size"]!);
+            Check.Throws<ArgumentException>(() => WorkIqMcpClient.SearchArguments("driveItem", words, 5));
+            var path = WorkIqMcpClient.EmailSearchPath(words);
+            Check.True(path.StartsWith("/me/messages?$search=%22Kubernetes%20upgrade%20rollout%22&", StringComparison.Ordinal));
+            Check.True(path.Contains("toRecipients", StringComparison.Ordinal));
+            var meetingPath = WorkIqMcpClient.MeetingSubjectLookupPath("Bob's sync ", Now);
+            Check.True(meetingPath.StartsWith("/me/calendarView?startDateTime=2026-08-24T", StringComparison.Ordinal));
+            Check.True(meetingPath.Contains("&$filter=subject%20eq%20%27Bob%27%27s%20sync%20%27&", StringComparison.Ordinal));
+            Check.True(meetingPath.EndsWith("&$top=5", StringComparison.Ordinal));
+            Check.Throws<ArgumentException>(() => WorkIqMcpClient.MeetingSubjectLookupPath("a\nb", Now));
+        }));
+        yield return ("WorkIQ search fallback parses hits and keeps service error codes", () => Run(() =>
+        {
+            var hits = WorkIqMcpClient.ParseSearchHits(Json("""
+                {"structuredContent":{"statusCode":200,"data":{"value":[{"hitsContainers":[{"hits":[
+                  {"summary":"about <c0>Kubernetes</c0> upgrade<ddd/>","resource":{"iCalUId":"uid-1"}},
+                  {"summary":"no resource"},
+                  {"resource":{"iCalUId":"uid-2"}}]}]}]}},"isError":false}
+                """));
+            Check.Equal(2, hits.Count);
+            Check.Equal("about Kubernetes upgrade", hits[0].Summary);
+            Check.Equal(0, WorkIqMcpClient.ParseSearchHits(
+                Json("""{"structuredContent":{"statusCode":200,"data":{}},"isError":false}""")).Count);
+            var declined = Check.Throws<WorkIqException>(() => WorkIqMcpClient.ParseSearchHits(Json(
+                """{"isError":true,"content":[{"type":"text","text":"{\"errorCode\":\"AccessDenied\"}"}]}""")));
+            Check.Equal("tool-error:AccessDenied", declined.Code);
+            Check.Equal(WorkIqFailure.Denied, Check.Throws<WorkIqException>(() => WorkIqMcpClient.ParseSearchHits(
+                Json("""{"structuredContent":{"statusCode":403},"isError":false}"""))).Kind);
+        }));
+        yield return ("WorkIQ email search fallback shows only mail that proves participation", () => Run(() =>
+        {
+            var snapshot = WorkIqMcpClient.EmailSearchContext(FetchOne("""
+                {"value":[
+                 {"id":"m1","subject":"Upgrade plan","webLink":"https://outlook.office365.com/owa/?ItemID=1",
+                  "receivedDateTime":"2026-09-20T10:00:00Z","bodyPreview":"Plan",
+                  "sender":{"emailAddress":{"address":"other@example.invalid"}},
+                  "toRecipients":[{"emailAddress":{"address":"ME@contoso.example"}}]},
+                 {"id":"m2","subject":"List mail","webLink":"https://outlook.office365.com/owa/?ItemID=2",
+                  "sender":{"emailAddress":{"address":"other@example.invalid"}},
+                  "toRecipients":[{"emailAddress":{"address":"dl@example.invalid"}}]},
+                 {"id":"m3","subject":"Unsafe","webLink":"http://outlook.office365.com/owa/?ItemID=3",
+                  "sender":{"emailAddress":{"address":"me@contoso.example"}}}]}
+                """), Now, SelfIdentity);
+            Check.Equal(RelatedContextAvailability.Available, snapshot.Availability);
+            var item = snapshot.Items.Single();
+            Check.Equal("Upgrade plan", item.Title);
+            Check.Equal(ContextSourceType.OutlookMail, item.Sources.Single().SourceType);
+            Check.Equal(ContextInvolvementRole.EmailToRecipient, item.Sources.Single().InvolvementRole);
+            Check.True(item.RelevanceRationale!.StartsWith(WorkIqMcpClient.SearchMatchedBy, StringComparison.Ordinal));
+            Check.Equal(WorkIqFailure.Denied, Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.EmailSearchContext(FetchOne("{}", 403), Now, SelfIdentity)).Kind);
+            Check.Equal(RelatedContextAvailability.NoEvidence, WorkIqMcpClient.EmailSearchContext(
+                FetchOne("""{"value":[]}"""), Now, SelfIdentity).Availability);
+        }));
+        yield return ("WorkIQ meeting search fallback uses only past meetings that prove attendance", () => Run(() =>
+        {
+            var hits = WorkIqMcpClient.ParseSearchHits(Json("""
+                {"structuredContent":{"statusCode":200,"data":{"value":[{"hitsContainers":[{"hits":[
+                  {"summary":"Upgrade review","resource":{"subject":"Upgrade review ","type":"occurrence"}},
+                  {"resource":{"subject":"upgrade REVIEW "}},
+                  {"resource":{"subject":"   "}},
+                  {"resource":{"subject":"Other sync"}},
+                  {"resource":{"subject":"Third"}}]}]}]}},"isError":false}
+                """));
+            var subjects = WorkIqMcpClient.MeetingSubjects(hits);
+            Check.Equal("Upgrade review |Other sync", string.Join("|", subjects.Select(subject => subject.Subject)));
+            var snapshot = WorkIqMcpClient.MeetingSearchContext(subjects, Json("""
+                {"structuredContent":{"results":[
+                 {"statusCode":200,"data":{"value":[
+                   {"iCalUId":"future","subject":"Upgrade review ","webLink":"https://outlook.office365.com/calendar/item/0",
+                    "start":{"dateTime":"2026-09-24T10:00:00Z","timeZone":"UTC"},"end":{"dateTime":"2026-09-24T11:00:00Z","timeZone":"UTC"},
+                    "attendees":[{"emailAddress":{"address":"me@contoso.example"}}]},
+                   {"iCalUId":"cancelled","subject":"Upgrade review ","isCancelled":true,"webLink":"https://outlook.office365.com/calendar/item/3",
+                    "start":{"dateTime":"2026-09-21T10:00:00Z","timeZone":"UTC"},"end":{"dateTime":"2026-09-21T11:00:00Z","timeZone":"UTC"},
+                    "attendees":[{"emailAddress":{"address":"me@contoso.example"}}]},
+                   {"iCalUId":"wrong","subject":"Unrelated","webLink":"https://outlook.office365.com/calendar/item/4",
+                    "start":{"dateTime":"2026-09-21T10:00:00Z","timeZone":"UTC"},"end":{"dateTime":"2026-09-21T11:00:00Z","timeZone":"UTC"},
+                    "attendees":[{"emailAddress":{"address":"me@contoso.example"}}]},
+                   {"iCalUId":"past","subject":"Upgrade review ","webLink":"https://outlook.office365.com/calendar/item/1",
+                    "start":{"dateTime":"2026-09-22T10:00:00Z","timeZone":"UTC"},"end":{"dateTime":"2026-09-22T11:00:00Z","timeZone":"UTC"},
+                    "organizer":{"emailAddress":{"address":"other@example.invalid"}},
+                    "attendees":[{"emailAddress":{"address":"me@contoso.example"}}]}]}},
+                 {"statusCode":200,"data":{"value":[
+                   {"iCalUId":"other","subject":"Other sync","webLink":"https://outlook.office365.com/calendar/item/2",
+                    "start":{"dateTime":"2026-09-21T10:00:00Z","timeZone":"UTC"},"end":{"dateTime":"2026-09-21T11:00:00Z","timeZone":"UTC"},
+                    "organizer":{"emailAddress":{"address":"other@example.invalid"}},
+                    "attendees":[{"emailAddress":{"address":"someone@example.invalid"}}]}]}}]},"isError":false}
+                """), Now, Now, SelfIdentity);
+            var item = snapshot.Items.Single();
+            Check.Equal("Upgrade review", item.Title);
+            Check.Equal(ContextSourceType.Calendar, item.Sources.Single().SourceType);
+            Check.Equal(ContextInvolvementRole.MeetingAttendee, item.Sources.Single().InvolvementRole);
+            Check.Equal(WorkIqFailure.Malformed, Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.MeetingSearchContext(subjects, FetchOne("{}"), Now, Now, SelfIdentity)).Kind);
+            Check.Equal(WorkIqFailure.Denied, Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.MeetingSearchContext(subjects.Take(1).ToArray(), FetchOne("{}", 403), Now, Now, SelfIdentity)).Kind);
+        }));
+        yield return ("WorkIQ Teams search fallback proves membership from chat members", () => Run(() =>
+        {
+            var hits = WorkIqMcpClient.ParseSearchHits(Json("""
+                {"structuredContent":{"statusCode":200,"data":{"value":[{"hitsContainers":[{"hits":[
+                  {"summary":"Upgrade <c0>chat</c0>","resource":{"id":"1","chatId":"19:chat-a","webLink":"https://teams.microsoft.com/l/message/1",
+                   "from":{"emailAddress":{"address":"other@example.invalid"}},"channelIdentity":{"channelId":"19:chat-a"}}},
+                  {"resource":{"id":"2","chatId":"19:chan","webLink":"https://teams.microsoft.com/l/message/2",
+                   "from":{"emailAddress":{"address":"other@example.invalid"}},"channelIdentity":{"teamId":"team-b","channelId":"19:chan"}}},
+                  {"resource":{"id":"3","chatId":"19:chat-c","webLink":"https://teams.microsoft.com/l/message/3",
+                   "from":{"emailAddress":{"address":"me@contoso.example"}}}}]}]}]}},"isError":false}
+                """));
+            var paths = hits.Select(hit => WorkIqMcpClient.TeamsMembersPath(hit.Resource)).OfType<string>().Distinct().ToArray();
+            Check.Equal("/chats/19%3Achat-a/members", paths[0]);
+            Check.Equal("/teams/team-b/channels/19%3Achan/members?$top=100", paths[1]);
+            var snapshot = WorkIqMcpClient.TeamsSearchContext(hits, paths, Json("""
+                {"structuredContent":{"results":[
+                 {"statusCode":200,"data":{"value":[{"userId":"user-123","email":"x@example.invalid"}]}},
+                 {"statusCode":429,"data":{}},
+                 {"statusCode":200,"data":{"value":[]}}]},"isError":false}
+                """), Now, SelfIdentity);
+            Check.Equal(2, snapshot.Items.Count);
+            Check.Equal(ContextInvolvementRole.TeamsMember, snapshot.Items[0].Sources.Single().InvolvementRole);
+            Check.Equal("19:chat-a:1", snapshot.Items[0].Sources.Single().SourceId);
+            Check.Equal(ContextInvolvementRole.TeamsAuthor, snapshot.Items[1].Sources.Single().InvolvementRole);
+            Check.Equal(WorkIqFailure.Authentication, Check.Throws<WorkIqException>(() =>
+                WorkIqMcpClient.TeamsSearchContext(hits, ["/chats/x/members"], FetchOne("{}", 401), Now, SelfIdentity)).Kind);
+        }));
+        yield return ("WorkIQ falls back to search only when retrieve is declined", async () =>
+        {
+            var found = new RelatedContextSnapshot(Now, [], RelatedContextAvailability.NoEvidence, "search");
+            var declinedCodes = new List<string?>();
+            var searched = 0;
+            Task<RelatedContextSnapshot> Search(CancellationToken _) { searched++; return Task.FromResult(found); }
+
+            var result = await WorkIqService.RetrieveFamilyWithFallbackAsync(
+                _ => Task.FromException<RelatedContextSnapshot>(
+                    new WorkIqException(WorkIqFailure.ServiceDeclined, "tool-error:AccessDenied")),
+                Search, false, ex => declinedCodes.Add(ex.Code), CancellationToken.None);
+            Check.Equal("search", result.Detail);
+            Check.Equal("tool-error:AccessDenied", declinedCodes.Single());
+
+            foreach (var kind in new[] { WorkIqFailure.Network, WorkIqFailure.Timeout, WorkIqFailure.SignedOut, WorkIqFailure.Authentication })
+                Check.Equal(kind, (await Check.ThrowsAsync<WorkIqException>(() =>
+                    WorkIqService.RetrieveFamilyWithFallbackAsync(
+                        _ => Task.FromException<RelatedContextSnapshot>(new WorkIqException(kind)),
+                        Search, false, _ => { }, CancellationToken.None))).Kind);
+            Check.Equal(1, searched);
+
+            var retrieveCalls = 0;
+            await WorkIqService.RetrieveFamilyWithFallbackAsync(
+                _ => { retrieveCalls++; return Task.FromResult(found); },
+                Search, true, _ => { }, CancellationToken.None);
+            Check.Equal(0, retrieveCalls);
+            Check.Equal(2, searched);
+
+            var noSearch = await Check.ThrowsAsync<WorkIqException>(() => WorkIqService.RetrieveFamilyWithFallbackAsync(
+                _ => Task.FromException<RelatedContextSnapshot>(new WorkIqException(WorkIqFailure.Unsupported)),
+                null, true, _ => { }, CancellationToken.None));
+            Check.Equal(WorkIqFailure.Unsupported, noSearch.Kind);
+
+            var keepsOriginal = await Check.ThrowsAsync<WorkIqException>(() => WorkIqService.RetrieveFamilyWithFallbackAsync(
+                _ => Task.FromException<RelatedContextSnapshot>(
+                    new WorkIqException(WorkIqFailure.ServiceDeclined, "tool-error:AccessDenied")),
+                _ => Task.FromException<RelatedContextSnapshot>(new WorkIqException(WorkIqFailure.Unsupported)),
+                false, _ => { }, CancellationToken.None));
+            Check.Equal("tool-error:AccessDenied", keepsOriginal.Code);
+        });
         yield return ("WorkIQ related-context diagnostics never retain query or source content", async () =>
         {
             var diagnostics = new AiDiagnosticsStream();

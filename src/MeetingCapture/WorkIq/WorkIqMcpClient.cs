@@ -35,7 +35,7 @@ public sealed class WorkIqException(WorkIqFailure kind, string? code = null) : E
 public sealed record WorkIqProfilePhoto(byte[] Content, string ContentType);
 
 /// <summary>Minimal hosted MCP client for bounded calendar metadata and profile-photo reads.</summary>
-public sealed class WorkIqMcpClient(HttpClient http, TimeSpan? requestTimeout = null) : IDisposable
+public sealed partial class WorkIqMcpClient(HttpClient http, TimeSpan? requestTimeout = null) : IDisposable
 {
     public const string Endpoint = "https://workiq.svc.cloud.microsoft/mcp";
     private const int MaxProfilePhotoBytes = 1024 * 1024;
@@ -44,6 +44,7 @@ public sealed class WorkIqMcpClient(HttpClient http, TimeSpan? requestTimeout = 
     private string? _session;
     private string? _protocol;
     private bool _retrieveAvailable;
+    private bool _searchAvailable;
     private int _id;
 
     public async Task InitializeAsync(string token, CancellationToken ct)
@@ -67,6 +68,8 @@ public sealed class WorkIqMcpClient(HttpClient http, TimeSpan? requestTimeout = 
             {
                 if (tool.GetProperty("name").GetString() == "retrieve")
                     _retrieveAvailable = true;
+                if (tool.GetProperty("name").GetString() == "do_action")
+                    _searchAvailable = true;
                 if (tool.GetProperty("name").GetString() != "fetch") continue;
                 var schema = tool.GetProperty("inputSchema");
                 var urls = schema.GetProperty("properties").GetProperty("entityUrls");
@@ -355,8 +358,33 @@ UNTRUSTED_TOPIC_JSON:
         }
     }
 
+    private static string ToolErrorCode(JsonElement result)
+    {
+        if (result.TryGetProperty("content", out var content) && content.ValueKind == JsonValueKind.Array)
+            foreach (var item in content.EnumerateArray())
+            {
+                if (item.ValueKind != JsonValueKind.Object ||
+                    !item.TryGetProperty("text", out var text) || text.ValueKind != JsonValueKind.String ||
+                    text.GetString() is not { Length: > 0 and <= 4096 } errorText)
+                    continue;
+                try
+                {
+                    using var error = JsonDocument.Parse(errorText);
+                    if (error.RootElement.ValueKind == JsonValueKind.Object &&
+                        error.RootElement.TryGetProperty("errorCode", out var code) &&
+                        code.ValueKind == JsonValueKind.String &&
+                        code.GetString() is { Length: > 0 and <= 40 } value &&
+                        value.All(char.IsAsciiLetter))
+                        return "tool-error:" + value;
+                }
+                catch (JsonException) { }
+            }
+        return "tool-error";
+    }
+
     public static RelatedContextSnapshot ParseRetrievedContext(
-        JsonElement result, DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity)
+        JsonElement result, DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity,
+        string matchedBy = "WorkIQ semantic retrieval")
     {
         try
         {
@@ -366,7 +394,7 @@ UNTRUSTED_TOPIC_JSON:
                     isError.ValueKind != JsonValueKind.False)
                     throw new WorkIqException(WorkIqFailure.Malformed, "shape:isError");
                 if (isError.GetBoolean())
-                    throw new WorkIqException(WorkIqFailure.ServiceDeclined, "tool-error");
+                    throw new WorkIqException(WorkIqFailure.ServiceDeclined, ToolErrorCode(result));
             }
             if (!result.TryGetProperty("structuredContent", out var structured) ||
                 structured.ValueKind != JsonValueKind.Object)
@@ -467,7 +495,7 @@ UNTRUSTED_TOPIC_JSON:
                     $"Related {SourceLabel(sourceType)} suggestion; open the cited source to verify relevance.",
                     ClaimKind.InferredConnection,
                     [source],
-                    $"WorkIQ semantic retrieval matched this {SourceLabel(sourceType)} to the selected topic; " +
+                    $"{matchedBy} matched this {SourceLabel(sourceType)} to the selected topic; " +
                     "treat it as a suggestion until the cited source is reviewed.",
                     SuggestionId(sourceType, sourceId)));
                 if (items.Count == 20)

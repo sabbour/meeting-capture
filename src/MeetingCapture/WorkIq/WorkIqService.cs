@@ -31,6 +31,7 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
     private (long Revision, WorkIqCurrentIdentity Identity)? _identityCache;
     private IPublicClientApplication? _app;
     private long _revision;
+    private long? _retrieveDeclinedRevision;
     private AuthStateSnapshot _authStateSnapshot = new(false, 0);
     private bool _disposed;
     public (bool IsAuthenticated, long Revision) AuthState
@@ -347,9 +348,29 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
                     using var familyPhase = _responsiveness?.BeginBackgroundPhase(FamilyPhase(capability));
                     try
                     {
-                        var response = await client.RetrieveRelatedContextResultAsync(
-                            auth.AccessToken, query.Topic, [capability], familyToken).ConfigureAwait(false);
-                        var family = WorkIqMcpClient.ParseRetrievedContext(response, retrievedAt, currentIdentity);
+                        bool skipRetrieve;
+                        lock (_gate) skipRetrieve = _retrieveDeclinedRevision == revision;
+                        var family = await RetrieveFamilyWithFallbackAsync(
+                            async ct => WorkIqMcpClient.ParseRetrievedContext(
+                                await client.RetrieveRelatedContextResultAsync(
+                                    auth.AccessToken, query.Topic, [capability], ct).ConfigureAwait(false),
+                                retrievedAt, currentIdentity),
+                            client.SearchAvailable || capability == "Email"
+                                ? ct => client.SearchRelatedContextAsync(
+                                    auth.AccessToken, query.Topic, capability, retrievedAt, currentIdentity, ct)
+                                : null,
+                            skipRetrieve,
+                            declined =>
+                            {
+                                var recorded = Failure(declined);
+                                if (recorded.Kind == WorkIqFailure.Unsupported ||
+                                    recorded.Code == "tool-error:AccessDenied")
+                                    lock (_gate) _retrieveDeclinedRevision = revision;
+                                _logger.LogInformation(
+                                    "WorkIQ retrieve declined for {Capability}; using keyword search fallback.",
+                                    capability);
+                            },
+                            familyToken).ConfigureAwait(false);
                         _logger.LogInformation(
                             "WorkIQ related-context family completed: {Capability} {Availability} {Count}.",
                             capability, family.Availability, family.Items.Count);
@@ -485,6 +506,40 @@ public sealed class WorkIqService : IDisposable, IRelatedContextSource
             "Work IQ does not support related suggestions.",
         _ => "Work IQ request failed. See Diagnostics/related.log for the error type.",
     };
+
+    /// <summary>
+    /// Runs WorkIQ "retrieve" for one source family and, only when the service declines it or
+    /// says it is not supported, runs the keyword-search fallback instead. Sign-in, network
+    /// and timeout failures are not hidden behind the fallback.
+    /// </summary>
+    internal static async Task<RelatedContextSnapshot> RetrieveFamilyWithFallbackAsync(
+        Func<CancellationToken, Task<RelatedContextSnapshot>> retrieve,
+        Func<CancellationToken, Task<RelatedContextSnapshot>>? search,
+        bool skipRetrieve,
+        Action<WorkIqException> onRetrieveDeclined,
+        CancellationToken cancellationToken)
+    {
+        if (skipRetrieve && search is not null)
+            return await search(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await retrieve(cancellationToken).ConfigureAwait(false);
+        }
+        catch (WorkIqException declined) when (
+            search is not null &&
+            declined.Kind is WorkIqFailure.ServiceDeclined or WorkIqFailure.Unsupported)
+        {
+            onRetrieveDeclined(declined);
+            try
+            {
+                return await search(cancellationToken).ConfigureAwait(false);
+            }
+            catch (WorkIqException unsupported) when (unsupported.Kind == WorkIqFailure.Unsupported)
+            {
+                throw declined;
+            }
+        }
+    }
 
     /// <summary>
     /// Queries every source family at the same time, each with its own time limit. One slow,

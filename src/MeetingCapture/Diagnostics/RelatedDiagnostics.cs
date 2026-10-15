@@ -8,7 +8,7 @@ internal static class RelatedDiagnostics
 {
     private static readonly object Gate = new();
     private static readonly Regex SafeCode = new(
-        @"\A(?:http:\d{3}|rpc:-?\d+|shape:[A-Za-z]+|AADSTS\d+)\z");
+        @"\A(?:http:\d{3}|rpc:-?\d+|shape:[A-Za-z]+|AADSTS\d+|tool-error(?::[A-Za-z]{1,40})?)\z");
 
     internal static string Format(string operation, bool? authenticated, Exception error)
     {
