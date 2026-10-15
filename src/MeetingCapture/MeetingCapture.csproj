@@ -61,6 +61,8 @@
   <ItemGroup>
     <None Update="appsettings.json" Condition="Exists('appsettings.json')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <!-- Local settings may contain personal values; never ship them in published builds. -->
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </None>
     <None Update="appsettings.template.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
@@ -74,5 +76,20 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
+
+  <!-- The Copilot SDK does not reliably add its CLI to the publish output (for example with
+       publish -no-build), so always publish the copy from the build output. The app cannot
+       generate notes without it, so publishing fails if it is missing. -->
+  <Target Name="PublishCopilotCli" AfterTargets="ComputeResolvedFilesToPublishList">
+    <PropertyGroup>
+      <_PublishCopilotCliRelativePath>runtimes\$(RuntimeIdentifier)\native\copilot.exe</_PublishCopilotCliRelativePath>
+      <_PublishCopilotCliPath>$(OutDir)$(_PublishCopilotCliRelativePath)</_PublishCopilotCliPath>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_PublishCopilotCliPath)')" Text="Copilot CLI not found at '$(_PublishCopilotCliPath)'. Build for this runtime before publishing." />
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" Condition="'%(ResolvedFileToPublish.RelativePath)' == '$(_PublishCopilotCliRelativePath)'" />
+      <ResolvedFileToPublish Include="$(_PublishCopilotCliPath)" RelativePath="$(_PublishCopilotCliRelativePath)" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
 
 </Project>
