@@ -235,22 +235,29 @@ public sealed partial class MainWindow : Window
         _visualization = visualization;
         _visualizationStorage = visualizationStorage;
         _copilotModelCatalog = copilotModelCatalog;
+        // The window is constructed on the UI thread; keep its queue so background callbacks can hop back to it.
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
+        // Honour the Windows "show animations" setting once at startup for all transitions.
         _animationsEnabled = new UISettings().AnimationsEnabled;
 
+        // Each UI phase is timed so slow startup steps on the UI thread show up in responsiveness diagnostics.
         using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowInitialize))
             InitializeComponent();
         UpdateVisualizationViewVisibility();
         using (_responsiveness.BeginUiPhase(ResponsivenessPhase.SettingsInitialize))
             InitializeSettingsEditor();
 
+        // Bind lists to the observable collections now; later updates only mutate the collections in place.
         TranscriptList.ItemsSource = _transcript;
         // User scrolling pauses follow-latest so new speech does not pull the view away.
+        // handledEventsToo=true: the ListView's internal scroller marks these events handled, so ordinary
+        // subscriptions would never see the user's click, wheel or keyboard navigation.
         TranscriptList.AddHandler(UIElement.PointerPressedEvent,
             new PointerEventHandler((_, _) => _viewport.Pause()), true);
         TranscriptList.AddHandler(UIElement.PointerWheelChangedEvent,
             new PointerEventHandler((_, e) =>
             {
+                // Only wheel-up (away from the newest line) pauses follow-latest; scrolling down is moving toward it.
                 if (e.GetCurrentPoint(TranscriptList).Properties.MouseWheelDelta > 0) _viewport.Pause();
             }), true);
         TranscriptList.KeyDown += (_, e) =>
@@ -277,10 +284,13 @@ public sealed partial class MainWindow : Window
         TopicPaneSplitter.NudgeRequested += OnTopicPaneSplitterNudged;
         RootLayout.Loaded += OnRootLayoutLoaded;
 
+        // Expander headers show item counts, so refresh them whenever the lists change.
         _questions.CollectionChanged += (_, _) => UpdateExpanderHeaders();
         _actions.CollectionChanged += (_, _) => UpdateExpanderHeaders();
         UpdateExpanderHeaders();
 
+        // Any size change of the recording sections re-runs the adaptive layout; expander toggles are deferred
+        // with TryEnqueue so layout runs after the expander has finished changing its own size.
         RecordingBodyScroll.Loaded += (_, _) => UpdateRecordingLayout();
         RecordingBodyScroll.SizeChanged += (_, _) => UpdateRecordingLayout();
         InsightSections.SizeChanged += (_, _) => UpdateRecordingLayout();
@@ -300,8 +310,10 @@ public sealed partial class MainWindow : Window
         _presenter.IsResizable = true;
         _presenter.IsMaximizable = false;
         _presenter.IsMinimizable = false;
+        // Border without the system title bar: keeps the native resize edge while the XAML header replaces the caption.
         _presenter.SetBorderAndTitleBar(true, false);
         AppWindow.SetPresenter(_presenter);
+        // Buttons inside the draggable title bar must be carved out as "passthrough" regions or clicks become window drags.
         _titleBarPointerSource = InputNonClientPointerSource.GetForWindowId(AppWindow.Id);
         AppTitleBar.SizeChanged += OnTitleBarSizeChanged;
         TitleBarActions.LayoutUpdated += OnTitleBarActionsLayoutUpdated;
@@ -309,6 +321,7 @@ public sealed partial class MainWindow : Window
 
         // Set taskbar/titlebar icon for this window.
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        // Subclass the native window to observe raw Win32 messages; drop the delegate if registration fails.
         _windowMessageProc = OnWindowMessage;
         if (!NativeMethods.SetWindowSubclass(hwnd, _windowMessageProc, WindowSubclassId, UIntPtr.Zero))
             _windowMessageProc = null;
@@ -320,6 +333,8 @@ public sealed partial class MainWindow : Window
         MeetingPrompt.CloseButtonClick += (_, _) => MeetingDismissRequested?.Invoke(this, EventArgs.Empty);
         MeetingEndPrompt.CloseButtonClick += (_, _) => MeetingEndPrompt.IsOpen = false;
 
+        // Subscribe to pipeline and service events last. They can be raised from background threads, so the
+        // handlers marshal onto the UI thread before touching controls.
         _pipeline.StateChanged += OnPipelineStatusChanged;
         _pipeline.TranscriptSegmentReceived += OnTranscriptSegmentReceived;
         _pipeline.PartialTranscriptReceived += OnPartialTranscriptReceived;
@@ -350,6 +365,7 @@ public sealed partial class MainWindow : Window
         };
         _healthTimer.Start();
 
+        // Start in the idle presentation so the window is coherent before the first pipeline event arrives.
         UpdateControlState();
         SetChipStatus("Idle", false);
         ShowState(recording: false);
@@ -370,6 +386,7 @@ public sealed partial class MainWindow : Window
     {
         // Layout still runs while the window closes; the pointer source is already closed then.
         if (_allowClose) return;
+        // Non-client regions are in physical pixels while XAML bounds are in DIPs, so scale by the monitor DPI.
         var scale = AppTitleBar.XamlRoot?.RasterizationScale ?? 1d;
         var interactiveRects = new List<RectInt32>();
         foreach (var control in new FrameworkElement[]
@@ -393,6 +410,7 @@ public sealed partial class MainWindow : Window
                 (int)Math.Ceiling(bounds.Height * scale)));
         }
 
+        // LayoutUpdated fires very often; only call into the native pointer source when the rectangles really changed.
         var rects = interactiveRects.ToArray();
         if (_titleBarInteractiveRects.AsSpan().SequenceEqual(rects))
             return;
@@ -416,18 +434,21 @@ public sealed partial class MainWindow : Window
         CancellationToken sessionCancellationToken)
     {
         var normalizedTopic = NormalizeRelatedContextTopic(topic);
+        // Drop topics from a session that is no longer the displayed one, or with invalid revision/ordinal values.
         if (sessionId != _sessionId ||
             !IsActiveVisualizationSession(sessionId) ||
             normalizedTopic.Length == 0 ||
             transcriptRevision < 0 || throughSegmentOrdinal < 0)
             return;
 
+        // A genuinely new topic clears the previous topic's related sources immediately rather than leaving them stale.
         if (!string.Equals(
             NormalizeRelatedContextTopic(_acceptedRelatedContextTopic),
             normalizedTopic,
             StringComparison.Ordinal))
             RenderRelatedContext(null);
         _acceptedRelatedContextTopic = topic;
+        // Counts analyses in flight; the last one to finish forces a map refresh (see RefreshVisualizationAnalysisAsync).
         Interlocked.Increment(ref _visualizationAnalysisPending);
         string acceptedTopicId;
         try
@@ -440,15 +461,18 @@ public sealed partial class MainWindow : Window
             _relatedContextStatesByTopicId[accepted.Id] = RelatedContextState.Pending;
             _currentVisualizationTopicId = accepted.Id;
             RefreshVisualization(force: true);
+            // Fire-and-forget: analysis runs in the background; its own finally block balances the pending counter.
             _ = RefreshVisualizationAnalysisAsync(sessionCancellationToken);
         }
         catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
         {
+            // No analysis was started, so undo the increment made above.
             Interlocked.Decrement(ref _visualizationAnalysisPending);
             _logger.LogWarning("Visualization topic update was rejected ({Type}).", ex.GetType().Name);
             return;
         }
         TldrChip.Text = ProjectVisualizationText(topic);
+        // Over-long summaries are not useful search queries: mark the topic's sources unavailable but keep the map live.
         if (!IsRelatedContextTopicEligible(normalizedTopic))
         {
             if (_currentVisualizationTopicId is not null)
@@ -471,6 +495,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            // Cancellation (session ended) is expected and silent; other failures are logged without exposing content.
             await _pipeline.RefreshVisualizationAnalysisAsync(cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
@@ -486,6 +511,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            // Only the last overlapping analysis repaints, and it does so on the UI thread (this continuation may not be on it).
             if (Interlocked.Decrement(ref _visualizationAnalysisPending) == 0)
                 InvokeOnUi(() => RefreshVisualization(force: true));
         }
@@ -545,6 +571,7 @@ public sealed partial class MainWindow : Window
                 DispatcherQueuePriority.Low,
                 RefreshTodaysMeetings))
             RefreshTodaysMeetings();
+        // Hold off focus-loss auto-dismiss briefly; the tray click itself can momentarily deactivate the window.
         _ = ReleaseSuppressAsync(_suppressReleaseCts.Token);
     }
 
@@ -560,6 +587,7 @@ public sealed partial class MainWindow : Window
 
     public void RefreshTodaysMeetings()
     {
+        // The idle calendar list only matters when a new recording can start; fire-and-forget the async load.
         if (!_pipeline.CanStart)
             return;
         _ = LoadTodaysMeetingsAsync();
@@ -573,9 +601,12 @@ public sealed partial class MainWindow : Window
             CalendarStatusText.Text = "Connect your calendar in Settings.";
             return;
         }
+        // The generation is a ticket: InvalidateCalendar (sign-in/out) bumps it, so results fetched under an older
+        // ticket are discarded instead of rendering another account's meetings.
         var generation = CalendarRevision;
         var session = _pipeline.Status.SessionId;
         using var lifetime = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        // Publish the token source so InvalidateCalendar/PrepareForExit can cancel this lookup; busy blocks overlap.
         _calendarCts = lifetime;
         _calendarBusy = true;
         _workIqConnection.BeginCalendar(_todaysMeetings.Count);
@@ -583,6 +614,7 @@ public sealed partial class MainWindow : Window
         UpdateWorkIqControls();
         try
         {
+            // WaitAsync lets the 30 s timeout abandon the await even if the provider ignores cancellation.
             var meetings = await GetCalendarCandidatesAsync(lifetime.Token).WaitAsync(lifetime.Token);
             if (_allowClose || _preparingExit || generation != CalendarRevision) return;
             _workIqConnection.CalendarSucceeded(meetings.Count, DateTimeOffset.Now);
@@ -593,6 +625,7 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             if (_allowClose || _preparingExit || generation != CalendarRevision) return;
+            // A real failure empties every list so stale meetings are not presented as current.
             _logger.LogWarning("Calendar refresh failed ({Type}).", ex.GetType().Name);
             _todaysMeetings.Clear();
             _otherMeetings.Clear();
@@ -613,6 +646,7 @@ public sealed partial class MainWindow : Window
         {
             if (ReferenceEquals(_calendarCts, lifetime)) _calendarCts = null;
             _calendarBusy = false;
+            // If auth changed while this run was in flight, its result was dropped; start over with the new identity.
             if (!_allowClose && generation != CalendarRevision)
                 _ = LoadTodaysMeetingsAsync(allowWhileRecording: true);
         }
@@ -628,6 +662,7 @@ public sealed partial class MainWindow : Window
         foreach (var meeting in CalendarMeetingList.Select(_calendarMeetings, now))
         {
             var row = MeetingRow.From(meeting, now);
+            // Bucket by time: meetings happening around now, later today, and already finished.
             var target = CalendarMeetingList.IsAroundNow(meeting, now) ? _todaysMeetings
                 : meeting.Start > now ? _otherMeetings : _pastMeetings;
             target.Add(row);
@@ -643,6 +678,8 @@ public sealed partial class MainWindow : Window
     {
         var start = new DateTimeOffset(DateTime.Today);
         var end = new DateTimeOffset(DateTime.Today.AddDays(1));
+        // Query off the UI thread; ConfigureAwait(false) means the code after this await may run on a pool thread,
+        // which is why the shared candidate list is guarded by a lock rather than UI-thread affinity.
         var meetings = await Task.Run(() => _workIq.GetCalendarAsync(start, end, ct), ct).ConfigureAwait(false);
         lock (_calendarCandidateGate) _latestCalendarCandidates = [.. meetings];
         return meetings;
@@ -650,6 +687,7 @@ public sealed partial class MainWindow : Window
 
     private void InvalidateCalendar()
     {
+        // New generation first so any in-flight load sees it was superseded, then cancel it and clear the display.
         Interlocked.Increment(ref _calendarGeneration);
         _calendarCts?.Cancel();
         _todaysMeetings.Clear();
@@ -669,15 +707,18 @@ public sealed partial class MainWindow : Window
     {
         if (_allowClose) return;
         var auth = _workIq.AuthState;
+        // Ignore repeated notifications for an auth revision that was already handled.
         if (!_workIqConnection.AuthenticationChanged(auth.IsAuthenticated, auth.Revision)) return;
         UpdateWorkIqControls();
         InvalidateCalendar();
+        // Related sources came from the previous identity: drop cached results and render a clean state.
         _relatedContext.Invalidate();
         _relatedContextStatesByTopicId.Clear();
         _appliedRelatedContextSnapshots.Clear();
         RefreshVisualization();
         RenderRelatedContext(_relatedContext.Status);
         var currentTopicId = ResolveLiveCanonicalTopicId(_currentVisualizationTopicId);
+        // After a sign-in during a live recording, re-query sources for existing topics (current topic first).
         if (_sessionId is not null && _contextCts is not null &&
             _loadedVisualization is null && auth.IsAuthenticated)
         {
@@ -706,10 +747,12 @@ public sealed partial class MainWindow : Window
         _workIqCts = lifetime;
         _workIqRestoring = true;
         UpdateWorkIqControls();
+        // Restore runs off the UI thread; the 30 s token only abandons the wait, so the task is observed below.
         var restore = Task.Run(() => _workIq.RestoreAsync(token), token);
         try { await restore.WaitAsync(token); }
         catch (OperationCanceledException)
         {
+            // The abandoned restore may still fault later; observe it so the exception is logged, not unobserved.
             _ = restore.ContinueWith(fault =>
                 _logger.LogWarning("WorkIQ restore finished after cancellation ({Type}).",
                     fault.Exception!.GetBaseException().GetType().Name),
@@ -733,10 +776,12 @@ public sealed partial class MainWindow : Window
         _workIqCts = lifetime;
         _workIqConnection.SetMessage("Finish WorkIQ sign-in in the browser (90-second limit), or cancel. Recording remains available.");
         UpdateWorkIqControls();
+        // Interactive browser sign-in; Cancel (or leaving) cancels the token. Recording is never blocked by this.
         try { await _workIq.SignInAsync(lifetime.Token); }
         catch (OperationCanceledException) { SetWorkIqAuthFailure(lifetime, "WorkIQ sign-in cancelled. You can close the browser tab."); }
         catch (WorkIqException ex) when (ex.Kind is WorkIqFailure.ServiceUnavailable && _workIq.IsAuthenticated)
         {
+            // Sign-in itself worked; only the backend is unavailable, so say so rather than reporting a login failure.
             var message = "Signed in to WorkIQ, but the WorkIQ service is having a problem right now. " +
                 "Your connection is working; try again in a few minutes." +
                 (string.IsNullOrEmpty(ex.Code) ? string.Empty : $" ({ex.Code})");
@@ -759,6 +804,7 @@ public sealed partial class MainWindow : Window
 
     private void SetWorkIqAuthFailure(CancellationTokenSource lifetime, string message)
     {
+        // Report only if this attempt is still the current one; a newer attempt or a successful sign-in wins.
         if (!_allowClose && !_preparingExit && ReferenceEquals(_workIqCts, lifetime) && !_workIq.IsAuthenticated)
         {
             _workIqConnection.SetMessage(message);
@@ -788,6 +834,7 @@ public sealed partial class MainWindow : Window
         _responsiveness.SetWorkIqState(authenticated, pending || signInBusy, _calendarBusy);
         var state = _workIqConnection.Controls(authenticated, signInBusy, pending,
             _workIqCts is { IsCancellationRequested: true }, _workIqRestoring);
+        // Called every second by the health timer: skip when unchanged, and below touch only fields that differ.
         if (_renderedWorkIqControls == state) return;
         var previous = _renderedWorkIqControls;
         var actions = state.Actions;
@@ -824,6 +871,7 @@ public sealed partial class MainWindow : Window
         if (PreferencesPanel.Visibility == Visibility.Visible)
             return;
 
+        // Remember which panel to return to, then hide recording-only header controls while Settings is shown.
         _preferencesFromRecording = RecordingPanel.Visibility == Visibility.Visible;
         CloseTopicMap();
         IdlePanel.Visibility = RecordingPanel.Visibility = Visibility.Collapsed;
@@ -852,6 +900,7 @@ public sealed partial class MainWindow : Window
 
     public void ShowMeetingPrompt(MeetingSession session)
     {
+        // Set before marshaling so UpdateMeetingPrompt can tell whether later updates still refer to this prompt.
         _promptSession = session;
         InvokeOnUi(() =>
         {
@@ -866,12 +915,15 @@ public sealed partial class MainWindow : Window
     {
         InvokeOnUi(() =>
         {
+            // Ignore updates for a prompt that was replaced, dismissed, or whose call already ended.
             if (!ReferenceEquals(_promptSession, session) || !MeetingPrompt.IsOpen || !session.IsActive)
                 return;
+            // Copy under the lock; the candidate list is replaced by background calendar refreshes.
             List<MeetingTitleCandidate> candidates;
             lock (_calendarCandidateGate) candidates = [.. _latestCalendarCandidates];
             var resolution = MeetingTitleResolver.ResolveWithReason(
                 session.SourceProcess, session.StartedAt, candidates);
+            // Attach the calendar event only when the resolver's title is the one the session already shows.
             if (resolution.Meeting is { } match &&
                 string.Equals(resolution.Title, session.Title, StringComparison.OrdinalIgnoreCase))
                 session.TryAttachCalendarMeeting(session.Id, match);
@@ -887,6 +939,7 @@ public sealed partial class MainWindow : Window
         SetOptionalPromptText(MeetingPromptSchedule, content.Schedule);
         SetOptionalPromptText(MeetingPromptOrganizer, content.Organizer);
         SetOptionalPromptText(MeetingPromptInvitees, content.Invitees);
+        // Screen-reader names include the meeting so the buttons are unambiguous out of context.
         AutomationProperties.SetName(TakeNotesButton, $"Take notes for {content.Title}");
         List<MeetingTitleCandidate> candidates;
         lock (_calendarCandidateGate) candidates = [.. _latestCalendarCandidates];
@@ -917,6 +970,7 @@ public sealed partial class MainWindow : Window
     public void CloseForReal()
     {
         if (!_preparingExit) PrepareForExit();
+        // _allowClose lets OnAppWindowClosing proceed instead of converting Close into Hide.
         _allowClose = true;
         // Unsubscribe before closing so late service events cannot update the closing window.
         AppTitleBar.SizeChanged -= OnTitleBarSizeChanged;
@@ -944,7 +998,9 @@ public sealed partial class MainWindow : Window
 
     public async Task<bool> ConfirmCloseAfterSavedPartialAsync()
     {
+        // Without a XamlRoot no dialog can be shown, so treat it as "do not close".
         if (RootLayout.XamlRoot is not { } xamlRoot) return false;
+        // The window may be hidden in the tray; show it so the user can see and answer the dialog.
         using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowShow))
             AppWindow.Show(activateWindow: true);
         _responsiveness.SetWindowState(visible: AppWindow.IsVisible);
@@ -959,6 +1015,7 @@ public sealed partial class MainWindow : Window
                 "Audio that did not reach transcription is not available for recovery.",
             PrimaryButtonText = "Close app",
             CloseButtonText = "Keep app open",
+            // The safe choice (keep running) is the default so an accidental Enter does not end the session.
             DefaultButton = ContentDialogButton.Close
         };
         return await dialog.ShowAsync() == ContentDialogResult.Primary;
@@ -985,8 +1042,10 @@ public sealed partial class MainWindow : Window
 
     public void ExitFailed()
     {
+        // Undo PrepareForExit: re-enable controls and restart the timers it stopped.
         _preparingExit = false;
         _healthTimer?.Start();
+        // Resume the elapsed-time display only if capture is still running and no timer start is already pending.
         if (_pipeline.State == PipelineState.Recording && _recordingCts is null) StartRecordingTimer();
         UpdateControlState();
         ShowStatusBar("Exit could not safely save the transcript or release capture. The app remains open. Check the recording/storage error, then retry Exit.",
@@ -1019,6 +1078,7 @@ public sealed partial class MainWindow : Window
             AppWindow.Size.Width,
             AppWindow.Size.Height,
             (int)NativeMethods.GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)),
+            // A work area starting below the monitor's top means the taskbar is docked at the top.
             workArea.Y > displayArea.OuterBounds.Y);
         return new(bounds.X, bounds.Y, bounds.Width, bounds.Height);
     }
@@ -1060,6 +1120,7 @@ public sealed partial class MainWindow : Window
     private void SetPinned(bool requested)
     {
         _presenter.IsAlwaysOnTop = requested;
+        // Read the value back: the presenter is the source of truth if the request could not be applied.
         _isPinned = _presenter.IsAlwaysOnTop;
         PinButton.IsChecked = _isPinned;
         var label = _isPinned ? "Unpin panel" : "Pin panel above other windows";
@@ -1070,8 +1131,10 @@ public sealed partial class MainWindow : Window
     private IntPtr OnWindowMessage(
         IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, UIntPtr idSubclass, UIntPtr refData)
     {
+        // Remove the subclass as the window is destroyed so the native callback never outlives the managed delegate.
         if (msg == NativeMethods.WmNcDestroy && _windowMessageProc is { } proc)
             NativeMethods.RemoveWindowSubclass(hWnd, proc, idSubclass);
+        // Let the default handler fill in MINMAXINFO first, then adjust it so maximize stays within the work area.
         var result = NativeMethods.DefSubclassProc(hWnd, msg, wParam, lParam);
         if (msg == NativeMethods.WmGetMinMaxInfo)
             NativeMethods.ConstrainMaximizedBoundsToWorkArea(hWnd, lParam);
@@ -1086,6 +1149,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // The X button hides to the tray instead of destroying the window; real exit goes through CloseForReal.
         args.Cancel = true;
         using (_responsiveness.BeginUiPhase(ResponsivenessPhase.WindowHide))
             AppWindow.Hide();
@@ -1106,6 +1170,8 @@ public sealed partial class MainWindow : Window
         var prompt = _promptSession;
         List<MeetingTitleCandidate> candidates;
         lock (_calendarCandidateGate) candidates = [.. _latestCalendarCandidates];
+        // Close the auto-detected prompt, then let the user pick a calendar meeting: platform-matched events first,
+        // then any known events, then a fresh lookup.
         MeetingDismissRequested?.Invoke(this, EventArgs.Empty);
         _showCompletedSession = false;
         ShowState(false);
@@ -1153,6 +1219,7 @@ public sealed partial class MainWindow : Window
                 _preparingExit, _retryBusy, _previewBusy).Message, InfoBarSeverity.Informational);
             return;
         }
+        // Disable both start buttons immediately so a double click cannot launch two recordings.
         StartButton.IsEnabled = NewRecordingButton.IsEnabled = false;
         var title = $"Manual Recording \u2014 {DateTime.Now:yyyy-MM-dd HH:mm}";
         // Device startup can take time; keep it off the UI thread and marshal the control update back.
@@ -1166,6 +1233,7 @@ public sealed partial class MainWindow : Window
             {
                 ShowStartFailure("Manual start", ex);
             }
+            // Success or failure, recompute button state on the UI thread (the state event may already have done so).
             finally { InvokeOnUi(UpdateControlState); }
         });
     }
@@ -1178,6 +1246,7 @@ public sealed partial class MainWindow : Window
     {
         InvokeOnUi(() =>
         {
+            // The event may arrive late; only prompt if this is still the session being recorded.
             if (!ReferenceEquals(_pipeline.CurrentSession, session)) return;
             MeetingEndPrompt.IsOpen = true;
         });
@@ -1202,6 +1271,7 @@ public sealed partial class MainWindow : Window
     /// </summary>
     public void ToggleStopCountdown()
     {
+        // A running countdown can always be cancelled; starting one requires a stoppable recording and no exit in progress.
         if (!_stopCountdown.IsActive && (_preparingExit || !_pipeline.CanStop)) return;
         _stopCountdown.Toggle(_pipeline.CurrentSession, DateTimeOffset.UtcNow);
         OnStopCountdownChanged();
@@ -1210,6 +1280,7 @@ public sealed partial class MainWindow : Window
     private void StartStopCountdown()
     {
         if (_preparingExit || !_pipeline.CanStop) return;
+        // The countdown remembers which session it was started for, so a tick can detect that recording ended or changed.
         _stopCountdown.Start(_pipeline.CurrentSession, DateTimeOffset.UtcNow);
         OnStopCountdownChanged();
     }
@@ -1217,6 +1288,7 @@ public sealed partial class MainWindow : Window
     private void ClearStopCountdown()
     {
         if (!_stopCountdown.IsActive) return;
+        // Cancel without stopping: reset the state, then OnStopCountdownChanged stops the timer and restores labels.
         _stopCountdown.Clear();
         OnStopCountdownChanged();
     }
@@ -1252,6 +1324,7 @@ public sealed partial class MainWindow : Window
         }
         if (_stopCountdown.Tick(DateTimeOffset.UtcNow))
         {
+            // The five seconds elapsed uncancelled: end the countdown UI first (stops this timer), then actually stop.
             OnStopCountdownChanged();
             StopRecordingNow();
             return;
@@ -1261,6 +1334,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdateStopCountdownPresentation()
     {
+        // Progress drives a scale transform that visually fills the Stop button over the countdown.
         var presentation = _stopCountdown.Present(DateTimeOffset.UtcNow);
         StopCountdownFillTransform.ScaleX = presentation.Progress;
         StopButtonLabel.Text = presentation.ButtonText;
@@ -1268,12 +1342,14 @@ public sealed partial class MainWindow : Window
         AutomationProperties.SetName(StopButton, presentation.AccessibleName);
         PreferencesStopButton.Content = presentation.IsActive ? presentation.ButtonText : "Stop recording";
         AutomationProperties.SetName(PreferencesStopButton, presentation.AccessibleName);
+        // Tray menu and other listeners subscribe so every Stop control shows the same countdown/cancel text.
         StopCountdownChanged?.Invoke(this, presentation);
     }
 
     private void StopRecordingNow()
     {
         if (_preparingExit || !_pipeline.CanStop) return;
+        // Lock the Stop controls and freeze the elapsed timer immediately so the user sees capture is winding down.
         StopButton.IsEnabled = PreferencesStopButton.IsEnabled = false;
         LifecycleText.Text = "Stopping capture...";
         StopRecordingTimer();
@@ -1286,6 +1362,7 @@ public sealed partial class MainWindow : Window
             }
             catch (Exception ex)
             {
+                // The pipeline preserves the transcript on failure, hence the "retained" message.
                 _logger.LogError("Manual stop failed ({Type}).", ex.GetType().Name);
                 ShowStatusBar("Recording could not finish. Retained transcript remains available.", InfoBarSeverity.Error);
             }
@@ -1297,6 +1374,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            // Open in Explorer only when the folder exists; before the first save it may not have been created yet.
             var path = _settings.Storage.NotesPath;
             if (Directory.Exists(path))
                 System.Diagnostics.Process.Start("explorer.exe", path);
@@ -1313,6 +1391,7 @@ public sealed partial class MainWindow : Window
     private void OnMeetingRecordClick(object sender, RoutedEventArgs e)
     {
         if (sender is not FrameworkElement { DataContext: MeetingRow row } || !_pipeline.CanStart) return;
+        // The row's bound calendar event is passed along so the session is titled and attributed to that meeting.
         _ = Task.Run(async () =>
         {
             try
@@ -1329,6 +1408,7 @@ public sealed partial class MainWindow : Window
 
     private async void OnWhatDidIMissClick(object sender, RoutedEventArgs e)
     {
+        // Show the loading surface first, then force a fresh summary; if nothing rendered, show the failure with retry.
         OpenCatchUp();
         await RefreshPanelAsync(_summaryState, force: true, catchUp: true);
         if (!_catchUpRendered)
@@ -1348,6 +1428,7 @@ public sealed partial class MainWindow : Window
         CatchUpProgress.Visibility = Visibility.Visible;
         CatchUpStatusText.Text = "Reading the recent conversation...";
         CatchUpScroll.ChangeView(null, 0, null, disableAnimation: true);
+        // Move keyboard focus into the panel so screen-reader and keyboard users land on the new surface.
         CatchUpCloseButton.Focus(FocusState.Programmatic);
     }
 
@@ -1359,6 +1440,7 @@ public sealed partial class MainWindow : Window
         CatchUpProgress.IsActive = false;
         CatchUpProgress.Visibility = Visibility.Collapsed;
         _catchUpRendered = false;
+        // Return focus to the control that opened the panel so keyboard users do not lose their place.
         if (WhatDidIMissButton.Visibility == Visibility.Visible && WhatDidIMissButton.IsEnabled)
             WhatDidIMissButton.Focus(FocusState.Programmatic);
     }
@@ -1390,11 +1472,13 @@ public sealed partial class MainWindow : Window
         CatchUpStatusText.Text = $"Updated {DateTimeOffset.Now:h:mm:ss tt} \u00b7 from this recording only.";
         CatchUpBody.Visibility = Visibility.Visible;
 
+        // Show the "current topic" only when a real summary exists; otherwise the chip still holds placeholder text.
         CatchUpCurrentTopicText.Text = _hasSummary && !string.IsNullOrWhiteSpace(TldrChip.Text)
             ? TldrChip.Text
             : "Topic not established yet.";
         CatchUpSummaryText.Text = summary;
 
+        // Only unresolved questions/actions are fed in; completed items are not part of "what did I miss".
         _catchUpSections.Clear();
         foreach (var section in CatchUpPresentation.Sections(
                      _displayedVisualizationDocument,
@@ -1423,10 +1507,12 @@ public sealed partial class MainWindow : Window
             var package = new Windows.ApplicationModel.DataTransfer.DataPackage();
             package.SetText(RecordingNoticeText);
             Windows.ApplicationModel.DataTransfer.Clipboard.SetContent(package);
+            // Flush so the text survives after the app is hidden or closed.
             Windows.ApplicationModel.DataTransfer.Clipboard.Flush();
             CopyRecordingNoticeIcon.Glyph = "\uE73E";
             ToolTipService.SetToolTip(CopyRecordingNoticeButton, "Copied");
         }
+        // The clipboard can be locked by another process, which surfaces as a COMException; tell the user to retry.
         catch (System.Runtime.InteropServices.COMException ex)
         {
             _logger.LogWarning("Could not copy transcription notice ({Type}).", ex.GetType().Name);
@@ -1443,6 +1529,7 @@ public sealed partial class MainWindow : Window
             StatusBar.Message = message;
             StatusBar.IsOpen = true;
 
+            // Replace any pending dismissal so a newer message gets its own full 15 seconds.
             _statusBarDismissTimer?.Stop();
             _statusBarDismissTimer = null;
 
@@ -1461,6 +1548,7 @@ public sealed partial class MainWindow : Window
 
     private void OnPipelineStatusChanged(object? sender, PipelineStatus status)
     {
+        // Pipeline events are raised from capture/background threads; InvokeOnUi runs the handler on the UI thread.
         InvokeOnUi(() =>
         {
             _responsiveness.SetCaptureState(_pipeline.CanStop);
@@ -1470,6 +1558,7 @@ public sealed partial class MainWindow : Window
 
     private void OnAiUsageChanged(object? sender, EventArgs e)
     {
+        // On the UI thread render directly; from other threads coalesce notifications so only one render is queued.
         if (_dispatcherQueue.HasThreadAccess)
         {
             RenderAiUsage(refreshDetails: true, announceTransition: true);
@@ -1480,6 +1569,7 @@ public sealed partial class MainWindow : Window
             return;
         if (!_dispatcherQueue.TryEnqueue(() =>
             {
+                // Clear the pending marker before rendering so an update arriving mid-render queues another pass.
                 Interlocked.Exchange(ref _aiUsageRenderQueued, 0);
                 RenderAiUsage(refreshDetails: true, announceTransition: true);
             }))
@@ -1494,6 +1584,8 @@ public sealed partial class MainWindow : Window
         InvokeOnUi(() =>
         {
             if (update.SessionId != _sessionId || update.Revision < _transcriptRevision) return;
+            // Revisions only grow; an equal revision is an update to an existing line (e.g. re-attributed speaker),
+            // while a higher one is a newly finalized segment and bumps the count.
             var isNewRevision = update.Revision > _transcriptRevision;
             _transcriptRevision = Math.Max(_transcriptRevision, update.Revision);
             if (isNewRevision)
@@ -1526,6 +1618,7 @@ public sealed partial class MainWindow : Window
     private void RenderLatestPartialTranscript()
     {
         _partialTranscriptRetryTimer?.Stop();
+        // Take ownership of the pending partial; a retry timer tick may find nothing left to render.
         var update = Interlocked.Exchange(ref _pendingPartialTranscript, null);
         if (update is null)
         {
@@ -1553,12 +1646,14 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Rendering now: clear the queued flag first so a newer partial arriving meanwhile can schedule itself.
         Interlocked.Exchange(ref _partialUiUpdateQueued, 0);
         _lastPartialUiUpdate = now;
         var p = update.Partial;
         var rawSpeaker = string.IsNullOrWhiteSpace(p.SpeakerId)
             ? "Unknown" : _pipeline.SpeakerResolver.Canonical(p.SpeakerId)!;
         var display = _pipeline.SpeakerResolver.GetDisplayName(rawSpeaker);
+        // Reuse the single provisional row for this speaker rather than adding a row per interim update.
         var result = _transcriptState.UpsertPartial(
             rawSpeaker,
             () => CreatePartialTranscriptLine(rawSpeaker, display, p.Text),
@@ -1570,6 +1665,7 @@ public sealed partial class MainWindow : Window
         if (result.RequiresFollow)
             ScrollToLatest();
 
+        // A newer partial may have been stored while this one was rendering; schedule another pass.
         if (Volatile.Read(ref _pendingPartialTranscript) is not null)
             QueuePartialTranscriptRender();
     }
@@ -1577,6 +1673,7 @@ public sealed partial class MainWindow : Window
     private void SchedulePartialTranscriptRetry(TimeSpan delay)
     {
         var timer = _partialTranscriptRetryTimer;
+        // The one-shot timer is created lazily and reused; its tick re-enters the normal queue path.
         if (timer is null)
         {
             timer = _dispatcherQueue.CreateTimer();
@@ -1633,17 +1730,22 @@ public sealed partial class MainWindow : Window
             OnRecordingStarted();
             InvalidatePanels();
         }
+        // Show the transcription notice once per session, tracked by session id.
         if (RecordingViewState.ShouldShowNotice(status.State, _sessionId, _recordingNoticeSessionId))
         {
             _recordingNoticeSessionId = _sessionId;
             RecordingNotice.IsOpen = true;
         }
+        // After capture stops, ReviewingSave offers Save now or Discard until its deadline.
+        // This is separate from the five-second Stop countdown that runs while capture is still active.
         if (status.State == PipelineState.ReviewingSave)
             StartSaveReview(status);
         else
             StopSaveReview();
+        // _recordingCts doubles as "timers running", so this only starts them once per recording.
         if (status.State == PipelineState.Recording && _recordingCts is null)
             StartRecordingTimer();
+        // Anything past Starting/Recording ends live capture: drop timers, pending partials, and the provisional row.
         if (status.State is not (PipelineState.Starting or PipelineState.Recording))
         {
             RecordingNotice.IsOpen = false;
@@ -1663,11 +1765,13 @@ public sealed partial class MainWindow : Window
         LifecycleText.Text = status.Message;
         if (status.NotesPath is not null) _notesPath = status.NotesPath;
         SavedPathText.Text = _notesPath is null ? "" : "Notes saved";
+        // An AI failure takes precedence over a generic error since it carries a recovery hint.
         if (status.IntelligenceFailure is { } failure)
             ShowStatusBar($"{failure.Provider}: {failure.Kind}. {failure.Message} Use Settings, then Retry AI.", InfoBarSeverity.Warning);
         else if (status.Error is not null)
             ShowStatusBar(status.Error,
                 status.State == PipelineState.Saved ? InfoBarSeverity.Warning : InfoBarSeverity.Error);
+        // A discarded recording must leave no session UI behind, so reset to idle and return early.
         if (status.State == PipelineState.Discarded)
         {
             ClearDiscardedSessionUi();
@@ -1681,6 +1785,7 @@ public sealed partial class MainWindow : Window
             return;
         }
         ShowState(_sessionId is not null && _showCompletedSession);
+        // Once the session is final, force-refresh any open visualization so it reflects the saved result.
         if (status.State is PipelineState.Saved or PipelineState.Failed &&
             _displayedVisualizationDocument is not null)
             RefreshVisualization(force: true);
@@ -1710,6 +1815,7 @@ public sealed partial class MainWindow : Window
             CloseTopicMap();
             CloseCatchUp();
         }
+        // Back on the idle page: reset the chip and scroll the meeting list to the top.
         if (!recording && _pipeline.CanStart)
         {
             SetChipStatus("Idle", false);
@@ -1719,6 +1825,7 @@ public sealed partial class MainWindow : Window
 
     private void OnRecordingStarted()
     {
+        // Reset every per-session cache (summary flag, speaker stats, context, roster) so nothing leaks from a prior meeting.
         _hasSummary = false;
         _finalizedSegmentCount = 0;
         _lastFinalSpeakerId = null;
@@ -1730,6 +1837,7 @@ public sealed partial class MainWindow : Window
         _speakerAvatarImages.Clear();
         _speakerAvatarRevisions.Clear();
         _selectedSpeakerNameOption = null;
+        // Cancel in-flight related-context work from the previous session before issuing a fresh token.
         _contextCts?.Cancel();
         _contextCts?.Dispose();
         _relatedContext.Invalidate();
@@ -1770,14 +1878,18 @@ public sealed partial class MainWindow : Window
 
     private void UpdateRecordingLayout()
     {
+        // Not laid out yet (or collapsed); there is no height to divide.
         if (RecordingBodyScroll.ActualHeight <= 0) return;
 
+        // Height consumed by sections that don't scroll; the +24 approximates inter-section spacing.
+        // RecordingLayout splits what remains between the overview and the transcript list.
         var fixedHeight = InsightSections.ActualHeight + SpeakerSection.ActualHeight +
             RecordingUtilityActions.ActualHeight + 24;
         var allocation = RecordingLayout.Calculate(
             RecordingBodyScroll.ActualHeight,
             fixedHeight);
 
+        // Only assign on >1px change to avoid layout feedback loops from sub-pixel jitter.
         if (Math.Abs(RecordingOverviewScroll.MaxHeight - allocation.OverviewMaxHeight) > 1)
             RecordingOverviewScroll.MaxHeight = allocation.OverviewMaxHeight;
         if (Math.Abs(TranscriptList.MaxHeight - allocation.TranscriptMaxHeight) > 1)
@@ -1786,6 +1898,7 @@ public sealed partial class MainWindow : Window
 
     private void OnChecklistItemToggled(object sender, RoutedEventArgs e)
     {
+        // The view model is carried in the CheckBox Tag; sync the checked state back and refresh the header counts.
         if (sender is CheckBox { Tag: ChecklistItemViewModel item } checkBox)
         {
             item.IsCompleted = checkBox.IsChecked == true;
@@ -1803,6 +1916,7 @@ public sealed partial class MainWindow : Window
 
     private void StartRecordingTimer()
     {
+        // Stop first so restarting never leaves duplicate timers; the CTS lets Stop abort outstanding AI refreshes.
         StopRecordingTimer();
         _recordingCts = new CancellationTokenSource();
         UpdateTimeIndicator();
@@ -1830,6 +1944,7 @@ public sealed partial class MainWindow : Window
 
     private void StopRecordingTimer()
     {
+        // Stop the timers, then cancel and dispose the shared token so in-flight refreshes observe cancellation.
         _recordingTimer?.Stop();
         _recordingTimer = null;
 
@@ -1845,6 +1960,7 @@ public sealed partial class MainWindow : Window
 
     private void StartSaveReview(PipelineStatus status)
     {
+        // A different session gets a fresh decision; the same session keeps any decision already submitted.
         if (_saveReviewSessionId != status.SessionId)
             _saveDecisionSubmitted = false;
 
@@ -1857,6 +1973,7 @@ public sealed partial class MainWindow : Window
 
     private DispatcherQueueTimer CreateSaveReviewTimer()
     {
+        // 200 ms ticks keep the countdown fill bar and button text smooth.
         var timer = _dispatcherQueue.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(200);
         timer.IsRepeating = true;
@@ -1883,10 +2000,13 @@ public sealed partial class MainWindow : Window
             DateTimeOffset.UtcNow,
             _saveDecisionSubmitted);
         SaveDecisionPanel.Visibility = presentation.IsVisible ? Visibility.Visible : Visibility.Collapsed;
+        // Progress drives a horizontal scale transform that visually drains the countdown on the Save button.
         SaveCountdownFillTransform.ScaleX = presentation.Progress;
         SaveCountdownButtonLabel.Text = presentation.ButtonText;
+        // Screen readers hear the remaining time through the button's name, since the visual fill is not exposed.
         AutomationProperties.SetName(SaveRecordingNowButton, presentation.AccessibleName);
         AutomationProperties.SetHelpText(SaveRecordingNowButton, presentation.AccessibleName);
+        // Disable both choices once a decision is submitted, the deadline passes, or the app is exiting.
         var canDecide = !_preparingExit && presentation.CanDecide && _pipeline.CanReviewSave;
         DiscardRecordingButton.IsEnabled = canDecide;
         SaveRecordingNowButton.IsEnabled = canDecide;
@@ -1897,6 +2017,7 @@ public sealed partial class MainWindow : Window
         if (_saveDecisionSubmitted || _saveReviewSessionId is not { } sessionId)
             return;
 
+        // Latch the decision and stop the countdown before calling the pipeline so a second click can't race it.
         _saveDecisionSubmitted = true;
         _saveReviewTimer?.Stop();
         _pipeline.DiscardPendingRecording(sessionId);
@@ -1909,6 +2030,7 @@ public sealed partial class MainWindow : Window
         if (_saveDecisionSubmitted || _saveReviewSessionId is not { } sessionId)
             return;
 
+        // Same latch-then-act ordering as discard; saving immediately skips the rest of the countdown.
         _saveDecisionSubmitted = true;
         _saveReviewTimer?.Stop();
         _pipeline.SaveNow(sessionId);
@@ -1918,6 +2040,7 @@ public sealed partial class MainWindow : Window
 
     private void RefreshSaveReviewFromPipelineStatus(string sessionId)
     {
+        // If the pipeline is still reviewing this session, keep its deadline; otherwise the review is over.
         var status = _pipeline.Status;
         if (status.State == PipelineState.ReviewingSave && status.SessionId == sessionId)
         {
@@ -1931,6 +2054,7 @@ public sealed partial class MainWindow : Window
 
     private void ClearDiscardedSessionUi()
     {
+        // Mirrors the new-session reset in HandleStatusChange, but ends with no session at all (idle placeholders).
         _showCompletedSession = false;
         _sessionId = null;
         _startedAt = null;
@@ -2037,8 +2161,10 @@ public sealed partial class MainWindow : Window
             RenderPanelStatuses();
             return;
         }
+        // TryBegin dedupes: it returns nothing when the same transcript/config revision is already fresh or in flight (unless forced).
         var request = panel.TryBegin(snapshot.SessionId, snapshot.Revision, config.Revision, force);
         if (request is not { } generation) return;
+        // Remember the speaker-name revision so results built from stale names can be discarded later.
         var speakerNameRevision = Volatile.Read(ref _speakerNameRevision);
         var ct = cts.Token;
         if (panel == _summaryState && !_hasSummary && !catchUp)
@@ -2048,12 +2174,15 @@ public sealed partial class MainWindow : Window
         RenderPanelStatuses();
         try
         {
+            // Catch-up looks at the last 10 minutes (up to 150 segments); routine refreshes use the latest 50.
             var recent = catchUp
                 ? snapshot.Segments
                     .Where(s => s.Timestamp >= DateTimeOffset.Now.AddMinutes(-10))
                     .TakeLast(150)
                 : snapshot.Segments.TakeLast(50);
             var text = string.Join("\n", recent.Select(s => $"{s.SpeakerDisplayName ?? s.SpeakerId}: {s.Text}"));
+            // Each branch awaits the model off the UI thread and returns an `apply` closure that mutates the UI later,
+            // only if the result is still current.
             Action apply;
             bool hasResults;
             if (panel == _summaryState)
@@ -2124,6 +2253,7 @@ public sealed partial class MainWindow : Window
                     }
                 };
             }
+            // Apply only if capture wasn't cancelled, speaker names and session are unchanged, and this generation is still the latest.
             if (!ct.IsCancellationRequested &&
                 speakerNameRevision == Volatile.Read(ref _speakerNameRevision) &&
                 _sessionId == snapshot.SessionId &&
@@ -2136,6 +2266,7 @@ public sealed partial class MainWindow : Window
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         catch (Exception ex)
         {
+            // Normalize any exception into an IntelligenceFailure; only the generic message is shown and only type names are logged.
             var failure = ex is IntelligenceException typed ? typed.Failure
                 : new IntelligenceFailure(ex is OperationCanceledException ? IntelligenceFailureKind.Timeout : IntelligenceFailureKind.Unknown,
                     config.Settings.Provider,
@@ -2148,6 +2279,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            // Always release the in-flight slot, even on cancellation or failure, so retries aren't blocked.
             panel.End(generation);
             RenderPanelStatuses();
         }
@@ -2179,6 +2311,7 @@ public sealed partial class MainWindow : Window
             is PanelState.SucceededEmpty or PanelState.SucceededWithResults
             ? Visibility.Collapsed
             : Visibility.Visible;
+        // During recording only the panel's own failure counts; after recording, a pipeline-level failure also applies.
         var summaryFailure = _summaryState.Status.Failure ??
             (_pipeline.State == PipelineState.Recording ? null : _pipeline.Status.IntelligenceFailure);
         SummaryStatusText.Text = _pipeline.State == PipelineState.Generating
@@ -2195,6 +2328,7 @@ public sealed partial class MainWindow : Window
         };
         if (summaryFailure is not null)
         {
+            // Never overwrite an existing grounded topic with an error message; only explain via the status line.
             if (_hasSummary)
             {
                 SummaryStatusText.Text = "Keeping the last grounded topic while analysis reconnects.";
@@ -2222,6 +2356,8 @@ public sealed partial class MainWindow : Window
                 PipelineState.Failed => "Transcript retained - check recording status",
                 _ => "Transcript captured - finalizing notes"
             };
+        // Show Retry only during recording, after a finalized segment and a panel failure;
+        // disable it while that panel already has a request in progress.
         var recording = _pipeline.State == PipelineState.Recording;
         QuestionsRetryButton.IsEnabled = recording && _finalizedSegmentCount > 0 && !_questionsState.IsBusy;
         ActionsRetryButton.IsEnabled = recording && _finalizedSegmentCount > 0 && !_actionsState.IsBusy;
@@ -2237,6 +2373,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdateSpeakerBalance(string speakerId, string text)
     {
+        // Split on any whitespace to approximate word count per speaker.
         var words = text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries).Length;
         if (words == 0)
             return;
@@ -2253,6 +2390,7 @@ public sealed partial class MainWindow : Window
         TranscriptionSegment segment,
         bool isNewRevision)
     {
+        // Map provider speaker ids to their canonical id so renames/merges apply consistently.
         if (!string.IsNullOrWhiteSpace(segment.SpeakerId))
             segment = segment with { SpeakerId = _pipeline.SpeakerResolver.Canonical(segment.SpeakerId) };
         if (!_hasSummary && _summaryState.Status.Failure is null)
@@ -2262,9 +2400,11 @@ public sealed partial class MainWindow : Window
             UpdateSpeakerBalance(
                 string.IsNullOrWhiteSpace(segment.SpeakerId) ? "Unknown" : segment.SpeakerId,
                 segment.Text);
+            // Kick off the first topic summary as soon as ~30 words exist instead of waiting for the 30s timer.
             if (_totalWords >= 30 && _summaryState.Status.LastAttemptAt is null)
                 _ = RefreshPanelAsync(_summaryState);
         }
+        // While the user reads older text, only revise an already-rendered row in place and hint at new content.
         if (!_viewport.FollowLatest)
         {
             var existing = _transcript.FirstOrDefault(line => line.Revision == revision);
@@ -2275,6 +2415,7 @@ public sealed partial class MainWindow : Window
         }
         EmptyStateLabel.Visibility = Visibility.Collapsed;
         TranscriptList.Visibility = Visibility.Visible;
+        // ApplyFinal inserts the row or revises the existing one for this revision (replacing a provisional row).
         var result = _transcriptState.ApplyFinal(
             revision,
             () => CreateTranscriptLine(segment, revision),
@@ -2339,6 +2480,7 @@ public sealed partial class MainWindow : Window
             _pipeline.SpeakerResolver.IsResolved(speakerId));
         var brush = GetSpeakerBrush(speakerId);
         var image = _speakerAvatarImages.GetValueOrDefault(speakerId);
+        // Compare first so callers can skip redraws when nothing visible changed; then assign unconditionally.
         var changed = line.Speaker != $"{display} (provisional)" ||
             line.SpeakerId != speakerId ||
             line.Text != text ||
@@ -2408,6 +2550,7 @@ public sealed partial class MainWindow : Window
             Volatile.Read(ref _transcriptScrollQueued) != 0)
             return;
 
+        // Within 8px of the end counts as "at bottom": scrolling there resumes following; scrolling away pauses it.
         var atBottom = scroller.ScrollableHeight - scroller.VerticalOffset <= 8;
         if (atBottom && !_viewport.FollowLatest)
         {
@@ -2423,6 +2566,7 @@ public sealed partial class MainWindow : Window
 
     private static ScrollViewer? FindScroller(DependencyObject parent)
     {
+        // Walk the visual tree to find the ListView's internal ScrollViewer (not exposed directly).
         for (var index = 0; index < VisualTreeHelper.GetChildrenCount(parent); index++)
         {
             var child = VisualTreeHelper.GetChild(parent, index);
@@ -2435,12 +2579,15 @@ public sealed partial class MainWindow : Window
     private void ScrollToLatest()
     {
         if (!_viewport.FollowLatest || _transcript.Count == 0) return;
+        // Coalesce scroll requests into one queued dispatcher callback; the flag also makes
+        // OnTranscriptViewChanged ignore the view change this programmatic scroll causes.
         if (Interlocked.Exchange(ref _transcriptScrollQueued, 1) != 0)
             return;
         if (!_dispatcherQueue.TryEnqueue(() =>
         {
             try
             {
+                // Re-check follow state at run time; the user may have scrolled up since this was queued.
                 if (_viewport.FollowLatest && _transcript.Count > 0)
                     TranscriptList.ScrollIntoView(_transcript[^1]);
             }
@@ -2458,6 +2605,7 @@ public sealed partial class MainWindow : Window
     {
         var snapshot = DisplayedSnapshot;
         if (snapshot is null) return;
+        // Paging mode: re-snapshot the visible window, reconcile existing rows in place, then show the "start-end / total" header.
         var page = _viewport.Update(snapshot.Segments.Count);
         var segments = snapshot.Segments.Skip(page.Start).Take(page.Count).ToArray();
         _transcriptState.Reconcile(
@@ -2482,6 +2630,7 @@ public sealed partial class MainWindow : Window
     private void UpdateDiagnostics()
     {
         var diagnostics = _pipeline.GetDiagnostics();
+        // Ignore diagnostics that belong to a different session than the one on screen.
         if (diagnostics.SessionId is not null && diagnostics.SessionId != _sessionId) return;
         var sources = diagnostics.Audio.Select(source =>
             $"{source.Source}: {source.State}, level {(source.Level is { } level ? $"{level:P0}" : "unavailable")}, " +
@@ -2491,6 +2640,7 @@ public sealed partial class MainWindow : Window
         var audio = string.Join("\n", sources);
         var microphone = diagnostics.Audio.FirstOrDefault(source => source.Source == "microphone");
         var loopback = diagnostics.Audio.FirstOrDefault(source => source.Source == "loopback");
+        // A meter is disabled when its source reports no level (e.g. device absent) rather than showing a misleading zero.
         MicrophoneMeter.IsEnabled = microphone?.Level is not null;
         MicrophoneMeter.Value = microphone?.Level ?? 0;
         LoopbackMeter.IsEnabled = loopback?.Level is not null;
@@ -2512,6 +2662,7 @@ public sealed partial class MainWindow : Window
         UpdateControlState();
         try
         {
+            // Start/stop run off the UI thread since they touch audio devices; _previewBusy blocks re-entrancy meanwhile.
             if (_preview) await Task.Run(() => _pipeline.StopAudioPreviewAsync(CancellationToken.None));
             else await Task.Run(() => _pipeline.StartAudioPreviewAsync(CancellationToken.None));
             _preview = !_preview;
@@ -2529,6 +2680,7 @@ public sealed partial class MainWindow : Window
         => MeetingDismissRequested?.Invoke(this, EventArgs.Empty);
     private void OnSnoozeClick(object sender, RoutedEventArgs e)
     {
+        // Raised for the host (tray app) to act on; the window itself doesn't own detection state.
         MeetingSnoozeRequested?.Invoke(this, EventArgs.Empty);
         ShowStatusBar("Meeting detection snoozed for 30 minutes.", InfoBarSeverity.Informational);
     }
@@ -2548,6 +2700,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            // UseShellExecute lets Windows open the .md with the user's default handler.
             System.Diagnostics.Process.Start(
                 new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true });
             return true;
@@ -2563,6 +2716,7 @@ public sealed partial class MainWindow : Window
     private async void OnRetrySavedClick(object sender, RoutedEventArgs e)
     {
         if (_retryBusy || !_pipeline.CanStart || _sessionId is null) return;
+        // Capture the session id up front: the user may start another session while the retry runs, and results must not leak into it.
         var sessionId = _sessionId;
         _retryBusy = true;
         using var retryCts = new CancellationTokenSource();
@@ -2570,7 +2724,9 @@ public sealed partial class MainWindow : Window
         UpdateControlState();
         try
         {
+            // Run off the UI thread; the retry regenerates AI notes from the retained transcript.
             var path = await Task.Run(() => _pipeline.RetryIntelligenceAsync(sessionId, retryCts.Token));
+            // Ignore the result if the user has since moved to another session.
             if (_sessionId == sessionId)
             {
                 _notesPath = path;
@@ -2594,6 +2750,7 @@ public sealed partial class MainWindow : Window
 
     private void OnCancelRetryClick(object sender, RoutedEventArgs e)
     {
+        // Cancellation is cooperative: disable the button and tell the user we're waiting for the pipeline to unwind.
         _retryCts?.Cancel();
         CancelRetryButton.IsEnabled = false;
         LifecycleText.Text = "Cancelling AI retry; waiting for safe cleanup...";
@@ -2605,6 +2762,7 @@ public sealed partial class MainWindow : Window
         if (_speakerBrushes.TryGetValue(speaker, out var brush))
             return brush;
 
+        // Palette colors are handed out in first-seen order and cached, so a speaker keeps one color all session.
         var color = SpeakerPalette[_speakerBrushes.Count % SpeakerPalette.Length];
         brush = new SolidColorBrush(color);
         _speakerBrushes[speaker] = brush;
@@ -2619,6 +2777,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdateControlState()
     {
+        // Central enable/visibility pass: every button state derives from the pipeline state plus busy/exit flags.
         var newRecording = RecordingViewState.NewRecordingAction(_pipeline.Status, _pipeline.CanStart,
             _preparingExit, _retryBusy, _previewBusy);
         StartButton.IsEnabled = NewRecordingButton.IsEnabled = newRecording.Enabled;
@@ -2629,11 +2788,13 @@ public sealed partial class MainWindow : Window
         OpenSavedButton.IsEnabled = _notesPath is not null;
         OpenSavedButton.Visibility = _notesPath is not null ? Visibility.Visible : Visibility.Collapsed;
         SavedPathText.Visibility = _notesPath is not null ? Visibility.Visible : Visibility.Collapsed;
+        // Retry AI needs a completed transcript with segments belonging to the session on screen.
         RetrySavedButton.IsEnabled = !_preparingExit && _pipeline.CanStart && !_retryBusy &&
             _pipeline.LastCompletedTranscript is { Segments.Count: > 0 } completed && completed.SessionId == _sessionId;
         RetrySavedButton.Visibility = RetrySavedButton.IsEnabled || _retryBusy ? Visibility.Visible : Visibility.Collapsed;
         NewRecordingButton.Visibility = NewRecordingHint.Visibility = newRecording.Visible ? Visibility.Visible : Visibility.Collapsed;
         NewRecordingHint.Text = newRecording.Message;
+        // Expose why "new recording" is unavailable to assistive tech via help text.
         AutomationProperties.SetHelpText(NewRecordingButton, newRecording.Message);
         BackToMeetingsButton.Visibility = _pipeline.CanStart ? Visibility.Visible : Visibility.Collapsed;
         StopButton.Visibility = _pipeline.CanStop ? Visibility.Visible : Visibility.Collapsed;
@@ -2641,6 +2802,7 @@ public sealed partial class MainWindow : Window
             OnStopCountdownChanged();
         CancelRetryButton.Visibility = _retryBusy ? Visibility.Visible : Visibility.Collapsed;
         CancelRetryButton.IsEnabled = _retryCts is { IsCancellationRequested: false };
+        // The utility row is shown only when at least one of its buttons is.
         RecordingUtilityActions.Visibility =
             OpenSavedButton.Visibility == Visibility.Visible ||
             RetrySavedButton.Visibility == Visibility.Visible ||
@@ -2656,6 +2818,7 @@ public sealed partial class MainWindow : Window
         if (_allowClose || _sessionId is null) return;
         var state = RecordingViewState.Create(_pipeline.State, _finalizedSegmentCount,
             _viewport.FollowLatest, _summaryState.Status.Failure is not null, _summaryState.IsBusy);
+        // Paging controls only matter when the viewport is not following live content; Earlier/Later enable by window position.
         TranscriptNavigation.Visibility = state.ShowPaging || state.ShowLatest ? Visibility.Visible : Visibility.Collapsed;
         EarlierButton.Visibility = LaterButton.Visibility = state.ShowPaging ? Visibility.Visible : Visibility.Collapsed;
         EarlierButton.IsEnabled = _viewport.Start > 0;
@@ -2675,6 +2838,7 @@ public sealed partial class MainWindow : Window
             ? $"{_speakerWordCounts.Count} speaker{(_speakerWordCounts.Count == 1 ? "" : "s")}"
             : "Recognizing speech...";
         UpdateCombineSpeakersButton();
+        // After recording ends, replace placeholder topic text with a final-state message unless a real summary exists.
         if (_pipeline.State is PipelineState.Saved or PipelineState.Failed)
         {
             if (!_hasSummary) TldrChip.Text = _finalizedSegmentCount == 0 ? "No speech was recognized." : "Recording ended";
@@ -2712,6 +2876,7 @@ public sealed partial class MainWindow : Window
     {
         if (TopicMapPanel.Visibility == Visibility.Visible)
             return;
+        // Visualization needs a recording or a loaded saved meeting; otherwise revert the toggle and explain.
         if (RecordingPanel.Visibility != Visibility.Visible && _loadedVisualization is null)
         {
             TopicMapToggleButton.IsChecked = false;
@@ -2721,6 +2886,8 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // In the normal (restored) window, try to widen it so the side panel doesn't squeeze the transcript;
+        // fail if the work area can't fit it. Maximized/fullscreen windows already have all their space.
         var current = CurrentWindowBounds();
         var expanded = current;
         if (_presenter.State == Microsoft.UI.Windowing.OverlappedPresenterState.Restored
@@ -2738,6 +2905,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Remember how much width we added so closing the panel can shrink the window back by the same amount.
         _topicMapAddedWidth = Math.Max(0, expanded.Width - current.Width);
         if (_topicMapAddedWidth > 0)
             AppWindow.MoveAndResize(new(expanded.X, expanded.Y, expanded.Width, expanded.Height));
@@ -2751,6 +2919,7 @@ public sealed partial class MainWindow : Window
     private void CloseTopicMap()
     {
         TopicMapToggleButton.IsChecked = false;
+        // Keep the toggle's accessible name in sync with its action since the visual state alone doesn't convey it.
         AutomationProperties.SetName(TopicMapToggleButton, "Show meeting visualization");
         if (TopicMapPanel.Visibility != Visibility.Visible)
             return;
@@ -2759,6 +2928,7 @@ public sealed partial class MainWindow : Window
         TopicMapPanel.Visibility = Visibility.Collapsed;
         PrimaryContentColumn.Width = new GridLength(1, GridUnitType.Star);
         TopicMapColumn.Width = new GridLength(0);
+        // A map opened from a saved file is only valid while shown; drop it so the next open reloads live data.
         if (_loadedVisualization is not null)
         {
             _loadedVisualization = null;
@@ -2770,12 +2940,14 @@ public sealed partial class MainWindow : Window
         if (_topicMapAddedWidth <= 0)
             return;
 
+        // Only a Restored window was resized on open; if the user has since maximized, there is nothing to shrink.
         if (_presenter.State != Microsoft.UI.Windowing.OverlappedPresenterState.Restored)
         {
             _topicMapAddedWidth = 0;
             return;
         }
 
+        // Collapse by exactly the width we added, clamped to the work area, so the window returns to its prior size.
         var current = CurrentWindowBounds();
         var collapsed = WindowPlacement.CollapseSidePanel(
             current,
@@ -2804,6 +2976,8 @@ public sealed partial class MainWindow : Window
         ToolTipService.SetToolTip(VisualizationExpandButton, "Restore visualization to the side pane");
         AutomationProperties.SetName(VisualizationExpandButton, "Restore visualization to the side pane");
 
+        // Expanded mode: maximize the window (only if it was restored, and remember that so Restore can undo it)
+        // and let the visualization take the remaining width.
         if (_presenter.State == Microsoft.UI.Windowing.OverlappedPresenterState.Restored)
         {
             _presenter.Maximize();
@@ -2818,6 +2992,7 @@ public sealed partial class MainWindow : Window
         if (!_visualizationExpanded)
             return;
 
+        // Only undo a maximize this feature caused; a window the user maximized themselves stays maximized.
         if (_visualizationMaximizedWindow)
         {
             _presenter.Restore();
@@ -2839,6 +3014,8 @@ public sealed partial class MainWindow : Window
         if (TopicMapPanel.Visibility != Visibility.Visible || viewportWidth <= 0)
             return;
 
+        // Expanded: pin the primary column to its calculated width and give the rest to the map (star).
+        // Side-pane: primary content takes the star column and the map gets a fixed width.
         var allocation = VisualizationLayout.Calculate(viewportWidth, _visualizationExpanded);
         if (_visualizationExpanded)
         {
@@ -2865,6 +3042,8 @@ public sealed partial class MainWindow : Window
 
     private void UpdateTopicDetailLayout(double totalWidth)
     {
+        // At >=1380 DIPs the detail pane sits beside the map; narrower, it drops below spanning both columns
+        // with a capped height so the map stays visible.
         var wide = totalWidth >= 1380;
         TopicDetailColumn.Width = wide ? GridLength.Auto : new GridLength(0);
         TopicDetailPanel.Width = wide ? 360 : double.NaN;
@@ -2879,6 +3058,7 @@ public sealed partial class MainWindow : Window
 
     private static bool SetColumnWidth(ColumnDefinition column, GridLength width)
     {
+        // Ignore sub-pixel differences so layout passes don't retrigger each other; returns whether it changed.
         if (column.Width.GridUnitType == width.GridUnitType &&
             Math.Abs(column.Width.Value - width.Value) <= 1)
             return false;
@@ -2889,6 +3069,7 @@ public sealed partial class MainWindow : Window
     private void OnRootLayoutLoaded(object sender, RoutedEventArgs e)
     {
         using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.WindowLoad);
+        // Subscribe once to XamlRoot size changes so the visualization layout tracks window resizes.
         if (!_visualizationViewportSubscribed && RootLayout.XamlRoot is { } xamlRoot)
         {
             xamlRoot.Changed += OnVisualizationViewportChanged;
@@ -2897,6 +3078,7 @@ public sealed partial class MainWindow : Window
         UpdateVisualizationLayout();
         if (!_initialViewReadyRaised)
         {
+            // Signal readiness once, then restore WorkIQ at low priority so it never delays first paint.
             _initialViewReadyRaised = true;
             InitialViewReady?.Invoke(this, EventArgs.Empty);
             if (!_dispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () => _ = RestoreWorkIqAsync()))
@@ -2912,18 +3094,21 @@ public sealed partial class MainWindow : Window
 
     private WindowBounds CurrentWorkArea()
     {
+        // Nearest display's work area (excludes the taskbar), used to bound window expansion.
         var area = Microsoft.UI.Windowing.DisplayArea.GetFromWindowId(
             AppWindow.Id,
             Microsoft.UI.Windowing.DisplayAreaFallback.Nearest).WorkArea;
         return new(area.X, area.Y, area.Width, area.Height);
     }
 
+    // Win32 GetDpiForWindow on the WinUI window's HWND, so placement math accounts for per-monitor scaling.
     private int CurrentWindowDpi()
         => (int)NativeMethods.GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this));
 
     private void OnVisualizationChanged(object? sender, long revision)
         => InvokeOnUi(() =>
         {
+            // Live updates must not overwrite a map the user opened from a saved file.
             if (_loadedVisualization is null)
                 RefreshVisualization();
         });
@@ -2989,6 +3174,7 @@ public sealed partial class MainWindow : Window
             ShowStatusBar("The saved meeting visualization could not be opened.", InfoBarSeverity.Error);
             return;
         }
+        // Re-check after the awaited picker/IO: a recording may have started meanwhile, and its UI must not be replaced.
         if (!_pipeline.CanStart)
         {
             ShowStatusBar(
@@ -2997,6 +3183,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Anything but a valid companion document is reported; older notes with no companion file fall back to opening the Markdown.
         if (result.Kind != MeetingVisualizationLoadKind.Valid || result.Document is null)
         {
             if (_loadedVisualization is not null)
@@ -3020,6 +3207,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Switch to read-only saved mode: reset selection state so stale live ids aren't carried over, then force a render.
         _loadedVisualization = result.Document;
         _selectedVisualizationTopicId = null;
         _currentVisualizationTopicId = null;
@@ -3031,6 +3219,7 @@ public sealed partial class MainWindow : Window
 
     private void ConfigureVisualizationTransitions()
     {
+        // Respect the user's animation preference.
         if (!_animationsEnabled)
             return;
 
@@ -3042,6 +3231,7 @@ public sealed partial class MainWindow : Window
         if (!_animationsEnabled || changed.Count == 0)
             return;
 
+        // Defer to the dispatcher so item containers exist after the collection change, then fade each changed row in.
         _dispatcherQueue.TryEnqueue(() =>
         {
             foreach (var item in changed)
@@ -3054,6 +3244,7 @@ public sealed partial class MainWindow : Window
 
     private static void AnimateOpacity(UIElement target, double from, double to, int milliseconds)
     {
+        // Build a one-shot opacity storyboard programmatically (ease-out so the change settles quickly).
         var animation = new DoubleAnimation
         {
             From = from,
@@ -3073,6 +3264,7 @@ public sealed partial class MainWindow : Window
     }
 
     private static string TrailFingerprint(TrailItemViewModel item)
+        // Unit separator joins fields so a change to any visible value changes the fingerprint.
         => string.Join(
             '\u001f',
             item.TopicId, item.Sequence, item.Label, item.Detail, item.RelationText,
@@ -3084,6 +3276,7 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private string? ResolveLiveCanonicalTopicId(string? topicId)
     {
+        // Saved documents are immutable, so only live ids need redirect resolution; unknown ids pass through unchanged.
         if (string.IsNullOrEmpty(topicId) || _loadedVisualization is not null)
             return topicId;
         try
@@ -3097,6 +3290,7 @@ public sealed partial class MainWindow : Window
     }
     private void RefreshVisualization(bool force = false)
     {
+        // Prefer the opened saved document; otherwise snapshot the live meeting (which may not exist yet).
         MeetingVisualizationDocument? document = _loadedVisualization;
         if (document is null)
         {
@@ -3116,6 +3310,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // New session or no topics yet: discard cached notes so they can't belong to a prior meeting.
         if (!StringComparer.Ordinal.Equals(_meetingNotesSessionId, document.SessionId) ||
             document.TopicClusters.Count == 0)
         {
@@ -3129,12 +3324,14 @@ public sealed partial class MainWindow : Window
         var selectedTopicId = ResolveLiveCanonicalTopicId(_selectedVisualizationTopicId);
         var currentTopicId = ResolveLiveCanonicalTopicId(_currentVisualizationTopicId) ??
             document.TopicTrail.LastOrDefault()?.TopicId;
+        // Project the document into view state; "current" defaults to the last trail entry when none is remembered.
         var projection = TopicMapState.Project(
             document, selectedTopicId, currentTopicId, _relatedContextStatesByTopicId,
             _workIq.IsAuthenticated, _loadedVisualization is not null,
             buildMeetingNotes: false);
         var fingerprint =
             $"{projection.Fingerprint}|{projection.SelectedTopicId}|{projection.CurrentTopicId}";
+        // Skip re-rendering when nothing visible changed, unless the caller forces it.
         if (!force && fingerprint == _renderedVisualizationFingerprint)
             return;
         _visualizationProjection = projection;
@@ -3180,6 +3377,7 @@ public sealed partial class MainWindow : Window
                 : projection.MeetingNotes?.EmptyMessage ??
                     projection.MeetingBrainMap?.EmptyMessage ??
                     "Meeting notes are unavailable.";
+        // Notes are built off-thread; the revision stamp lets a stale result be dropped if another refresh supersedes it.
         var notesProjectionRevision = Interlocked.Increment(ref _meetingNotesProjectionRevision);
         UpdateVisualizationViewVisibility();
         RenderVisualizationSurface(projection);
@@ -3194,6 +3392,7 @@ public sealed partial class MainWindow : Window
         VisualizationProjection projection,
         int projectionRevision)
     {
+        // Build notes on a worker thread; ConfigureAwait(false) because UI work is re-marshaled via the dispatcher below.
         IReadOnlyList<MeetingTopicNotes> topicNotes;
         try
         {
@@ -3215,6 +3414,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Apply on the UI thread only if this is still the latest projection (revision and fingerprint both match).
         _dispatcherQueue.TryEnqueue(() =>
         {
             if (projectionRevision != Volatile.Read(ref _meetingNotesProjectionRevision) ||
@@ -3229,6 +3429,8 @@ public sealed partial class MainWindow : Window
                 projection.CurrentTopicId);
             notes = notes with { Topics = TopicCollapseState.Apply(notes.Topics, _collapsedTopicIds) };
             _visualizationProjection = projection with { MeetingNotes = notes };
+            // Reconcile updates the observable list in place and reports which rows changed (for the fade animation),
+            // instead of rebuilding the list and losing scroll/focus.
             var notesUpdate = VisualizationCollectionState.Reconcile(
                 _meetingNotes,
                 notes.Topics,
@@ -3247,6 +3449,7 @@ public sealed partial class MainWindow : Window
 
     private void ClearVisualizationPresentation()
     {
+        // Bumping the revision invalidates any in-flight notes build before state is cleared.
         Interlocked.Increment(ref _meetingNotesProjectionRevision);
         _visualizationProjection = null;
         _displayedVisualizationDocument = null;
@@ -3299,6 +3502,7 @@ public sealed partial class MainWindow : Window
 
     private void OnBrainMapViewSizeChanged(object sender, SizeChangedEventArgs e)
     {
+        // Resize only matters for horizontal changes >1px; the map layout depends on available width.
         if (e.NewSize.Width <= 0 ||
             Math.Abs(e.NewSize.Width - e.PreviousSize.Width) <= 1 ||
             TopicMapPanel.Visibility != Visibility.Visible ||
@@ -3321,6 +3525,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Lay out against the view width (minus 20px padding) and account for collapsed topics' hidden leaves.
         var layout = MeetingBrainMapLayout.Calculate(
             Math.Max(0, BrainMapView.ActualWidth - 20),
             TopicCollapseState.LeafCounts(map, _collapsedTopicIds));
@@ -3334,6 +3539,8 @@ public sealed partial class MainWindow : Window
         BrainMapEmptyText.Visibility = map.EmptyMessage.Length > 0
             ? Visibility.Visible : Visibility.Collapsed;
 
+        // Diff the canvas against the new layout: remove connectors and nodes that no longer exist,
+        // then upsert the rest so existing elements (and their focus) are reused.
         var activeConnectorIds = layout.Connectors
             .Select(item => item.Id)
             .ToHashSet(StringComparer.Ordinal);
@@ -3352,6 +3559,7 @@ public sealed partial class MainWindow : Window
                 connector.End.X,
                 connector.End.Y);
 
+        // Node ids are namespaced by kind; leaves of collapsed topics are intentionally excluded so they're removed.
         var activeNodeIds = map.Topics
             .Select(item => $"topic:{item.Id}")
             .Concat(map.Topics.Select(item => $"toggle:{item.Id}"))
@@ -3367,6 +3575,7 @@ public sealed partial class MainWindow : Window
             _brainMapNodes.Remove(staleId);
         }
 
+        // Accessible names describe each node's role since the canvas has no semantic structure of its own.
         _brainMapRootButton = UpsertBrainMapNode(
             "root:meeting",
             "meeting",
@@ -3439,6 +3648,7 @@ public sealed partial class MainWindow : Window
             BrainMapCanvas.Children.Add(button);
         }
 
+        // Chevron reflects state (right = collapsed, down = expanded); the name/tooltip describe the action for screen readers.
         var name = collapsed ? $"Expand topic: {topic.Title}" : $"Collapse topic: {topic.Title}";
         ((FontIcon)button.Content).Glyph = collapsed ? "\uE76C" : "\uE70D";
         button.Tag = topic.Id;
@@ -3632,6 +3842,7 @@ public sealed partial class MainWindow : Window
     {
         if (sender is not Button button)
             return;
+        // Brain-map node click: the root scrolls the notes to the top; topic nodes select the topic and reveal its notes.
         if (AutomationProperties.GetAutomationId(button) == "BrainMapNode_meeting")
         {
             MeetingNotesView.ChangeView(null, 0, null);
@@ -3652,6 +3863,7 @@ public sealed partial class MainWindow : Window
 
     private void ScrollNotesToTopic(string topicId)
     {
+        // Wait a dispatcher turn so the notes list has realized the container, then scroll it into view.
         _dispatcherQueue.TryEnqueue(() =>
         {
             var topic = _meetingNotes.FirstOrDefault(item => item.Id == topicId);
@@ -3695,6 +3907,7 @@ public sealed partial class MainWindow : Window
 
     private void RenderMeetingNotesWorkIqStatus()
     {
+        // Show WorkIQ status only for the session on screen, and only once the meeting has topics.
         RelatedContextStatus? status = _relatedContext.Status;
         if (_displayedVisualizationDocument is not { } document ||
             status?.SessionId != document.SessionId)
@@ -3710,9 +3923,12 @@ public sealed partial class MainWindow : Window
 
     private static string? FocusedAutomationIdWithin(FrameworkElement container)
     {
+        // Focus helpers: capture which keyed control has focus before a re-render and re-apply it afterwards
+        // so keyboard users don't lose their place.
         if (container.XamlRoot is null ||
             FocusManager.GetFocusedElement(container.XamlRoot) is not DependencyObject focused)
             return null;
+        // Walk up from the focused element to see whether it lives inside this container.
         for (DependencyObject? current = focused; current is not null; current = VisualTreeHelper.GetParent(current))
             if (ReferenceEquals(current, container))
                 return focused is FrameworkElement element
@@ -3728,6 +3944,7 @@ public sealed partial class MainWindow : Window
         foreach (var child in container.Children.OfType<Control>())
             if (AutomationProperties.GetAutomationId(child) == automationId)
             {
+                // FocusState.Keyboard so the focus visual is shown, matching how the user was navigating.
                 child.Focus(FocusState.Keyboard);
                 return;
             }
@@ -3737,6 +3954,7 @@ public sealed partial class MainWindow : Window
     {
         try
         {
+            // Replace speaker ids in AI text with current display names; with no active session, show text unchanged.
             var speakers = _visualization.Snapshot().Speakers.ToDictionary(
                 speaker => speaker.SpeakerId,
                 speaker => speaker.DisplayName,
@@ -3752,6 +3970,7 @@ public sealed partial class MainWindow : Window
     private void OnRelatedContextStatusChanged(object? sender, RelatedContextStatus status)
         => InvokeOnUi(() =>
         {
+            // Status events come from background work; drop ones for another session or stale WorkIQ source revisions.
             if (!IsCurrentRelatedContextStatus(status))
                 return;
             RenderRelatedContext(status);
@@ -3759,6 +3978,8 @@ public sealed partial class MainWindow : Window
 
     private void OnContextFlyoutOpening(object sender, object e)
     {
+        // Refresh everything shown in the flyout on open; the roster is probed lazily, at most once per session
+        // unless the user presses refresh.
         RenderAiUsage(refreshDetails: true, announceTransition: false);
         PopulateScheduledInvitees();
         var status = _relatedContext.Status;
@@ -3777,6 +3998,7 @@ public sealed partial class MainWindow : Window
     private void RenderAiUsage(bool refreshDetails, bool announceTransition)
     {
         var snapshot = _pipeline.AiUsage.GetSnapshot();
+        // Usage is tracked per recording; hide the indicator rather than show another recording's numbers.
         if (_sessionId is null ||
             !string.Equals(snapshot.SessionId, _sessionId, StringComparison.Ordinal))
         {
@@ -3795,6 +4017,8 @@ public sealed partial class MainWindow : Window
         if (refreshDetails)
             AiUsageStatusText.Text = presentation.Status;
 
+        // The announcement text is a polite live region: update it only when the activity state changes,
+        // so screen readers are not interrupted by every usage tick.
         if (!announceTransition ||
             string.Equals(_aiUsageTransitionKey, presentation.TransitionKey, StringComparison.Ordinal))
             return;
@@ -3805,9 +4029,11 @@ public sealed partial class MainWindow : Window
 
     private async void OnRelatedContextRefreshClick(object sender, RoutedEventArgs e)
     {
+        // Manual refresh needs a live recording; a reopened saved map has no running context lookup.
         if (_sessionId is null || _contextCts is null || _loadedVisualization is not null)
             return;
 
+        // Prefer the topic the user selected on the map, otherwise the topic currently being discussed.
         var topicId = ResolveLiveCanonicalTopicId(_selectedVisualizationTopicId) ??
             ResolveLiveCanonicalTopicId(_currentVisualizationTopicId);
         var topic = topicId is null
@@ -3823,6 +4049,7 @@ public sealed partial class MainWindow : Window
             return;
         }
 
+        // Disable the button while the forced lookup runs; the finally block re-evaluates it.
         RelatedContextRefreshButton.IsEnabled = false;
         try
         {
@@ -3863,6 +4090,7 @@ public sealed partial class MainWindow : Window
         var snapshot = status?.Snapshot;
         UpdateRelatedContextTopicPresentation(status);
         string? mappedTopicId = null;
+        // Record the state per topic only when the status belongs to the session on the map and its topic still exists.
         if (status is not null &&
             IsActiveVisualizationSession(status.SessionId) &&
             ResolveLiveCanonicalTopicId(status.TopicId) is { } topicId)
@@ -3872,6 +4100,7 @@ public sealed partial class MainWindow : Window
         }
         if (mappedTopicId is not null && snapshot is not null)
         {
+            // This method re-renders often; attach each retrieved snapshot (topic + retrieval time) to the map only once.
             var appliedKey = $"{mappedTopicId}\n{snapshot.RetrievedAt.UtcTicks}";
             if (_appliedRelatedContextSnapshots.Add(appliedKey))
             {
@@ -3941,8 +4170,10 @@ public sealed partial class MainWindow : Window
 
     private bool IsCurrentRelatedContextStatus(RelatedContextStatus status)
     {
+        // A status produced under an older sign-in revision is stale.
         if (status.SourceRevision != _workIq.Revision)
             return false;
+        // A status with no session id is not tied to a recording and is accepted as-is.
         return status.SessionId.Length == 0 || status.SessionId == _sessionId;
     }
 
@@ -3958,11 +4189,13 @@ public sealed partial class MainWindow : Window
             RenderRoster(null);
             return Task.CompletedTask;
         }
+        // Share a check that is already running instead of starting a second Teams inspection.
         if (_rosterRefreshTask is not null)
             return _rosterRefreshTask;
         var refresh = LoadRosterAsync();
         _rosterRefreshTask = refresh;
         UpdateRosterRefreshButton();
+        // Clear the shared task in the background once it finishes so the next request starts a new check.
         _ = ReleaseRosterRefreshAsync(refresh);
         return refresh;
     }
@@ -3975,6 +4208,7 @@ public sealed partial class MainWindow : Window
         }
         finally
         {
+            // Only clear the slot if a newer check has not replaced it.
             if (ReferenceEquals(_rosterRefreshTask, refresh))
                 _rosterRefreshTask = null;
             UpdateRosterRefreshButton();
@@ -3983,6 +4217,7 @@ public sealed partial class MainWindow : Window
 
     private async Task LoadRosterAsync()
     {
+        // Capture session, token and provider first so the result can be matched to the session that asked for it.
         var sessionId = _sessionId;
         var context = _contextCts;
         var provider = _activeRoster;
@@ -4010,6 +4245,7 @@ public sealed partial class MainWindow : Window
         catch (Exception ex)
         {
             _logger.LogWarning("Active roster refresh failed ({Type}).", ex.GetType().Name);
+            // Clear the participant chips so earlier names are not presented as currently in the call.
             if (_sessionId == sessionId)
             {
                 _rosterChecked = true;
@@ -4026,6 +4262,7 @@ public sealed partial class MainWindow : Window
 
     private void RenderRoster(ActiveRosterSnapshot? snapshot)
     {
+        // Only a verified live roster produces name chips; any other result shows status text and guidance only.
         var members = snapshot is not null &&
             snapshot.Availability == ActiveRosterAvailability.VerifiedLive
                 ? snapshot.Members.Select(member => member.DisplayName).ToArray()
@@ -4078,6 +4315,7 @@ public sealed partial class MainWindow : Window
             : Visibility.Collapsed;
         ScheduledInviteesSummaryText.Text = ParticipantPresentation.InviteeSummary(names);
         ScheduledInviteesAllText.Text = ParticipantPresentation.InviteeList(names);
+        // Offer the full list only when some invitees did not fit in the chips; otherwise collapse it so it cannot stay open.
         ScheduledInviteesExpander.Visibility = names.Count > preview.Chips.Count
             ? Visibility.Visible
             : Visibility.Collapsed;
@@ -4087,6 +4325,7 @@ public sealed partial class MainWindow : Window
 
     private void UpdateRelatedContextRefreshButton()
     {
+        // Can run before XAML has created the control (e.g. from events raised during load).
         if (RelatedContextRefreshButton is null)
             return;
         var topic = NormalizeRelatedContextTopic(_acceptedRelatedContextTopic);
@@ -4111,6 +4350,8 @@ public sealed partial class MainWindow : Window
 
     private void OnOpenContextSourceClick(object sender, RoutedEventArgs e)
     {
+        // Links come from external search results: open only absolute HTTPS addresses with a host and no
+        // embedded user name/password, so a crafted link cannot launch a local file or another protocol.
         if (sender is not FrameworkElement { Tag: string value } ||
             !Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
             uri.Scheme != Uri.UriSchemeHttps ||
@@ -4124,6 +4365,7 @@ public sealed partial class MainWindow : Window
 
         try
         {
+            // UseShellExecute hands the URL to Windows, which opens it in the default browser.
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(uri.AbsoluteUri)
             {
                 UseShellExecute = true,
@@ -4158,6 +4400,7 @@ public sealed partial class MainWindow : Window
             ? Visibility.Visible
             : Visibility.Collapsed;
         TopicBriefContextStatus.Visibility = Visibility.Visible;
+        // "Find related work"/"Retry" is offered only for a live, signed-in recording whose lookup is pending or failed.
         var canRequestContext = _loadedVisualization is null &&
             _sessionId is not null &&
             _contextCts is not null &&
@@ -4170,6 +4413,8 @@ public sealed partial class MainWindow : Window
         TopicBriefContextActionButton.Visibility =
             canRequestContext ? Visibility.Visible : Visibility.Collapsed;
         TopicBriefContextActionButton.IsEnabled = canRequestContext;
+        // "Still analysing" applies only to the current topic while background analyses are pending; the counter
+        // is updated from other threads, hence Volatile.Read.
         TopicBriefAnalysisText.Visibility =
             brief.IsCurrent && Volatile.Read(ref _visualizationAnalysisPending) > 0
                 ? Visibility.Visible
@@ -4200,6 +4445,7 @@ public sealed partial class MainWindow : Window
                 : Visibility.Collapsed;
 
         TopicBriefSourcesList.ItemsSource = brief.WorkIqSources;
+        // Verified sources beyond the ones listed are summarised as a count.
         var overflow = brief.WorkIqVerifiedTotal - brief.WorkIqSources.Count;
         TopicBriefSourcesSection.Visibility = Visibility.Visible;
         TopicBriefSourcesOverflowText.Text = overflow > 0 ? $"+{overflow} related suggestions" : string.Empty;
@@ -4210,10 +4456,13 @@ public sealed partial class MainWindow : Window
 
     private void OnUnknownSpeakerDetected(object? sender, string speakerId)
     {
+        // Raised on a pipeline thread: capture the session now and compare on the UI thread, so a late event
+        // cannot open a prompt in a newer recording.
         var sessionId = _pipeline.CurrentSessionId;
         InvokeOnUi(() =>
         {
             if (sessionId != _sessionId || sessionId is null) return;
+            // Only one naming banner is shown at a time; further speakers wait in the queue.
             _pendingUnknownSpeakers.Enqueue(speakerId);
             if (_currentPromptSpeakerId is null)
                 ShowNextSpeakerPrompt();
@@ -4222,6 +4471,7 @@ public sealed partial class MainWindow : Window
 
     private void OnSpeakerResolved(object? sender, SpeakerResolvedEventArgs e)
     {
+        // Bump immediately (on the raising thread) so in-flight panel refreshes built from old names are discarded.
         Interlocked.Increment(ref _speakerNameRevision);
         var sessionId = _pipeline.CurrentSessionId;
         InvokeOnUi(() =>
@@ -4239,6 +4489,8 @@ public sealed partial class MainWindow : Window
                     line.AvatarImage = null;
                 }
             }
+            // AI text elsewhere contains speaker ids that ProjectVisualizationText swaps for display names,
+            // so re-project the timeline, topic chip, related-context topic, map and catch-up summary.
             RefreshSpeakerTimeline();
             if (!string.IsNullOrWhiteSpace(_acceptedRelatedContextTopic))
                 TldrChip.Text = ProjectVisualizationText(_acceptedRelatedContextTopic);
@@ -4282,6 +4534,7 @@ public sealed partial class MainWindow : Window
             SpeakerPromptTitleText.Text = "Name detected speaker";
             SpeakerTargetText.Text = $"Speaker: {next}";
             PopulateSpeakerCombo(next);
+            // Keep the window from auto-hiding on focus loss while the user is choosing a name.
             _suppressAutoDismiss = true;
             SpeakerNamingPanel.Visibility = Visibility.Visible;
             return;
@@ -4294,6 +4547,7 @@ public sealed partial class MainWindow : Window
     {
         _speakerNameOptions.Clear();
         _selectedSpeakerNameOption = null;
+        // Suggest the local user first, then calendar invitees not already listed (matched by email or name).
         var localName = _pipeline.SpeakerResolver.LocalUserDisplayName;
         _speakerNameOptions.Add(new SpeakerNameOption(
             string.IsNullOrWhiteSpace(localName) ? "Me" : localName, null, IsLocal: true));
@@ -4310,7 +4564,9 @@ public sealed partial class MainWindow : Window
 
     private void OnSpeakerNameSearchTextChanged(AutoSuggestBox sender, AutoSuggestBoxTextChangedEventArgs e)
     {
+        // Ignore text set by code (e.g. when a suggestion is chosen); that would wrongly clear the chosen person.
         if (e.Reason != AutoSuggestionBoxTextChangeReason.UserInput) return;
+        // Typing breaks the link to a chosen person, so the text is applied as a plain name without a photo lookup.
         _selectedSpeakerNameOption = null;
         var query = sender.Text.Trim();
         sender.ItemsSource = query.Length == 0 ? _speakerNameOptions
@@ -4346,6 +4602,7 @@ public sealed partial class MainWindow : Window
     private SpeakerNameOption? SelectedSpeakerOption(string text)
     {
         var selected = _selectedSpeakerNameOption;
+        // The chosen person counts only if the box still shows exactly their name.
         return selected is not null &&
                string.Equals(selected.Name, text.Trim(), StringComparison.OrdinalIgnoreCase)
             ? selected
@@ -4359,10 +4616,13 @@ public sealed partial class MainWindow : Window
             return;
 
         var sessionId = _sessionId;
+        // Bump this speaker's avatar revision and drop the old photo so a slower lookup for an earlier name
+        // cannot overwrite the new one.
         var revision = _speakerAvatarRevisions.GetValueOrDefault(id) + 1;
         _speakerAvatarRevisions[id] = revision;
         _speakerAvatarImages.Remove(id);
         _pipeline.SpeakerResolver.Resolve(id, displayName.Trim());
+        // A photo is fetched only for the local user or an invitee with an email; typed names keep initials.
         if (sessionId is not null && person is not null &&
             (person.IsLocal || !string.IsNullOrWhiteSpace(person.Email)))
             _ = LoadSpeakerPhotoAsync(sessionId, id, revision, person);
@@ -4383,6 +4643,8 @@ public sealed partial class MainWindow : Window
         try
         {
             var token = _recordingCts?.Token ?? CancellationToken.None;
+            // The provider call runs on the thread pool; the awaits resume on the UI thread, which is required
+            // to create the BitmapImage and update bound transcript lines below.
             var photo = await Task.Run(
                 () => person.IsLocal
                     ? _workIq.GetCurrentUserPhotoAsync(token)
@@ -4397,6 +4659,7 @@ public sealed partial class MainWindow : Window
                 return;
 
             var image = await CreateProfileImageAsync(photo);
+            // Check again: decoding is also asynchronous.
             if (_sessionId != sessionId ||
                 _speakerAvatarRevisions.GetValueOrDefault(speakerId) != revision)
                 return;
@@ -4426,15 +4689,19 @@ public sealed partial class MainWindow : Window
 
     private static async Task<BitmapImage> CreateProfileImageAsync(WorkIqProfilePhoto photo)
     {
+        // BitmapImage reads from a WinRT stream, so copy the downloaded bytes into an in-memory one.
         using var stream = new InMemoryRandomAccessStream();
         using (var writer = new DataWriter(stream))
         {
             writer.WriteBytes(photo.Content);
             await writer.StoreAsync();
             await writer.FlushAsync();
+            // Detach so disposing the writer does not also close the stream the image still needs.
             writer.DetachStream();
         }
+        // Rewind so the decoder reads from the start.
         stream.Seek(0);
+        // Decode at a small physical size: avatars are tiny, so this keeps memory use low.
         var image = new BitmapImage
         {
             DecodePixelWidth = 96,
@@ -4471,8 +4738,11 @@ public sealed partial class MainWindow : Window
     /// </summary>
     private void PromptSpeakerRename(string speakerId)
     {
+        // "Unknown" is a shared placeholder, not a real speaker, so it cannot be renamed.
         if (string.IsNullOrWhiteSpace(speakerId) || speakerId == "Unknown") return;
 
+        // Clicking the speaker already being prompted does nothing. A different speaker replaces the open
+        // prompt immediately; the replaced speaker is not put back in the queue.
         if (_currentPromptSpeakerId != speakerId)
         {
             _currentPromptSpeakerId = speakerId;
@@ -4481,12 +4751,15 @@ public sealed partial class MainWindow : Window
             PopulateSpeakerCombo(speakerId);
             _suppressAutoDismiss = true;
             SpeakerNamingPanel.Visibility = Visibility.Visible;
+            // Move keyboard focus into the name box so keyboard and screen-reader users can type right away.
             SpeakerNameSearch.Focus(FocusState.Programmatic);
         }
     }
 
     private void InvokeOnUi(Action action)
     {
+        // Run inline when already on the UI thread; otherwise post it to the window's queue. TryEnqueue returns
+        // false (and the action is dropped) if the queue is shutting down, e.g. during app exit.
         if (_dispatcherQueue.HasThreadAccess)
             action();
         else

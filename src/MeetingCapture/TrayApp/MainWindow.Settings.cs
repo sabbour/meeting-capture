@@ -134,6 +134,7 @@ public sealed partial class MainWindow
         // Diagnostic events can arrive from background requests; queue at most one UI refresh at a time.
         if (Interlocked.Exchange(ref _aiDiagnosticsRenderQueued, 1) != 0)
             return;
+        // Marshal to the UI thread; the flag is cleared before rendering so a change during the render queues a new pass.
         if (!_dispatcherQueue.TryEnqueue(() =>
             {
                 Interlocked.Exchange(ref _aiDiagnosticsRenderQueued, 0);
@@ -141,6 +142,7 @@ public sealed partial class MainWindow
                     RenderAiDiagnostics();
             }))
         {
+            // The queue rejected the work (window closing); reset the flag so a later event is not suppressed forever.
             Interlocked.Exchange(ref _aiDiagnosticsRenderQueued, 0);
         }
     }
@@ -244,6 +246,8 @@ public sealed partial class MainWindow
 
     private void LoadSettingsValues()
     {
+        // Transcription, audio and storage fields prefer the saved file and fall back to the loaded configuration;
+        // the intelligence fields below come from the effective snapshot instead.
         var saved = _settingsManager.ReadSaved();
 
         // Secret fields intentionally stay blank; placeholders confirm whether a saved key already exists.
@@ -284,6 +288,7 @@ public sealed partial class MainWindow
 
     private void OnProviderChanged(object sender, SelectionChangedEventArgs e)
     {
+        // SelectionChanged can fire during XAML load, before the provider-specific panels exist.
         if (GitHubIntelligenceFields is null || AzureIntelligenceFields is null)
             return;
 
@@ -301,6 +306,7 @@ public sealed partial class MainWindow
         var lifetime = _settingsEditorLifetime;
         if (lifetime is null || lifetime.IsCancellationRequested)
             return;
+        // A load already in flight for this editor opening is reused rather than started twice.
         if (_copilotModelLoadLifetime == lifetime)
             return;
 
@@ -337,6 +343,7 @@ public sealed partial class MainWindow
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested)
         {
+            // The editor was closed or reopened; the finally block handles cleanup and nothing is shown.
         }
         catch (Exception ex)
         {
@@ -363,6 +370,7 @@ public sealed partial class MainWindow
 
     private void SetConfiguredCopilotModels(string synthesis, string intelligence)
     {
+        // Seed the combo boxes with only the configured ids so they display before (or without) the live catalog.
         _synthesisModelSelection = synthesis.Trim();
         _intelligenceModelSelection = intelligence.Trim();
         ReplaceCopilotModels(CopilotModelPresentation.Merge([], synthesis, intelligence));
@@ -386,12 +394,14 @@ public sealed partial class MainWindow
 
     private static string CurrentCopilotModel(ComboBox selector, string retained)
     {
+        // While the list is being replaced the combo box has no selection, so fall back to the remembered id.
         var selected = SelectedCopilotModel(selector);
         return selected.Length > 0 ? selected : retained;
     }
 
     private static void RetainCopilotModelSelection(ComboBox selector, ref string retained)
     {
+        // Ignore the empty selection raised when ItemsSource is cleared so the last real choice survives a refresh.
         var selected = SelectedCopilotModel(selector);
         if (selected.Length > 0)
             retained = selected;
@@ -493,6 +503,7 @@ public sealed partial class MainWindow
         }
         finally
         {
+            // Only re-enable the button if the same editor opening is still showing; a newer one resets its own controls.
             if (_settingsEditorLifetime == lifetime)
                 button.IsEnabled = true;
             if (isSynthesis)
@@ -580,12 +591,14 @@ public sealed partial class MainWindow
 
     private void OnSettingsCancelClick(object sender, RoutedEventArgs e)
     {
+        // Discard the form without saving and return to whichever view (idle or recording) opened Settings.
         CancelSettingsEditor();
         ShowState(_preferencesFromRecording);
     }
 
     private void InvalidateModelTests()
     {
+        // Bumping the revision makes in-flight RunModelTestAsync calls drop their results instead of showing stale outcomes.
         _settingsFormRevision++;
         foreach (var result in new[]
                  {
