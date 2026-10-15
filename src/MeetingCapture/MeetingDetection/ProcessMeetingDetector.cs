@@ -9,7 +9,7 @@ namespace MeetingCapture.MeetingDetection;
 internal sealed record MeetingProcessSnapshot(
     int ProcessId, string ProcessName, DateTimeOffset StartedAt, bool HasActiveCapture = false);
 
-/// <summary>Suggests sustained microphone activity from known apps, never process presence alone.</summary>
+/// <summary>Suggests meetings from known apps with a sustained active microphone capture session, not process presence alone.</summary>
 public sealed class ProcessMeetingDetector : IMeetingDetector
 {
     private readonly MeetingDetectionSettings _settings;
@@ -82,6 +82,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
     {
         lock (_gate)
         {
+            // A prompt can outlive the process signal that created it, so confirm only the current active session.
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_activeSession?.Id != sessionId || _activeSession is null || !_activeSession.IsActive)
             {
@@ -103,6 +104,8 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
             ObjectDisposedException.ThrowIf(_disposed, this);
             var now = _timeProvider.GetUtcNow();
             var until = GetDeadline(now, cooldown);
+            // The key includes process start time as well as PID, so a later process reusing the PID
+            // is not hidden by this dismissal.
             if (_activeSession?.Id != sessionId || _activeProcess is null || _confirmed)
             {
                 _logger.LogDebug("Ignoring stale or confirmed meeting dismissal: {SessionId}", sessionId);
@@ -122,6 +125,8 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
         lock (_gate)
         {
             if (_activeSession?.Id != sessionId) return;
+            // Keep a confirmed recording from being suggested again while the same capture session
+            // continues; PollOnce removes this guard after the signal resets.
             if (_activeProcess is { } process && _captureSince.ContainsKey(process))
                 _awaitSignalReset.Add(process);
             ended = ClearActive(_timeProvider.GetUtcNow());
@@ -137,6 +142,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
             ObjectDisposedException.ThrowIf(_disposed, this);
             var now = _timeProvider.GetUtcNow();
             _snoozedUntil = GetDeadline(now, duration);
+            // A snooze hides suggestions, but does not end a meeting the user already confirmed.
             ended = _confirmed ? null : ClearActive(now);
         }
         NotifyEnded(ended);
@@ -148,6 +154,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             _snoozedUntil = null;
+            // Discard old evidence so the next poll must observe a fresh sustained capture period.
             _dismissed.Clear();
             _observed.Clear();
             _captureSince.Clear();
@@ -157,6 +164,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
+        // Serialize start and stop so a canceled poll loop cannot overlap a replacement loop.
         await _lifecycleGate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
@@ -169,6 +177,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
                 _cts?.Dispose();
                 _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 var token = _cts.Token;
+                // Polling is background work; never run process enumeration on a UI caller.
                 _pollTask = Task.Run(() => PollLoopAsync(token), CancellationToken.None);
             }
         }
@@ -189,6 +198,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
             lock (_gate)
                 _disposed |= dispose;
 
+            // Await the poll loop before clearing its state or releasing its cancellation source.
             if (_cts is not null)
                 await _cts.CancelAsync().ConfigureAwait(false);
             if (_pollTask is not null)
@@ -230,6 +240,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
                 }
                 catch (Exception ex)
                 {
+                    // A failed poll is unknown evidence, not proof that the meeting ended.
                     _logger.LogWarning(ex, "Meeting detection poll failed; retaining the previous detection");
                 }
 
@@ -250,6 +261,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
         catch
         {
             // Unknown intervals cannot count toward sustained evidence, but are not proof a call ended.
+            // Restart the sustained-capture timer after the next successful snapshot.
             lock (_gate) _captureSince.Clear();
             throw;
         }
@@ -268,6 +280,8 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
 
             var now = _timeProvider.GetUtcNow();
             var capturing = processes.Where(process => process.HasActiveCapture).Select(Identity).ToHashSet();
+            // Reset timers when a capture session disappears; only continuous observed capture
+            // for _startDelay qualifies as a suggestion.
             foreach (var key in _captureSince.Keys.ToArray())
                 if (!capturing.Contains(key)) _captureSince.Remove(key);
             _awaitSignalReset.RemoveWhere(key => !capturing.Contains(key));
@@ -296,6 +310,8 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
 
             if (!_confirmed && !(_snoozedUntil > now))
             {
+                // Keep one current suggestion, and skip processes the user already saw while their
+                // capture signal has not reset.
                 var candidate = processes.FirstOrDefault(process =>
                     qualified.Contains(Identity(process)) &&
                     !_dismissed.ContainsKey(Identity(process)) &&
@@ -319,6 +335,8 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
         NotifyEnded(ended);
         if (started is not null)
         {
+            // State changed under the lock; recheck before notifying because another caller may
+            // have dismissed or stopped this session in the meantime.
             lock (_gate)
                 if (!ReferenceEquals(_activeSession, started))
                     return;
@@ -338,6 +356,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
                 try
                 {
                     var name = process.ProcessName;
+                    // Read start time only for configured apps; unrelated processes need no more inspection.
                     if (_knownProcesses.Contains(name))
                         result.Add(new MeetingProcessSnapshot(
                             process.Id, name, new DateTimeOffset(process.StartTime).ToUniversalTime()));
@@ -350,9 +369,11 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
         }
         finally
         {
+            // Process objects hold native handles and must be released even if one identity read fails.
             foreach (var process in processes)
                 process.Dispose();
         }
+        // Avoid querying all audio endpoints when no known meeting app is running.
         var capturing = result.Count == 0 ? [] : CaptureActivityReader.ReadActiveProcessIds();
         return result.Select(process => process with { HasActiveCapture = capturing.Contains(process.ProcessId) }).ToArray();
     }
@@ -360,6 +381,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
     private MeetingSession? ClearActive(DateTimeOffset now)
     {
         var ended = _activeSession;
+        // Reset all state tied to the old process before a later poll selects another candidate.
         ended?.End(now);
         _activeSession = null;
         _activeProcess = null;
@@ -372,6 +394,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
     {
         if (ended is null)
             return;
+        // Raise events after the detector lock is released so subscribers can safely call back into it.
         _logger.LogInformation("Meeting detection ended: {SessionId}", ended.Id);
         MeetingEnded?.Invoke(this, ended);
     }
@@ -381,6 +404,7 @@ public sealed class ProcessMeetingDetector : IMeetingDetector
 
     private static DateTimeOffset GetDeadline(DateTimeOffset now, TimeSpan duration)
     {
+        // Requiring a positive interval avoids storing a cooldown that expires immediately.
         if (duration <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(duration), "Duration must be positive.");
         return now.Add(duration);

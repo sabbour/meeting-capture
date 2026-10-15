@@ -43,6 +43,7 @@ internal static class SpeechStartupDiagnostics
     /// <summary>Maps an SDK or transport fault to a typed kind without retaining provider text.</summary>
     public static TranscriptionStartFailureKind Classify(Exception error)
     {
+        // Preserve a classification already assigned by this app; otherwise inspect nested SDK errors.
         if (error is TranscriptionStartException typed) return typed.Kind;
         return ClassifyMessage(Flatten(error));
     }
@@ -68,6 +69,7 @@ internal static class SpeechStartupDiagnostics
         var text = new System.Text.StringBuilder();
         for (var current = error; current is not null; current = current.InnerException)
         {
+            // SDK wrappers often put the useful transport fault in an inner exception or aggregate.
             text.Append(current.Message).Append('\n');
             if (current is AggregateException aggregate)
                 foreach (var nested in aggregate.InnerExceptions) text.Append(nested.Message).Append('\n');
@@ -75,6 +77,7 @@ internal static class SpeechStartupDiagnostics
         return text.ToString().ToLowerInvariant();
     }
 
+    // Match only known diagnostic terms; the returned user-facing message never includes this text.
     private static bool Contains(string text, params string[] markers) =>
         markers.Any(marker => text.Contains(marker, StringComparison.Ordinal));
 }

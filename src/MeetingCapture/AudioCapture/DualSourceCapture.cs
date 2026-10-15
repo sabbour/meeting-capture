@@ -74,6 +74,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         TaskCompletionSource drained;
         lock (_gate)
         {
+            // Build one fresh pair of source rings for each run; old callbacks cannot feed the new run.
             if (IsCapturing) throw new InvalidOperationException("The mixer or an audio source is already owned.");
             if (!_useLoopback && !_useMicrophone) throw new InvalidOperationException("No audio source is enabled.");
             _pcmMixer = mixer = new(SampleRate, Channels);
@@ -87,6 +88,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         }
         _loopbackHandler = (sender, args) =>
         {
+            // Check sender identity as well as the mixer instance to reject late callbacks after stop.
             if (ReferenceEquals(sender, _loopback)) Enqueue(mixer, AudioSource.Loopback, args);
         };
         _microphoneHandler = (sender, args) =>
@@ -97,6 +99,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         if (_useMicrophone) _microphone.DataAvailable += _microphoneHandler;
         try
         {
+            // Start the clock before the devices so initial packets wait in the rings until their frame is due.
             _mixer = new Thread(() => Mix(mixer, mixerStop, drained))
             {
                 IsBackground = true, Name = "MeetingCapture-DualMixer"
@@ -108,6 +111,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
             if (_useLoopback)
                 loopbackStarted = await TryStartAsync(_loopback, ct, error => _loopbackError = error).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
+            // Try both sources even when the first fails; one healthy device is still useful audio.
             if (_useMicrophone)
                 microphoneStarted = await TryStartAsync(_microphone, ct, error => _microphoneError = error).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
@@ -127,6 +131,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         catch (OperationCanceledException) { throw; }
         catch (Exception ex)
         {
+            // Treat one source failure as degraded capture, not total startup failure, if the other works.
             setError("The configured audio source could not start; its audio is missing.");
             _logger.LogWarning("Audio source {Source} could not start ({ErrorType}); health reports missing audio.", capture.Name, ex.GetType().Name);
             return false;
@@ -137,6 +142,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
     {
         lock (_gate)
         {
+            // Serialize ring writes with stop's ownership check and account for any overwritten bytes.
             if (!ReferenceEquals(_pcmMixer, mixer) || args.BytesRecorded == 0) return;
             if (mixer.Add(source, args.Buffer, args.BytesRecorded) > 0) _health.Dropped();
         }
@@ -151,12 +157,17 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
             var frameNumber = 1L;
             while (true)
             {
+                // Schedule against elapsed time rather than sleeping 20 ms after each frame;
+                // the latter would add processing time to every interval and drift.
                 var due = TimeSpan.FromMilliseconds(frameNumber * FrameMilliseconds) - clock.Elapsed;
                 if (due > TimeSpan.Zero && stop.WaitOne(due)) break;
                 if (stop.WaitOne(0)) break;
                 EmitFrame(mixer, frame, includeSilence: true);
+                // If work ran late, skip missed deadlines instead of sending a burst of stale frames.
                 frameNumber = NextFrameNumber(frameNumber, clock.Elapsed);
             }
+            // Emit only real buffered samples after stopping; there is no need to extend the recording
+            // with silence once the live clock has ended.
             while (mixer.ReadFrame(frame, includeSilence: false)) Emit(frame);
         }
         catch (Exception ex)
@@ -170,6 +181,8 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
 
     internal static long NextFrameNumber(long currentFrame, TimeSpan elapsed)
     {
+        // Frame numbers are one-based. Integer division finds the last elapsed boundary, so add one
+        // to choose the first deadline still in the future.
         var frameTicks = TimeSpan.FromMilliseconds(FrameMilliseconds).Ticks;
         var firstFutureFrame = elapsed.Ticks / frameTicks + 1;
         return Math.Max(currentFrame + 1, firstFutureFrame);
@@ -182,6 +195,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
 
     private void Emit(byte[] frame)
     {
+        // Mix reuses a frame array, so downstream listeners must get a separate buffer.
         var copy = frame.ToArray();
         _health.Received(copy.Length);
         _health.Level(copy, copy.Length);
@@ -201,6 +215,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
     {
         List<Exception> errors = [];
         // Child stop includes worker drain; keep handlers attached until both finish.
+        // Stop both devices before detaching so their final accepted buffers reach the mixer.
         var sources = new List<IAudioCapture>();
         if (_useLoopback) sources.Add(_loopback);
         if (_useMicrophone) sources.Add(_microphone);
@@ -214,6 +229,8 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         Task drained;
         lock (_gate)
         {
+            // The source callbacks are now drained. Signal the mixer and wait for its final ring drain
+            // before releasing its state or reusing any of the synchronization objects.
             if (!_mixerStarted) _drained!.TrySetResult();
             else _mixerStop!.Set();
             drained = _drained!.Task;
@@ -244,6 +261,7 @@ public sealed class DualSourceCapture : IAudioCapture, IMicActivitySource
         try { StopAsync(CancellationToken.None).GetAwaiter().GetResult(); }
         finally
         {
+            // Dispose both children even when stopping the first one reports a failure.
             try { _loopback.Dispose(); }
             finally { _microphone.Dispose(); }
         }

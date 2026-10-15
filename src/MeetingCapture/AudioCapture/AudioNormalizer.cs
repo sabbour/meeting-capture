@@ -82,6 +82,8 @@ internal static class AudioNormalizer
         if (targetRms <= 0.0 || micRms < SilenceFloorRms)
             return MinGain;
 
+        // Match the microphone's measured level to recent loopback RMS, but never attenuate
+        // the mic or amplify it by more than the configured ceiling.
         var gain = targetRms / micRms;
         if (gain < MinGain) return MinGain;
         if (gain > MaxGain) return MaxGain;
@@ -103,6 +105,7 @@ internal static class AudioNormalizer
             var idx = i * 2;
             var sample = (short)(pcm[idx] | (pcm[idx + 1] << 8));
 
+            // Clamp before converting back to 16-bit PCM so louder input saturates instead of wrapping.
             var amplified = (int)Math.Round(sample * gain);
             if (amplified > short.MaxValue) amplified = short.MaxValue;
             else if (amplified < short.MinValue) amplified = short.MinValue;

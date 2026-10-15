@@ -29,6 +29,7 @@ public sealed record TranscriptSnapshot
         DateTimeOffset? EndedAt, long Revision, bool IsComplete,
         IReadOnlyList<TranscriptionSegment> Segments)
     {
+        // A snapshot may outlive the active recording, so copy the segment list and expose it read-only.
         this.SessionId = SessionId;
         this.Title = Title;
         this.StartedAt = StartedAt;
@@ -43,6 +44,7 @@ public sealed record TranscriptSnapshot
 
     public TranscriptionResult ToTranscriptionResult()
     {
+        // Return a mutable result object for consumers that expect the service's list-based contract.
         var result = new TranscriptionResult();
         result.Segments.AddRange(Segments);
         return result;

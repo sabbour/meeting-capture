@@ -25,6 +25,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
         ArgumentException.ThrowIfNullOrWhiteSpace(markdownPath);
         ArgumentNullException.ThrowIfNull(document);
         cancellationToken.ThrowIfCancellationRequested();
+        // Validate before serializing so broken links or oversized collections never become saved state.
         if (!MeetingVisualizationValidator.IsValid(document))
             throw new InvalidOperationException("Visualization data is invalid.");
         if (new FileInfo(markdownPath).Length > MaxMarkdownBytes)
@@ -33,6 +34,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
         var envelope = new Envelope(MeetingVisualizationSession.CurrentSchemaVersion,
             DateTimeOffset.UtcNow, Convert.ToHexString(SHA256.HashData(markdown)), document);
         var path = Path.ChangeExtension(markdownPath, ".json");
+        // The hash binds this sidecar to the exact Markdown bytes; the temporary file protects readers from partial JSON.
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
@@ -59,6 +61,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
             return new(MeetingVisualizationLoadKind.LegacyMissing, null);
         try
         {
+            // Bound the input before parsing and cap JSON nesting to avoid spending unbounded work on a damaged file.
             var info = new FileInfo(path);
             if (info.Length <= 0 || info.Length > MaxJsonBytes)
                 return Corrupt();
@@ -71,6 +74,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
             if (schemaVersion > MeetingVisualizationSession.CurrentSchemaVersion)
                 return new(MeetingVisualizationLoadKind.FutureSchema, null,
                     "Visualization data was created by a newer version.");
+            // Inspect array and string sizes before materializing the object graph.
             if (!Preflight(json.RootElement, schemaVersion))
                 return Corrupt();
             var envelope = json.RootElement.Deserialize<Envelope>(Json);
@@ -87,13 +91,16 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
             var expected = Convert.FromHexString(envelope.MarkdownSha256);
             if (expected.Length != 32)
                 return Corrupt();
+            // Compare hashes in constant time and reject sidecars saved for older or different notes.
             if (!CryptographicOperations.FixedTimeEquals(
                     expected, SHA256.HashData(markdown)))
                 return new(MeetingVisualizationLoadKind.StaleMismatch, null,
                     "Visualization data does not match the Markdown transcript.");
             var loadedDocument = envelope.SchemaVersion == 1
+                // Schema 1 did not store the current document version, so upgrade it before validation.
                 ? envelope.Document with { SchemaVersion = MeetingVisualizationSession.CurrentSchemaVersion }
                 : envelope.Document;
+            // Older related-context facts were suggestions, not meeting facts; keep that distinction on load.
             loadedDocument = loadedDocument with
             {
                 Evidence = loadedDocument.Evidence.Select(item =>
@@ -128,6 +135,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
             !root.TryGetProperty("document", out var document) ||
             document.ValueKind != JsonValueKind.Object)
             return false;
+        // Limits are checked before deserialization so a small-looking file cannot contain huge arrays.
         var limits = new Dictionary<string, int>(StringComparer.Ordinal)
         {
             ["segments"] = 100_000,
@@ -152,6 +160,7 @@ public sealed class JsonMeetingVisualizationStorage : IMeetingVisualizationStora
 
     private static bool StringsWithinBounds(JsonElement element)
     {
+        // Check each parsed string before deserializing the document into application model objects.
         if (element.ValueKind == JsonValueKind.String)
             return (element.GetString()?.Length ?? 0) <= MaxStringLength;
         if (element.ValueKind == JsonValueKind.Array)
@@ -171,6 +180,7 @@ public static class MeetingVisualizationValidator
 
     public static bool IsValid(MeetingVisualizationDocument? document)
     {
+        // First reject null collections, unsupported versions, impossible counters, and oversized top-level data.
         if (document is null ||
             document.Segments is null || document.Speakers is null ||
             document.TopicClusters is null || document.TopicTrail is null ||
@@ -202,6 +212,7 @@ public static class MeetingVisualizationValidator
             document.Actions.Any(item => item is null) ||
             document.Decisions.Any(item => item is null))
             return false;
+        // IDs are used as dictionary keys and cross-links, so duplicates would make a loaded map ambiguous.
         if (!Unique(document.Segments.Select(item => item.Id)) ||
             !Unique(document.Speakers.Select(item => item.SpeakerId), StringComparer.OrdinalIgnoreCase) ||
             !Unique(document.TopicClusters.Select(item => item.Id)) ||
@@ -218,6 +229,7 @@ public static class MeetingVisualizationValidator
         var speakers = document.Speakers.Select(item => item.SpeakerId)
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
         var evidenceById = document.Evidence.ToDictionary(item => item.Id);
+        // A topic may have at most one analysis fact for the same displayed claim.
         if (document.Evidence
             .Where(item => item.Origin == EvidenceOrigin.Analysis &&
                 item.Provenance == VisualizationProvenance.TranscriptFact)
@@ -225,6 +237,7 @@ public static class MeetingVisualizationValidator
                 StringComparer.OrdinalIgnoreCase)
             .Any(group => group.Count() > 1))
             return false;
+        // Validate the relationships only after all referenced ID sets have been built.
         return document.Segments.Select(item => item.Ordinal).SequenceEqual(
                 Enumerable.Range(1, document.Segments.Count)) &&
             document.Segments.All(item => item.Id == $"seg-{item.Ordinal:D6}" &&

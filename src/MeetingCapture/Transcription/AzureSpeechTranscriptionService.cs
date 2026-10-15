@@ -12,6 +12,8 @@ namespace MeetingCapture.Transcription;
 /// <summary>Live transcription with Azure AI Speech. Audio is pushed in and results arrive as segments.</summary>
 public sealed class AzureSpeechTranscriptionService : ITranscriptionService
 {
+    // _gate protects lifecycle and transcript state; _writeGate serializes SDK stream writes with close;
+    // _callbackGate keeps result callbacks in order and prevents them racing handler removal.
     private readonly object _gate = new();
     private readonly object _writeGate = new();
     private readonly object _callbackGate = new();
@@ -61,6 +63,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         {
             lock (_gate)
             {
+                // The rolling sample array is bounded; nearest-rank p95 avoids retaining a full session's timings.
                 var samples = _writeSamples.AsSpan(0, _sampleCount).ToArray();
                 Array.Sort(samples);
                 var p95 = samples.Length == 0 ? 0 : samples[(int)Math.Ceiling(samples.Length * .95) - 1];
@@ -85,6 +88,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             ObjectDisposedException.ThrowIf(_disposed, this);
             ct.ThrowIfCancellationRequested();
             if (_owned) throw new InvalidOperationException("A transcription session is already owned.");
+            // Mark ownership before leaving the lock because SDK creation/start may still be in progress.
             _owned = true;
             if (resetSessionMetrics)
             {
@@ -110,6 +114,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         try
         {
             ct.ThrowIfCancellationRequested();
+            // Allow an environment-provided secret without writing it into the user settings file.
             var key = !string.IsNullOrWhiteSpace(_settings.ApiKey) ? _settings.ApiKey :
                 Environment.GetEnvironmentVariable("AZURE_SPEECH_KEY");
             if (string.IsNullOrWhiteSpace(key))
@@ -126,6 +131,8 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             Session session;
             try
             {
+                // Build resources in dependency order; the input stream format must match the PCM
+                // contract used by both capture sources.
                 speech = BuildSpeechConfig(key, endpoint);
                 speech.EnableDictation();
                 format = AudioStreamFormat.GetWaveFormatPCM(16000, 16, 1);
@@ -136,6 +143,8 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             }
             catch (Exception creationError)
             {
+                // Construction can fail halfway through, so dispose every resource that exists
+                // without replacing the original startup error.
                 List<Exception> cleanupErrors = [];
                 foreach (var resource in new IDisposable?[] { transcriber, audio, stream, format })
                     try { resource?.Dispose(); }
@@ -152,6 +161,8 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
                     TranscriptionSegment segment;
                     lock (_gate)
                     {
+                        // The SDK can call back after stop begins. Accept only recognized speech
+                        // from the session that still owns this service.
                         if (!ReferenceEquals(_session, session) || !ReferenceEquals(sender, session.Transcriber) ||
                             !session.AcceptCallbacks || args.Result.Reason != ResultReason.RecognizedSpeech ||
                             string.IsNullOrWhiteSpace(args.Result.Text)) return;
@@ -168,6 +179,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
                 lock (_callbackGate)
                 {
                     lock (_gate)
+                        // Apply the same ownership checks to interim text, but do not add it to the final transcript.
                         if (!ReferenceEquals(_session, session) || !ReferenceEquals(sender, session.Transcriber) ||
                             !session.AcceptCallbacks || args.Result.Reason != ResultReason.RecognizingSpeech ||
                             string.IsNullOrWhiteSpace(args.Result.Text)) return;
@@ -178,6 +190,8 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             {
                 lock (_gate)
                 {
+                    // Ignore expected cancellations during release. Service timeouts retain results
+                    // and defer reconnection until the next audio write.
                     if (!ReferenceEquals(_session, session) || !ReferenceEquals(sender, session.Transcriber) ||
                         !session.AcceptCallbacks || args.Reason != CancellationReason.Error) return;
                     if (SpeechCancellationDiagnostics.RequiresReconnect(args.ErrorCode.ToString()))
@@ -210,6 +224,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         }
         catch (OperationCanceledException)
         {
+            // Do not report startup cancellation as a service failure, but release all acquired resources.
             lock (_gate) Fail("Speech startup canceled.");
             try { await ReleaseSessionAsync().ConfigureAwait(false); }
             finally { ReleaseOwnership(); }
@@ -230,11 +245,13 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
     public async Task PushAudioAsync(byte[] pcmData, int bytesRecorded, CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(pcmData);
+        // Speech accepts 16-bit samples, so a write must contain complete samples and stay in the supplied array.
         if (bytesRecorded < 0 || bytesRecorded > pcmData.Length || bytesRecorded % 2 != 0)
             throw new ArgumentOutOfRangeException(nameof(bytesRecorded));
         ct.ThrowIfCancellationRequested();
         if (bytesRecorded == 0) return;
         Task<bool>? recovery;
+        // Share an in-progress reconnect instead of opening duplicate SDK sessions for concurrent audio callbacks.
         lock (_gate) recovery = _recoveryRequired ? StartRecoveryLocked(ct) : null;
         if (recovery is not null && !await recovery.ConfigureAwait(false))
             throw new InvalidOperationException("Speech transcription could not reconnect.");
@@ -250,6 +267,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             var started = Stopwatch.GetTimestamp();
             try
             {
+                // The SDK write is synchronous; serialize it against Stream.Close and measure its duration.
                 session.Stream.Write(pcmData, bytesRecorded);
                 lock (_gate) _bytes += bytesRecorded;
             }
@@ -284,6 +302,8 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         {
             try
             {
+                // Release the timed-out session before reconnecting, but keep the transcript and
+                // byte counters because this is still the same meeting.
                 try { await ReleaseSessionAsync().ConfigureAwait(false); }
                 finally { ReleaseOwnership(); }
                 lock (_gate)
@@ -314,6 +334,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             if (!_owned) return Task.FromResult(CopyResult());
             if (_recoveryTask is { IsCompleted: false } recovery)
             {
+                // Let recovery finish its ownership transition, then stop the resulting session once.
                 return _stopTask = Task.Run(async () =>
                 {
                     await recovery.ConfigureAwait(false);
@@ -321,6 +342,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
                     return await StopAsync(ct).ConfigureAwait(false);
                 });
             }
+            // Cancel app-side waiting, but still await SDK startup because its native call is not cancelable.
             _startupCancellation?.Cancel();
             var startup = _startTask;
             return _stopTask = Task.Run(async () =>
@@ -350,6 +372,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         List<Exception> errors = [];
         try
         {
+            // Close the stream only after any current write finishes; the SDK uses close as its end-of-audio signal.
             lock (_writeGate)
             {
                 lock (_gate) _transcribing = false;
@@ -366,17 +389,20 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
         {
             lock (_gate)
             {
+                // Wait for any callback already publishing a result, then reject future callbacks and detach handlers.
                 session.AcceptCallbacks = false;
                 session.Transcriber.Transcribed -= session.FinalHandler;
                 session.Transcriber.Transcribing -= session.PartialHandler;
                 session.Transcriber.Canceled -= session.CancelHandler;
             }
         }
+        // Dispose in reverse dependency order and attempt every release even if one SDK object throws.
         foreach (var resource in new IDisposable[] { session.Transcriber, session.Audio, session.Stream, session.Format })
             try { resource.Dispose(); }
             catch (Exception ex) { errors.Add(ex); _releaseFailed = true; }
         lock (_gate)
         {
+            // Keep ownership if any resource failed to release; a new session must not overlap a leaked SDK object.
             if (!_releaseFailed && ReferenceEquals(_session, session)) _session = null;
             if (errors.Count > 0) Fail("Speech shutdown failed; available transcript was retained.");
         }
@@ -387,6 +413,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
     {
         lock (_gate)
         {
+            // A failed release intentionally leaves the service owned until application shutdown.
             _owned = _releaseFailed;
             _transcribing = false;
             _recoveryRequired = false;
@@ -415,6 +442,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
     private void Publish<T>(EventHandler<T>? handlers, T args)
     {
         if (handlers is null) return;
+        // Invoke subscribers separately so one UI or pipeline failure cannot block the remaining listeners.
         foreach (EventHandler<T> handler in handlers.GetInvocationList())
             try { handler(this, args); }
             catch (Exception ex)
@@ -430,6 +458,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
     {
         var region = _settings.Region;
         var host = endpoint.Host.ToLowerInvariant();
+        // Regional Azure hosts encode the region in their first label; custom hosts need endpoint-based setup.
         if (string.IsNullOrWhiteSpace(region) &&
             (host.EndsWith(".api.cognitive.microsoft.com", StringComparison.Ordinal) ||
              host.EndsWith(".stt.speech.microsoft.com", StringComparison.Ordinal) ||
@@ -437,6 +466,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             region = host.Split('.')[0];
         var config = !string.IsNullOrWhiteSpace(region) ? SpeechConfig.FromSubscription(key, region) :
             SpeechConfig.FromEndpoint(new Uri($"wss://{host}/stt/speech/recognition/conversation/cognitiveservices/v1"), key);
+        // Use short silence segmentation for responsive live text and enable intermediate speaker labels.
         if (!string.IsNullOrWhiteSpace(_settings.Language)) config.SpeechRecognitionLanguage = _settings.Language;
         config.SetProperty(PropertyId.Speech_SegmentationSilenceTimeoutMs, "300");
         config.SetProperty(PropertyId.SpeechServiceConnection_InitialSilenceTimeoutMs, "0");
@@ -454,6 +484,7 @@ public sealed class AzureSpeechTranscriptionService : ITranscriptionService
             if (_disposed) return;
             _disposed = true;
         }
+        // StopAsync owns the same release path used by normal recording shutdown.
         await StopAsync(CancellationToken.None).ConfigureAwait(false);
     }
 }

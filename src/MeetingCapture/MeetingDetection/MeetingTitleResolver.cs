@@ -53,18 +53,21 @@ public static class MeetingTitleResolver
     /// <summary>Like <see cref="Resolve"/>, but also explains why no title was chosen.</summary>
     public static MeetingTitleResolution ResolveWithReason(string process, DateTimeOffset detectedAt, IEnumerable<MeetingTitleCandidate> meetings)
     {
+        // Filter out incomplete or non-human calendar items before comparing time and platform.
         var all = meetings.Where(IsEligibleOnlineMeeting).ToArray();
         if (all.Length == 0) return new(null, "WorkIQ found no trustworthy online meeting candidates.");
         var platform = AppLabel(process);
         var timed = all.Where(meeting =>
             meeting.End > detectedAt && meeting.Start <= detectedAt.AddMinutes(5) &&
             meeting.End > meeting.Start).ToArray();
+        // A time match alone is not enough: the meeting metadata must identify this app's platform.
         if (timed.Length == 0) return new(null, "WorkIQ found no online meetings overlapping this signal.");
         var candidates = MatchingCandidates(process, detectedAt, timed);
         if (candidates.Count == 0)
             return new(null, $"Calendar events overlap this time, but none has verified {platform} meeting metadata.");
         if (candidates.Count > 1)
             return new(null, $"{candidates.Count} {platform} meetings overlap this signal; choose the correct meeting.");
+        // Normalize whitespace only after the match is unambiguous, and never invent a subject.
         var subject = candidates[0].Subject.Trim();
         return subject.Length == 0 || subject == "(no subject)" ? new(null, "The matching calendar event has no usable title.")
             : new(string.Join(" ", subject.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)),
@@ -96,6 +99,8 @@ public static class MeetingTitleResolver
     {
         if (meeting.IsCancelled || meeting.IsAllDay || meeting.End <= meeting.Start || !HasOnlineCallEvidence(meeting))
             return false;
+        // Work IQ distinguishes the current user as organizer when known; otherwise require two
+        // distinct human identities so a solo appointment is not treated as a meeting.
         var attendees = meeting.Attendees?.Where(a => a.IsHuman).ToArray();
         if (attendees is null) return false;
         if (meeting.IsOrganizer == true) return attendees.Length > 0;
@@ -108,6 +113,8 @@ public static class MeetingTitleResolver
     public static IReadOnlyList<MeetingInvitee> InviteParticipants(MeetingTitleCandidate? meeting)
     {
         if (meeting is null) return [];
+        // Some calendar APIs omit the organizer from attendees, while others include them; group
+        // by email/name so either shape yields one person per identity.
         var people = meeting.Attendees?.Where(a => a.IsHuman).ToList() ?? [];
         if (meeting.IsOrganizer == false && meeting.Organizer?.IsHuman == true)
             people.Add(meeting.Organizer);
@@ -118,6 +125,7 @@ public static class MeetingTitleResolver
     private static bool HasOnlineCallEvidence(MeetingTitleCandidate meeting)
     {
         var provider = meeting.OnlineMeetingProvider?.Trim();
+        // Accept an explicit online flag, a known provider value, or an HTTPS join link as evidence.
         return meeting.IsOnlineMeeting == true ||
             !string.IsNullOrEmpty(provider) &&
             !string.Equals(provider, "unknown", StringComparison.OrdinalIgnoreCase) ||
@@ -135,6 +143,7 @@ public static class MeetingTitleResolver
         var host = Uri.TryCreate(meeting.JoinUrl, UriKind.Absolute, out var uri) &&
             uri.Scheme == Uri.UriSchemeHttps ? uri.Host : "";
         static bool Domain(string host, string domain) =>
+            // Match a whole host or a subdomain, not an unrelated name that merely ends with the text.
             host.Equals(domain, StringComparison.OrdinalIgnoreCase) ||
             host.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase);
         return platform switch

@@ -20,7 +20,7 @@ public interface IMeetingVisualizationStorage
     /// <summary>Saves the document for the notes file at <paramref name="markdownPath"/>.</summary>
     Task SaveAsync(string markdownPath, MeetingVisualizationDocument document, CancellationToken cancellationToken);
 
-    /// <summary>Loads and checks the saved document for the notes file. Problems are reported in the result, not thrown.</summary>
+    /// <summary>Loads and checks the saved document. Validation problems are returned; cancellation and unhandled I/O failures may still throw.</summary>
     Task<MeetingVisualizationLoadResult> LoadAsync(string markdownPath, CancellationToken cancellationToken);
 }
 

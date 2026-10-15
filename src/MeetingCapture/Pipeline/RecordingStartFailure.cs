@@ -96,6 +96,7 @@ public static class RecordingStartFailures
         Exception? error, IReadOnlyList<AudioSourceHealth> audio, TranscriptionHealth? transcription,
         bool resourcesRetained = false)
     {
+        // Prefer a typed startup error, then a retained-resource warning, before inferring from health snapshots.
         if (error is RecordingStartException typed) return typed.Failure;
         if (resourcesRetained) return Describe(RecordingStartFailureKind.RetainedCaptureOwnership);
         switch (error)
@@ -105,6 +106,7 @@ public static class RecordingStartFailures
             case ArgumentException: return Describe(RecordingStartFailureKind.IneligibleCalendarMeeting);
         }
         var sources = audio ?? [];
+        // Device-level failures give the most actionable guidance and are more specific than the mixer summary.
         var microphone = Failed(sources, "microphone");
         var loopback = Failed(sources, "loopback");
         if (microphone && loopback) return Describe(RecordingStartFailureKind.AudioUnavailable);
@@ -114,6 +116,7 @@ public static class RecordingStartFailures
             return Describe(RecordingStartFailureKind.NoAudioSource);
         if (sources.Any(source => source.State == CaptureHealthState.Failed))
             return Describe(RecordingStartFailureKind.AudioUnavailable);
+        // The transcription state is considered only after audio failures, which should be fixed first.
         if (transcription is { State: CaptureHealthState.Failed })
             return Describe(RecordingStartFailureKind.SpeechStartFailed);
         return Describe(RecordingStartFailureKind.Unknown);

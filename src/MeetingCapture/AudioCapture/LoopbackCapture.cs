@@ -32,6 +32,7 @@ public sealed class LoopbackCapture : IAudioCapture
     public Task StartAsync(CancellationToken ct)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        // The transcription stream consumes only the configured 16 kHz mono PCM format.
         if (SampleRate != 16000 || Channels != 1)
             throw new InvalidOperationException("Loopback capture supports 16000 Hz mono PCM.");
         return _worker.StartAsync(ct);
@@ -41,6 +42,7 @@ public sealed class LoopbackCapture : IAudioCapture
     {
         if (_disposed) return;
         _disposed = true;
+        // Ensure native device capture is stopped before this wrapper is considered released.
         _worker.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 }
@@ -50,6 +52,7 @@ internal sealed class EventSynchronizedLoopbackCapture()
     : WasapiCapture(WasapiLoopbackCapture.GetDefaultLoopbackCaptureDevice(), true, 100)
 {
     /// <summary>Enables WASAPI loopback mode for the playback-device stream.</summary>
+    // Keep event synchronization from WasapiCapture and add only the loopback stream flag.
     protected override AudioClientStreamFlags GetAudioClientStreamFlags() =>
         AudioClientStreamFlags.Loopback | base.GetAudioClientStreamFlags();
 }

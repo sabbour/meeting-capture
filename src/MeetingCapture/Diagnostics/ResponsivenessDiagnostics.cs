@@ -129,6 +129,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         _started = _time.GetTimestamp();
         _reportFailure = reportFailure;
         _stopToken = _stop.Token;
+        // A dedicated writer keeps file creation and flushes away from the UI and capture callbacks.
         _writer = Task.Factory.StartNew(Write, CancellationToken.None,
             TaskCreationOptions.LongRunning, TaskScheduler.Default);
         Enqueue(Snapshot(ResponsivenessEventKind.ProcessStarted));
@@ -182,6 +183,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
 
     private PhaseScope BeginPhase(ResponsivenessPhase phase, bool ui)
     {
+        // Operation IDs distinguish repeated phases; nested UI scopes restore the phase they replaced.
         var scope = new PhaseScope(this, phase, Interlocked.Increment(ref _operation),
             _time.GetTimestamp(), ui, ui ? Volatile.Read(ref _activeUiPhase) : null);
         if (ui) Volatile.Write(ref _activeUiPhase, scope);
@@ -213,6 +215,8 @@ public sealed class ResponsivenessDiagnostics : IDisposable
                 ProbePostDurationMs = observation.ProbePostDurationMs,
                 MonitorIntervalMs = observation.MonitorIntervalMs
             }));
+        // Keep dispatch posting on its own thread: a dispatcher call that blocks must not stop
+        // the monitor from measuring the delay.
         _poster = Task.Factory.StartNew(() =>
         {
             while (!_stopToken.IsCancellationRequested)
@@ -222,6 +226,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
                 heartbeat.PostPending();
             }
         }, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // Tick once per second using a background thread, independent of UI responsiveness.
         _monitor = Task.Factory.StartNew(() =>
         {
             while (!_stopToken.IsCancellationRequested)
@@ -235,6 +240,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _stopped, 1) != 0) return;
+        // Queue the final marker before completing the channel; then wake both workers so they can exit.
         Enqueue(Snapshot(ResponsivenessEventKind.ProcessStopping), stopping: true);
         _stop.Cancel();
         _events.Writer.TryComplete();
@@ -255,6 +261,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         var state = Volatile.Read(ref _state);
         var uiPhase = Volatile.Read(ref _lastUiPhase);
         var backgroundPhase = Volatile.Read(ref _lastBackgroundPhase);
+        // Use monotonic time for elapsed durations and UTC only for timestamps shared with other logs.
         return new LogEntry(
             1, Interlocked.Increment(ref _sequence), _time.GetUtcNow(),
             _time.GetElapsedTime(_started, now).TotalMilliseconds, kind,
@@ -276,6 +283,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
     private void Enqueue(LogEntry entry, bool stopping = false)
     {
         if (!stopping && Volatile.Read(ref _stopped) != 0) return;
+        // TryWrite keeps diagnostics non-blocking for callers; a full queue is counted rather than awaited.
         if (_events.Writer.TryWrite(entry))
         {
             try { _writeReady.Set(); }
@@ -306,6 +314,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
         {
             while (true)
             {
+                // The single reader preserves event order while producers continue to add bounded entries.
                 while (_events.Reader.TryRead(out var entry))
                 {
                     while (true)
@@ -322,6 +331,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
                         }
                         catch (Exception error) when (error is IOException or UnauthorizedAccessException)
                         {
+                            // Retry on this worker with a pause; never make a logging failure block its caller.
                             ReportFailure(error);
                             hadFailure = true;
                             CloseStream();
@@ -343,6 +353,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
             if (stream is null)
             {
                 Directory.CreateDirectory(directory);
+                // On first use, preserve the previous run before opening this run's log.
                 if (!opened && File.Exists(path)) RotateFiles();
                 stream = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read,
                     4096, FileOptions.None);
@@ -351,6 +362,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
             var bytes = JsonSerializer.SerializeToUtf8Bytes(entry with { DroppedEvents = DroppedEvents }, JsonOptions);
             if (stream.Length + bytes.Length + 1 > FileSizeLimit)
             {
+                // Rotate before adding a line that would cross the one-megabyte active-file limit.
                 stream.Dispose();
                 stream = null;
                 RotateFiles();
@@ -359,12 +371,14 @@ public sealed class ResponsivenessDiagnostics : IDisposable
             }
             stream.Write(bytes);
             stream.WriteByte((byte)'\n');
+            // Flush each line so a process crash does not erase already recorded stall evidence.
             stream.Flush();
             Interlocked.Increment(ref _written);
         }
 
         void RotateFiles()
         {
+            // Keep two older files; moving the oldest first avoids losing the previous run on rotation.
             var previous = Path.Combine(directory, "responsiveness.1.jsonl");
             if (File.Exists(previous))
                 File.Move(previous, Path.Combine(directory, "responsiveness.2.jsonl"), overwrite: true);
@@ -411,6 +425,7 @@ public sealed class ResponsivenessDiagnostics : IDisposable
             if (Interlocked.Exchange(ref _ended, 1) != 0) return;
             if (ui)
             {
+                // Nested phases restore their parent only if this scope is still the active one.
                 Interlocked.CompareExchange(ref owner._activeUiPhase, parent, this);
                 Volatile.Write(ref owner._lastUiPhase, (int)Phase);
             }
@@ -492,6 +507,8 @@ internal sealed class UiHeartbeat(
             var delay = time.GetElapsedTime(probe.Sent, response?.Timestamp ?? now);
             if (delivery.State is UiProbePostState.Pending or UiProbePostState.Posting)
             {
+                // The dispatch request itself may be stuck before reaching the UI queue; report
+                // that separately instead of claiming the UI thread has stopped.
                 if (time.GetElapsedTime(probe.Sent, now) >= StallThreshold &&
                     (!_postDelayed || time.GetElapsedTime(_lastPostReport, now) >= TimeSpan.FromSeconds(10)))
                 {
@@ -516,6 +533,7 @@ internal sealed class UiHeartbeat(
             }
             else
             {
+                // Start the UI-response timer after dispatch accepts the probe, not before queueing it.
                 _rejected = false;
                 var uiWait = time.GetElapsedTime(delivery.Completed, response?.Timestamp ?? now);
                 if (uiWait >= StallThreshold && !_stallReported)
@@ -549,6 +567,7 @@ internal sealed class UiHeartbeat(
         if (responded && observedProbe is { } acknowledged &&
             time.GetElapsedTime(_lastCheckpoint, now) >= TimeSpan.FromSeconds(30))
         {
+            // Periodic checkpoints prove the UI is still responding even when no stall occurred.
             _lastCheckpoint = now;
             Record(ResponsivenessEventKind.UiCheckpoint, acknowledged,
                 Volatile.Read(ref acknowledged.Delivery), _lastDelay, _lastResponseUtc);
@@ -577,6 +596,7 @@ internal sealed class UiHeartbeat(
     internal void PostPending()
     {
         var next = Volatile.Read(ref _pending);
+        // Only one poster may dispatch a given probe; this prevents duplicate callbacks racing the monitor.
         if (next is null || Interlocked.CompareExchange(ref next.PostStarted, 1, 0) != 0) return;
         var started = time.GetTimestamp();
         var startedUtc = time.GetUtcNow();
@@ -585,6 +605,7 @@ internal sealed class UiHeartbeat(
         bool accepted;
         try
         {
+            // The supplied dispatcher call may block, which is why PostPending runs on its own worker.
             accepted = post(() => Volatile.Write(ref next.Response,
                 new Response(time.GetTimestamp(), time.GetUtcNow())));
         }

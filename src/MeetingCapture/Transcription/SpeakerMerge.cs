@@ -26,6 +26,7 @@ public sealed class SpeakerMergePlan
     public static SpeakerMergePlan? Create(IEnumerable<string?> speakerIds, string? keptId)
     {
         ArgumentNullException.ThrowIfNull(speakerIds);
+        // Normalize once so IDs differing only by surrounding whitespace or case do not split counts.
         var kept = keptId?.Trim();
         if (string.IsNullOrEmpty(kept)) return null;
         var absorbed = speakerIds
@@ -53,6 +54,7 @@ public sealed class SpeakerMergePlan
     public void MergeCounts(IDictionary<string, int> counts)
     {
         ArgumentNullException.ThrowIfNull(counts);
+        // Remove absorbed entries before updating the destination, which may already have a count.
         var moved = 0;
         foreach (var id in AbsorbedIds)
             if (counts.TryGetValue(id, out var value))

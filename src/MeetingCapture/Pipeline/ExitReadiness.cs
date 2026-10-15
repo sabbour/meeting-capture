@@ -27,6 +27,7 @@ public sealed record ExitReadiness(
     public bool HasDeferredWork => Deferral != ExitDeferralKind.None;
 
     public static bool ShouldCloseAfterSavedPartial(bool partialIsDurable, bool userConfirmed) =>
+        // A partial transcript is safe to leave only when both persistence and user confirmation are present.
         partialIsDurable && userConfirmed;
 
     /// <summary>Sanitized user guidance: never includes transcript or meeting content.</summary>
