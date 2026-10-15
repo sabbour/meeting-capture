@@ -25,6 +25,9 @@ src\MeetingCapture\bin\Release\net10.0-windows10.0.19041.0\win-arm64\MeetingCapt
 ```
 
 The project is unpackaged and self-contained, including .NET and Windows App SDK. Do not assume an x64 output exists without explicitly building and validating that RID. Open the application from its tray icon; closing/hiding its window does not by itself mean recording has stopped.
+
+GitHub Actions runs the full offline regression suite and publishes unsigned Release builds for `win-arm64` and `win-x64` on pushes and pull requests to `master`, or when started manually. CI builds include the matching Copilot CLI and the settings template, not local settings or credentials. Signed releases are made locally with Trusted Signing; CI does not sign builds or use signing secrets.
+
 The tray window opens at a DPI-scaled 600 x 900 logical-pixel default when the monitor work area allows it. It is natively resizable, remains inside the active monitor work area, and preserves the user's current size when hidden and reopened from the tray.
 The executable declares Per-Monitor V2 DPI awareness so Windows renders text and icons at the monitor's native scale rather than stretching a 96-DPI window. It runs with the current user's permissions and requires no elevation.
 

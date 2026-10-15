@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+# Release signing is done locally with Trusted Signing, never in CI.
+jobs:
+  regression:
+    name: Offline regression
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      # The regression project's NuGet.Config clears sources for local offline use.
+      - name: Restore regression dependencies
+        run: dotnet restore tests\MeetingCapture.Regression\MeetingCapture.Regression.csproj --source https://api.nuget.org/v3/index.json
+      - name: Run all offline regression checks
+        run: dotnet run --project tests\MeetingCapture.Regression\MeetingCapture.Regression.csproj -c Release --no-restore
+
+  publish:
+    name: Unsigned ${{ matrix.rid }}
+    needs: regression
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rid: [win-arm64, win-x64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Restore application dependencies
+        run: dotnet restore src\MeetingCapture\MeetingCapture.csproj -r ${{ matrix.rid }} --source https://api.nuget.org/v3/index.json
+      # The SDK downloads the matching Copilot CLI from npm on this clean runner.
+      # Do not skip it: a missing CLI must fail rather than produce an incomplete app.
+      - name: Build Release
+        run: dotnet build src\MeetingCapture\MeetingCapture.csproj -c Release -r ${{ matrix.rid }} --no-restore -p:AppxPackageSigningEnabled=false
+      - name: Publish unsigned application
+        run: dotnet publish src\MeetingCapture\MeetingCapture.csproj -c Release -r ${{ matrix.rid }} --no-build --no-restore -p:AppxPackageSigningEnabled=false -o "${{ runner.temp }}\publish"
+      - name: Check package contents
+        run: |
+          $output = "${{ runner.temp }}\publish"
+          foreach ($relative in @('MeetingCapture.exe', 'MeetingCapture.dll', 'appsettings.template.json', 'runtimes\${{ matrix.rid }}\native\copilot.exe')) {
+            if (-not (Test-Path (Join-Path $output $relative) -PathType Leaf)) {
+              throw "Missing required published file: $relative"
+            }
+          }
+          $privateFiles = Get-ChildItem $output -Recurse -Force |
+            Where-Object { $_.Name -in @('appsettings.json', '.squad', 'IMPROVEMENT-PLAN.md') }
+          if ($privateFiles) {
+            throw "Local-only files must not be published: $($privateFiles.FullName -join ', ')"
+          }
+          foreach ($name in @('MeetingCapture.exe', 'MeetingCapture.dll')) {
+            if ((Get-AuthenticodeSignature (Join-Path $output $name)).Status -ne 'NotSigned') {
+              throw "CI output must be unsigned: $name"
+            }
+          }
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.md $output
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MeetingCapture-${{ matrix.rid }}-unsigned
+          path: ${{ runner.temp }}\publish\**
+          if-no-files-found: error
+          retention-days: 14
