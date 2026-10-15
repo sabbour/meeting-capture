@@ -14,7 +14,7 @@
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <WindowsPackageType>None</WindowsPackageType>
     <EnableMsixTooling>true</EnableMsixTooling>
-    <Version>0.1.0</Version>
+    <Version>0.1.1</Version>
     <Description>Meeting capture tray app with transcription and AI notes</Description>
     <ApplicationIcon>Resources\tray.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>

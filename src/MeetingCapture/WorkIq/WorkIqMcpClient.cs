@@ -52,7 +52,7 @@ public sealed partial class WorkIqMcpClient(HttpClient http, TimeSpan? requestTi
         var initialized = await RequestAsync("initialize", new
         {
             protocolVersion = "2025-03-26", capabilities = new { },
-            clientInfo = new { name = "MeetingCapture", version = "0.1.0" }
+            clientInfo = new { name = "MeetingCapture", version = "0.1.1" }
         }, token, ct).ConfigureAwait(false);
         _protocol = initialized.GetProperty("protocolVersion").GetString();
         if (_protocol is not ("2025-03-26" or "2025-06-18" or "2025-11-25"))
