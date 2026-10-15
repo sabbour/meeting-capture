@@ -57,6 +57,8 @@ public sealed class MeetingVisualizationSession
         bool publish;
         lock (_gate)
         {
+            // Reuse the session object between recordings, but clear every prior ID map and
+            // counter before publishing the new session.
             ClearLocked();
             _sessionId = sessionId;
             _title = Clean(meetingTitle);
@@ -87,6 +89,8 @@ public sealed class MeetingVisualizationSession
                 RequireMutable();
             else if (_closed || _sessionId != expectedSessionId || isCurrent is null || !isCurrent())
                 return false;
+            // Stable ordinal-derived IDs let later corrections replace a segment without
+            // changing the references stored by the visualization.
             var value = new VisualizationSegment($"seg-{ordinal:D6}", ordinal, segment.Text,
                 segment.Timestamp, segment.SpeakerId, segment.ConfidenceScore);
             var index = _segments.FindIndex(item => item.Ordinal == ordinal);
@@ -94,17 +98,21 @@ public sealed class MeetingVisualizationSession
             {
                 if (_segments[index] != value)
                 {
+                    // A corrected transcript segment invalidates analysis that depended on it.
                     _segments[index] = value;
                     InvalidateAnalysisFromLocked(ordinal);
                 }
             }
             else
             {
+                // Appending only the next ordinal keeps the transcript a gap-free source of truth.
                 if (ordinal != _segments.Count + 1)
                     throw new InvalidOperationException("Segment ordinals must be contiguous.");
                 _segments.Add(value);
             }
             _transcriptRevision = Math.Max(_transcriptRevision, ordinal);
+            // Create an unconfirmed speaker entry on first sight; callers can later replace it
+            // with a user-confirmed display name.
             if (!string.IsNullOrWhiteSpace(segment.SpeakerId) && !_speakers.ContainsKey(segment.SpeakerId))
                 _speakers.Add(segment.SpeakerId, new(segment.SpeakerId,
                     segment.SpeakerDisplayName ?? segment.SpeakerId, false));
@@ -138,6 +146,8 @@ public sealed class MeetingVisualizationSession
         lock (_gate)
         {
             RequireSession();
+            // Preserve the kept speaker's confirmation state; an automatic rename must not
+            // accidentally turn an unconfirmed label into a confirmed identity.
             var keptName = string.IsNullOrWhiteSpace(keptDisplayName) ? plan.KeptId : keptDisplayName.Trim();
             var confirmed = _speakers.TryGetValue(plan.KeptId, out var existing) && existing.IsConfirmed;
             _speakers[plan.KeptId] = new(plan.KeptId, keptName, confirmed);
@@ -148,6 +158,8 @@ public sealed class MeetingVisualizationSession
             }
             foreach (var alias in _speakerAliases.Where(pair => plan.Absorbs(pair.Value)).Select(pair => pair.Key).ToArray())
                 _speakerAliases[alias] = plan.KeptId;
+            // Rewrite historical segments as well as the alias map so snapshots and future
+            // evidence use one canonical speaker ID.
             for (var index = 0; index < _segments.Count; index++)
                 if (plan.Absorbs(_segments[index].SpeakerId))
                     _segments[index] = _segments[index] with { SpeakerId = plan.KeptId };
@@ -180,12 +192,15 @@ public sealed class MeetingVisualizationSession
             TopicCluster topic;
             if (existingTopicId is not null)
             {
+                // A previous model redirect may have merged this ID; always update its surviving
+                // canonical topic rather than reviving the old one.
                 existingTopicId = ResolveTopicIdLocked(existingTopicId);
                 topic = _topics.SingleOrDefault(item => item.Id == existingTopicId)
                     ?? throw new InvalidOperationException("The supplied topic ID does not exist.");
             }
             else
             {
+                // Allocate IDs locally so topic identity does not depend on model-generated text.
                 var id = $"topic-{++_nextTopic:D4}";
                 topic = new(id, clean, [clean], throughSegmentOrdinal, throughSegmentOrdinal);
                 _topics.Add(topic);
@@ -193,6 +208,7 @@ public sealed class MeetingVisualizationSession
 
             var aliases = topic.Aliases.Contains(clean, StringComparer.OrdinalIgnoreCase)
                 ? topic.Aliases : topic.Aliases.Append(clean).ToArray();
+            // Keep prior labels as aliases, but update the current label and segment span.
             var updated = topic with
             {
                 Label = clean,
@@ -202,6 +218,8 @@ public sealed class MeetingVisualizationSession
             };
             _topics[_topics.IndexOf(topic)] = updated;
             if (_trail.Count == 0 || ResolveTopicIdLocked(_trail[^1].TopicId) != updated.Id)
+                // The trail records topic changes only; repeated model updates to the same topic
+                // do not create noisy duplicate visits.
                 _trail.Add(new($"occ-{++_nextOccurrence:D6}", updated.Id, transcriptRevision,
                     throughSegmentOrdinal, clean));
             publish = ChangedLocked();
@@ -226,6 +244,8 @@ public sealed class MeetingVisualizationSession
             foreach (var item in snapshot.Items)
                 foreach (var source in item.Sources)
                 {
+                    // Refresh the same URL in place so its stable evidence ID survives while
+                    // title, date, and explanation can be updated from the latest lookup.
                     const VisualizationProvenance provenance =
                         VisualizationProvenance.RelatedSourceSuggestion;
                     var existing = _evidence.Values.FirstOrDefault(value =>
@@ -258,6 +278,8 @@ public sealed class MeetingVisualizationSession
     {
         ArgumentNullException.ThrowIfNull(delta);
         bool publish;
+        // Delta-only callers do not change topic identities; validate the additions against the
+        // current document snapshot under the same lock used for the eventual commit.
         lock (_gate)
             publish = ApplyAnalysisLocked(new([], delta), SnapshotLocked(), requireTopicAssignments: false);
         PublishChanged(publish);
@@ -273,6 +295,8 @@ public sealed class MeetingVisualizationSession
         ArgumentNullException.ThrowIfNull(analyzedPrefix);
         ArgumentNullException.ThrowIfNull(result);
         bool publish;
+        // Full analysis is checked against the exact prefix that was sent to the model so a
+        // response cannot be applied to a different recording or corrected transcript.
         lock (_gate)
             publish = ApplyAnalysisLocked(result, analyzedPrefix, requireTopicAssignments: true);
         PublishChanged(publish);
@@ -284,6 +308,8 @@ public sealed class MeetingVisualizationSession
         bool requireTopicAssignments)
     {
         RequireSession();
+        // Model work happens outside the session lock. Recheck the analyzed prefix before
+        // changing anything so stale replies cannot overwrite newer transcript state.
         if (analyzedPrefix.SessionId != _sessionId ||
             analyzedPrefix.TranscriptRevision > _transcriptRevision ||
             analyzedPrefix.Segments.Count > _segments.Count)
@@ -322,6 +348,8 @@ public sealed class MeetingVisualizationSession
             item => item.OccurrenceId, StringComparer.Ordinal);
         foreach (var assignment in result.TopicAssignments)
         {
+            // Apply each model-declared merge to temporary copies first. The real collections
+            // are not changed until all assignments and evidence pass validation.
             var label = Clean(assignment.Label);
             if (label.Length == 0 || label.Length > TopicLabelCharacterLimit)
                 throw new InvalidOperationException("Topic assignment is invalid.");
@@ -334,6 +362,8 @@ public sealed class MeetingVisualizationSession
             var topic = sourceTopic;
             if (assignment.RedirectToTopicId is not null)
             {
+                // A redirect is the model's explicit identity decision; do not infer merges by
+                // comparing topic wording in the client.
                 var existingTopicId = ResolveTopicId(assignment.RedirectToTopicId, redirects);
                 topic = topics.SingleOrDefault(item => item.Id == existingTopicId)
                     ?? throw new InvalidOperationException("Topic assignment references an unknown topic.");
@@ -352,6 +382,8 @@ public sealed class MeetingVisualizationSession
                     topics[topics.FindIndex(item => item.Id == topic.Id)] = topic;
                     topics.Remove(sourceTopic);
                     redirects[sourceTopic.Id] = topic.Id;
+                    // Flatten redirect chains after each merge so later links resolve directly
+                    // to the surviving topic.
                     foreach (var key in redirects.Keys.ToArray())
                         redirects[key] = ResolveTopicId(redirects[key], redirects);
                 }
@@ -379,6 +411,8 @@ public sealed class MeetingVisualizationSession
                 .Distinct(StringComparer.OrdinalIgnoreCase).Count() > 1))
             throw new InvalidOperationException(
                 "Assignments for one canonical topic must use one stable label.");
+        // Distinct canonical topics need distinct labels; fail the whole update if the model
+        // returned duplicates instead of silently choosing one.
         if (topics.GroupBy(item => Clean(item.Label), StringComparer.OrdinalIgnoreCase)
             .Any(group => group.Count() > 1))
             throw new InvalidOperationException(
@@ -395,6 +429,8 @@ public sealed class MeetingVisualizationSession
                 : item)
             .OrderBy(item => item.ThroughSegmentOrdinal), redirects);
 
+        // Remap existing references when a topic was merged, then validate and add the new
+        // evidence before validating questions, actions, decisions, and links that cite it.
         var evidence = _evidence.Values.ToDictionary(item => item.Id, item => item.TopicId is null
             ? item : item with { TopicId = ResolveTopicId(item.TopicId, redirects) }, StringComparer.Ordinal);
         foreach (var item in result.Delta.Evidence)
@@ -447,6 +483,8 @@ public sealed class MeetingVisualizationSession
             ? item : item with { TopicId = ResolveTopicId(item.TopicId, redirects) }, StringComparer.Ordinal);
         foreach (var question in result.Delta.Questions)
         {
+            // Questions must point only to existing topics and transcript-backed citations;
+            // retrieved suggestions cannot answer a participant's meeting question.
             var remapped = question.TopicId is null
                 ? question : question with { TopicId = ResolveTopicId(question.TopicId, redirects) };
             if (!Enum.IsDefined(remapped.QuestionState) ||
@@ -469,6 +507,8 @@ public sealed class MeetingVisualizationSession
             .ToDictionary(item => item.Id, StringComparer.Ordinal);
         foreach (var link in result.Delta.ExplainedTopicLinks)
         {
+            // Resolve merged topic IDs first, then reject self-links and require transcript
+            // evidence on both sides of any remaining relation.
             var remapped = link with
             {
                 FromTopicId = ResolveTopicId(link.FromTopicId, redirects),
@@ -504,6 +544,8 @@ public sealed class MeetingVisualizationSession
             ? item : item with { TopicId = ResolveTopicId(item.TopicId, redirects) }, StringComparer.Ordinal);
         foreach (var action in result.Delta.Actions)
         {
+            // Actions are displayable only when they cite transcript facts, never a retrieved
+            // source or an unsupported inference.
             var remapped = action.TopicId is null
                 ? action : action with { TopicId = ResolveTopicId(action.TopicId, redirects) };
             if (!Enum.IsDefined(remapped.State))
@@ -517,6 +559,7 @@ public sealed class MeetingVisualizationSession
             ? item : item with { TopicId = ResolveTopicId(item.TopicId, redirects) }, StringComparer.Ordinal);
         foreach (var decision in result.Delta.Decisions)
         {
+            // Decisions use the same transcript-only grounding rule as action items.
             var remapped = decision.TopicId is null
                 ? decision : decision with { TopicId = ResolveTopicId(decision.TopicId, redirects) };
             ValidateGroundedStateItem(
@@ -526,6 +569,8 @@ public sealed class MeetingVisualizationSession
         }
         var throughOrdinal = result.ThroughSegmentOrdinal ??
             result.SuppliedSegmentOrdinals.DefaultIfEmpty(_lastAnalyzedOrdinal).Max();
+        // Verify the model's analysis cursor against the exact source window before recording
+        // progress; corrections remain pending until the corrected range has been reanalyzed.
         if (throughOrdinal < 0 || throughOrdinal > analyzedPrefix.Segments.Count)
             throw new InvalidOperationException("Visualization analysis cursor is invalid.");
         if (result.SuppliedSegmentOrdinals.Count > 0 &&
@@ -535,6 +580,7 @@ public sealed class MeetingVisualizationSession
                  ordinal => ordinal < 1 || ordinal > analyzedPrefix.Segments.Count) ||
              throughOrdinal != result.SuppliedSegmentOrdinals.Max()))
             throw new InvalidOperationException("Visualization source segment window is invalid.");
+        // Commit the already-validated copies together. No partially applied result is visible.
         _topics.Clear();
         _topics.AddRange(topics);
         _topicRedirects.Clear();
@@ -561,6 +607,8 @@ public sealed class MeetingVisualizationSession
         lock (_gate)
         {
             RequireSession();
+            // Closing prevents transcript/topic edits but leaves speaker corrections available
+            // for a saved meeting that needs cleanup before persistence.
             _endedAt = endedAt;
             _complete = isComplete;
             _closed = true;
@@ -578,6 +626,8 @@ public sealed class MeetingVisualizationSession
     private MeetingVisualizationDocument SnapshotLocked()
     {
         RequireSession();
+        // Copy every collection while holding the lock; the returned document is a stable
+        // point-in-time input for analysis, persistence, and UI rendering.
         return new(CurrentSchemaVersion, _sessionId, _title, _startedAt, _endedAt,
             _transcriptRevision, _complete, _segments.ToArray(), _speakers.Values.ToArray(),
             _topics.ToArray(), _trail.ToArray(), _questions.Values.ToArray(),
@@ -595,6 +645,7 @@ public sealed class MeetingVisualizationSession
         bool publish;
         lock (_gate)
         {
+            // Clear the model but still publish a revision so observers can discard old views.
             ClearLocked();
             publish = ChangedLocked();
         }
@@ -604,6 +655,8 @@ public sealed class MeetingVisualizationSession
     private void ValidateEvidence(VisualizationEvidence evidence, IReadOnlyList<TopicCluster>? topics = null)
     {
         topics ??= _topics;
+        // All source URLs are treated as untrusted input, even when they came from an earlier
+        // lookup or persisted document.
         if (string.IsNullOrWhiteSpace(evidence.Id) || !Enum.IsDefined(evidence.Origin) ||
             !Enum.IsDefined(evidence.Provenance))
             throw new InvalidOperationException("Evidence ID, origin, and provenance are required.");
@@ -613,6 +666,8 @@ public sealed class MeetingVisualizationSession
             throw new InvalidOperationException("Evidence contains an unsafe source URL.");
         if (evidence.Provenance == VisualizationProvenance.TranscriptFact)
         {
+            // A transcript fact must resolve to an actual segment and have a compact label and
+            // summary suitable for the evidence panel.
             if (evidence.Origin == EvidenceOrigin.RelatedContext || evidence.SegmentOrdinal is null ||
                 _segments.All(segment => segment.Ordinal != evidence.SegmentOrdinal) ||
                 evidence.TopicId is null ||
@@ -624,6 +679,7 @@ public sealed class MeetingVisualizationSession
         }
         else if (evidence.Provenance == VisualizationProvenance.RelatedSourceSuggestion)
         {
+            // Related sources are suggestions only and must retain a safe citation to be useful.
             if (evidence.Origin != EvidenceOrigin.RelatedContext ||
                 string.IsNullOrWhiteSpace(evidence.SourceTitle) ||
                 !SafeHttps(evidence.SourceUrl))
@@ -637,6 +693,7 @@ public sealed class MeetingVisualizationSession
     private static IReadOnlyList<VisualizationEvidence> RequireEvidence(
         IReadOnlyList<string> ids, IReadOnlyDictionary<string, VisualizationEvidence> evidence, bool allowEmpty = false)
     {
+        // Validate the full reference set before returning any evidence to callers.
         if ((!allowEmpty && ids.Count == 0) || ids.Any(id => !evidence.ContainsKey(id)))
             throw new InvalidOperationException("Evidence references are missing or invalid.");
         return ids.Select(id => evidence[id]).ToArray();
@@ -651,6 +708,7 @@ public sealed class MeetingVisualizationSession
         IReadOnlyDictionary<string, VisualizationEvidence> evidence,
         string name)
     {
+        // Shared checks keep actions and decisions bounded and transcript-grounded.
         if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(text) || text.Length > 240 ||
             topicId is not null && topics.All(topic => topic.Id != topicId))
             throw new InvalidOperationException($"{name} is invalid.");
@@ -661,6 +719,8 @@ public sealed class MeetingVisualizationSession
 
     private void InvalidateAnalysisFromLocked(int ordinal)
     {
+        // Keep earlier analysis intact. Remove only generated evidence that cites the corrected
+        // segment or a later one, then remove every item that depended on that evidence.
         _reanalysisFromOrdinal = Math.Min(_reanalysisFromOrdinal ?? ordinal, ordinal);
         var removedEvidence = _evidence.Values
             .Where(item => item.Origin == EvidenceOrigin.Analysis &&
@@ -680,6 +740,7 @@ public sealed class MeetingVisualizationSession
         Func<T, IReadOnlyList<string>> evidenceIds,
         IReadOnlySet<string> removedEvidence)
     {
+        // Materialize the keys first because the dictionary is changed during the removal pass.
         foreach (var id in values
             .Where(item => evidenceIds(item.Value).Any(removedEvidence.Contains))
             .Select(item => item.Key)
@@ -689,6 +750,8 @@ public sealed class MeetingVisualizationSession
 
     private static void RequireUnique(IEnumerable<string> ids, string name)
     {
+        // Stable IDs are map keys throughout the document; duplicates would overwrite entries
+        // and make a model response ambiguous.
         var values = ids.ToArray();
         if (values.Any(string.IsNullOrWhiteSpace) ||
             values.Distinct(StringComparer.Ordinal).Count() != values.Length)
@@ -697,6 +760,7 @@ public sealed class MeetingVisualizationSession
 
     private static void Replace<T>(Dictionary<string, T> target, Dictionary<string, T> values)
     {
+        // Replace only after a complete candidate dictionary has passed validation.
         target.Clear();
         foreach (var item in values) target.Add(item.Key, item.Value);
     }
@@ -708,6 +772,8 @@ public sealed class MeetingVisualizationSession
         var result = new List<TopicOccurrence>();
         foreach (var occurrence in occurrences)
         {
+            // Redirected neighboring occurrences become one trail visit, while a later return
+            // to the topic remains a separate chronological visit.
             var canonical = occurrence with { TopicId = ResolveTopicId(occurrence.TopicId, redirects) };
             if (result.Count == 0 || result[^1].TopicId != canonical.TopicId)
                 result.Add(canonical);
@@ -735,6 +801,7 @@ public sealed class MeetingVisualizationSession
 
     private bool ChangedLocked()
     {
+        // Queue each revision so nested changes raised by observers are delivered in order.
         _revision++;
         _pendingChangedRevisions.Enqueue(_revision);
         if (_publishingChanges) return false;
@@ -746,6 +813,8 @@ public sealed class MeetingVisualizationSession
     {
         if (!publish) return;
         Exception? firstFailure = null;
+        // Drain outside the lock to allow handlers to read the session or trigger another
+        // update. Continue notifying remaining handlers, then rethrow the first failure.
         while (true)
         {
             long revision;
@@ -771,6 +840,7 @@ public sealed class MeetingVisualizationSession
 
     private void ClearLocked()
     {
+        // Reset data and generated-ID counters together so IDs are unique within each session.
         _segments.Clear();
         _speakers.Clear();
         _speakerAliases.Clear();
@@ -812,6 +882,8 @@ public sealed class MeetingVisualizationSession
     {
         var current = topicId;
         var visited = new HashSet<string>(StringComparer.Ordinal);
+        // Follow explicit merge redirects and detect cycles instead of returning an arbitrary
+        // topic if the redirect map is corrupted.
         while (redirects.TryGetValue(current, out var next))
         {
             if (!visited.Add(current))

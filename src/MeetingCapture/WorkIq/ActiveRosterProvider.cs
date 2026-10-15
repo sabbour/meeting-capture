@@ -68,6 +68,8 @@ public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIde
 
     public async Task<ActiveMeetingIdentitySnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
     {
+        // Bound this optional UI inspection so meeting detection never waits indefinitely for
+        // Teams accessibility to respond.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(_timeout);
         try
@@ -77,6 +79,7 @@ public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIde
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            // A timeout means the title is unknown, not that there is no active meeting.
             return new(null, "Teams meeting title inspection timed out.");
         }
         catch (OperationCanceledException) { throw; }
@@ -89,6 +92,7 @@ public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIde
 
     internal static ActiveMeetingIdentitySnapshot ParseHelperResult(string json)
     {
+        // Reject oversized or incomplete helper output before trusting any title from it.
         if (string.IsNullOrWhiteSpace(json) || json.Length > 1_000_000)
             return new(null, "Teams accessibility helper returned an invalid response.");
         var result = JsonSerializer.Deserialize<IdentityHelperResult>(json,
@@ -96,6 +100,7 @@ public sealed class TeamsUiAutomationMeetingIdentityProvider : IActiveMeetingIde
         if (result?.CallControlsVerified != true || string.IsNullOrWhiteSpace(result.CallTitle) ||
             result.CallTitle.Length > 256)
             return new(null, result?.Limitation ?? "No unique active Teams meeting title was exposed.");
+        // The helper proves the title only when it also found the joined-call controls.
         return new(result.CallTitle.Trim(), "Title verified from the active Teams joined-call surface.");
     }
 
@@ -128,6 +133,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
 
     public async Task<ActiveRosterSnapshot> GetSnapshotAsync(CancellationToken cancellationToken)
     {
+        // Keep roster inspection short; the app can continue recording without a roster.
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(_timeout);
         try
@@ -137,6 +143,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
+            // Preserve uncertainty explicitly. A timeout must never look like an empty live roster.
             return Snapshot(ActiveRosterAvailability.Indeterminate,
                 "Teams accessibility inspection timed out; no roster was inferred.");
         }
@@ -151,6 +158,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
 
     internal static ActiveRosterSnapshot ParseHelperResult(string json)
     {
+        // Treat helper output as untrusted IPC data and reject an oversized payload before parsing.
         if (string.IsNullOrWhiteSpace(json) || json.Length > 1_000_000)
             return Snapshot(ActiveRosterAvailability.Indeterminate,
                 "Teams accessibility helper returned an invalid response.");
@@ -160,6 +168,8 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
             return Snapshot(ActiveRosterAvailability.Indeterminate,
                 "Teams accessibility helper returned an invalid response.");
         if (result.State == "unavailable")
+            // "Unavailable" means there is no joined Participants surface; it is different from
+            // an ambiguous response that might have described a roster.
             return Snapshot(ActiveRosterAvailability.Unavailable,
                 result.Limitation ?? "No joined Teams meeting Participants surface is currently available.",
                 result.ObservedAt);
@@ -174,6 +184,8 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
             return Snapshot(ActiveRosterAvailability.Indeterminate,
                 "Teams accessibility response exceeded roster bounds.",
                 result.ObservedAt);
+        // The roster contains only rows currently visible to UI Automation. Mark it partial and
+        // never treat displayed names as proof of who spoke.
         return new ActiveRosterSnapshot(
             ActiveRosterAvailability.VerifiedLive,
             ActiveRosterSource.TeamsUiAutomation,
@@ -194,6 +206,8 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
 
     internal static async Task<string> RunHelperProcessAsync(CancellationToken cancellationToken)
     {
+        // Re-launch this app in a short-lived helper mode so UI Automation runs outside the
+        // recording window's normal work path.
         var executable = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(executable))
             throw new InvalidOperationException("Process path unavailable.");
@@ -212,6 +226,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
         var errors = process.StandardError.ReadToEndAsync();
         try
         {
+            // Drain both pipes while the helper runs so neither redirected stream can block it.
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
             if (process.ExitCode != 0) throw new InvalidOperationException("Teams roster helper failed.");
             await errors.ConfigureAwait(false);
@@ -219,6 +234,7 @@ public sealed class TeamsUiAutomationRosterProvider : IActiveRosterProvider
         }
         catch (OperationCanceledException)
         {
+            // Kill the helper tree on timeout, then drain its pipes before disposing the process.
             if (!process.HasExited)
             {
                 try { process.Kill(entireProcessTree: true); }
@@ -257,6 +273,8 @@ internal static partial class TeamsUiAutomationRosterHelper
         var observedAt = DateTimeOffset.UtcNow;
         try
         {
+            // Find visible Teams windows belonging to the desktop client, then require exactly
+            // one window with joined-call controls before trusting its Participants list.
             var teamsPids = Process.GetProcessesByName("ms-teams").Select(process => process.Id).ToHashSet();
             if (teamsPids.Count == 0)
                 return Result("unavailable", observedAt,
@@ -272,6 +290,8 @@ internal static partial class TeamsUiAutomationRosterHelper
 
             var window = live[0];
             if (window.Roster is null)
+                // A joined call proves the meeting is open, but without the Participants pane
+                // there is no roster to report.
                 return Result("unavailable", observedAt, callControlsVerified: true,
                     callTitle: window.CallTitle,
                     limitation: "A joined call is visible. Open the Teams Participants pane to make its displayed roster available.");
@@ -283,6 +303,8 @@ internal static partial class TeamsUiAutomationRosterHelper
         }
         catch
         {
+            // Accessibility trees can disappear while Teams redraws. Fail closed and report
+            // uncertainty rather than returning names collected from a partial traversal.
             return Result("indeterminate", observedAt,
                 limitation: "Teams accessibility inspection failed before a roster could be verified.");
         }
@@ -290,6 +312,8 @@ internal static partial class TeamsUiAutomationRosterHelper
 
     private static WindowObservation InspectWindow(IntPtr handle)
     {
+        // Read one window tree and collect independent signals: call buttons, title metadata,
+        // and a visible meeting-specific list. A chat participant list is deliberately ignored.
         var root = AutomationElement.FromHandle(handle);
         var descendants = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
         var leave = false;
@@ -315,6 +339,8 @@ internal static partial class TeamsUiAutomationRosterHelper
             if (current.ControlType != ControlType.List || current.IsOffscreen || ChatRoster.IsMatch(name) ||
                 !MeetingRoster.IsMatch(name))
                 continue;
+            // Only visible ListItem descendants are reported; Teams can virtualize or collapse
+            // rows, so this cannot prove that the full participant list was observed.
             var items = element.FindAll(TreeScope.Descendants,
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
             roster = items.Cast<AutomationElement>().Where(item => !item.Current.IsOffscreen)
@@ -346,6 +372,8 @@ internal static partial class TeamsUiAutomationRosterHelper
 
     internal static string? SelectUniqueCallTitle(IEnumerable<string> candidates)
     {
+        // Multiple different title candidates are ambiguous; returning no title is safer than
+        // picking a window label or chat name by accident.
         var titles = candidates.Select(NormalizeCallTitle)
             .Where(title => title.Length is >= 2 and <= 256 && !IsGenericCallTitle(title))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -356,6 +384,7 @@ internal static partial class TeamsUiAutomationRosterHelper
 
     private static string NormalizeCallTitle(string name)
     {
+        // Accessibility labels can prefix a real meeting title with "Meeting title:".
         var value = string.Join(" ", name.Split((char[]?)null,
             StringSplitOptions.RemoveEmptyEntries));
         var separator = value.IndexOf(':');
@@ -374,6 +403,7 @@ internal static partial class TeamsUiAutomationRosterHelper
 
     private static IReadOnlyList<IntPtr> EnumerateTeamsWindows(IReadOnlySet<int> teamsPids)
     {
+        // Limit inspection to visible TeamsWebView top-level windows owned by the Teams process.
         var windows = new List<IntPtr>();
         EnumWindows((handle, _) =>
         {

@@ -65,6 +65,8 @@ public sealed class CopilotModelCatalog
         bool forceRefresh,
         CancellationToken cancellationToken)
     {
+        // Use a fast cache check first; callers that miss it wait for the gate and check again
+        // so simultaneous settings requests share a single fetch.
         if (!forceRefresh && IsFresh(_cached))
             return _cached!;
 
@@ -73,11 +75,14 @@ public sealed class CopilotModelCatalog
         {
             if (!forceRefresh && IsFresh(_cached))
                 return _cached!;
+            // The linked token preserves user cancellation while also bounding a stuck SDK call.
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             deadline.CancelAfter(_requestTimeout);
             try
             {
                 var models = (await _fetch(deadline.Token).WaitAsync(deadline.Token).ConfigureAwait(false))
+                    // Ignore malformed entries, fill a missing display name from the ID, then
+                    // make the result stable for the settings list.
                     .Where(model => !string.IsNullOrWhiteSpace(model.Id))
                     .Select(model => new CopilotModelOption(
                         model.Id.Trim(),
@@ -90,6 +95,7 @@ public sealed class CopilotModelCatalog
                     throw new CopilotModelCatalogException(CopilotModelCatalogFailure.Empty);
                 return _cached = new CopilotModelCatalogSnapshot(models, DateTimeOffset.UtcNow);
             }
+            // Keep caller cancellation distinct from our timeout and from service failures.
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (OperationCanceledException ex) when (deadline.IsCancellationRequested)
             {
@@ -113,6 +119,8 @@ public sealed class CopilotModelCatalog
     private static async Task<IReadOnlyList<CopilotModelOption>> FetchAsync(
         CancellationToken cancellationToken)
     {
+        // Model discovery uses the same local Copilot CLI runtime as requests, but a short-lived
+        // client keeps catalog loading independent from the notes service's request lifecycle.
         await using var client = new CopilotClient(new CopilotClientOptions
         {
             Mode = CopilotClientMode.CopilotCli

@@ -11,6 +11,8 @@ public static class IntelligenceResponseParser
 {
     public static string ParseSummary(string response, string provider, string? model)
     {
+        // Some callers expect plain text and others parse JSON next; this first check gives both
+        // paths the same explicit empty-response error.
         if (string.IsNullOrWhiteSpace(response))
             throw IntelligenceErrors.Create(IntelligenceFailureKind.EmptyResponse, provider, model);
         return response.Trim();
@@ -21,6 +23,8 @@ public static class IntelligenceResponseParser
         ParseSummary(response, provider, model);
         try
         {
+            // Insight prompts return only arrays of strings; the shared parser also permits one
+            // JSON string where older model responses used that shape.
             using var document = JsonDocument.Parse(response);
             var values = Strings(document.RootElement);
             if (values.Count > 5) throw new JsonException();
@@ -52,6 +56,8 @@ public static class IntelligenceResponseParser
         ParseSummary(response, provider, model);
         try
         {
+            // Topic and catch-up prompts share one JSON property but have different size limits.
+            // Requiring exactly one property prevents provider wrappers from being mistaken as data.
             using var document = ParseJsonObjectResponse(response);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object || root.EnumerateObject().Count() != 1)
@@ -70,6 +76,8 @@ public static class IntelligenceResponseParser
         ParseSummary(response, provider, model);
         try
         {
+            // Build the result only after parsing the whole response inside this guarded block;
+            // a missing or wrongly typed field therefore becomes one safe malformed-response error.
             using var document = JsonDocument.Parse(response);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object) throw new JsonException();
@@ -85,6 +93,8 @@ public static class IntelligenceResponseParser
             if (notes.EstimatedDurationMinutes < 0) throw new JsonException();
             if (root.TryGetProperty("nuances", out var nuances))
                 notes.Nuances = OptionalString(nuances) ?? string.Empty;
+            // Required arrays deliberately fail if omitted; optional values are limited to fields
+            // that the prompt explicitly allows to be unknown or absent.
             notes.Topics.AddRange(Strings(root.GetProperty("topics")));
             notes.KeyDiscussionPoints.AddRange(Strings(root.GetProperty("keyDiscussionPoints")));
             notes.Decisions.AddRange(Strings(root.GetProperty("decisions")));
@@ -106,6 +116,7 @@ public static class IntelligenceResponseParser
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException or FormatException)
         {
+            // Avoid returning half-populated notes when any nested participant or action is invalid.
             throw IntelligenceErrors.Create(IntelligenceFailureKind.MalformedResponse, provider, model);
         }
     }
@@ -116,6 +127,8 @@ public static class IntelligenceResponseParser
         ParseSummary(response, provider, model);
         try
         {
+            // Apply the same strict JSON parsing used for topic replies, then validate each
+            // collection's types and size before the session model receives any of it.
             using var document = ParseJsonObjectResponse(response);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object) throw new JsonException();
@@ -141,6 +154,8 @@ public static class IntelligenceResponseParser
                         RequiredString(item.GetProperty("summary"), 480),
                         NullableString(item, "presentationLabel", 120)))
                     .TakeBounded(100);
+                // A topic cannot display two takeaway branches with the same label; reject the
+                // whole update rather than letting duplicate cards enter persisted state.
                 if (evidence
                     .Where(item => item.Provenance == VisualizationProvenance.TranscriptFact)
                     .GroupBy(item => $"{item.TopicId}\0{item.PresentationLabel}",
@@ -196,6 +211,8 @@ public static class IntelligenceResponseParser
         }
         catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
         {
+            // The session applies only fully parsed deltas, so malformed model output never
+            // partially changes the live visualization.
             throw IntelligenceErrors.Create(IntelligenceFailureKind.MalformedResponse, provider, model);
         }
     }
@@ -224,6 +241,7 @@ public static class IntelligenceResponseParser
     private static JsonDocument ParseJsonObjectResponse(string response)
     {
         var payload = response.Trim();
+        // Tolerate a single outer Markdown fence but not explanatory text around the JSON.
         if (payload.StartsWith("```", StringComparison.Ordinal) &&
             payload.EndsWith("```", StringComparison.Ordinal))
         {

@@ -53,6 +53,7 @@ public sealed class RelatedContextCoordinator : IDisposable
     /// </summary>
     public Task<RelatedContextStatus> RefreshAsync(ContextQuery query, CancellationToken cancellationToken)
     {
+        // Reject canceled or invalid input before taking the coordinator lock.
         cancellationToken.ThrowIfCancellationRequested();
         Validate(query);
         Task<RelatedContextStatus> request;
@@ -64,6 +65,8 @@ public sealed class RelatedContextCoordinator : IDisposable
             var topic = CleanTopic(query.Topic);
             var topicId = CleanTopicId(query.TopicId);
             var sourceRevision = _source.Revision;
+            // Topic IDs, session IDs, and source revisions define whether an old result or
+            // cached snapshot still belongs to this request.
             var sameSessionSource = Status.SessionId == query.SessionId &&
                 Status.SourceRevision == sourceRevision;
             var sameContext = sameSessionSource &&
@@ -78,14 +81,18 @@ public sealed class RelatedContextCoordinator : IDisposable
 
             if (staleSourceRevision && !query.ForceRefresh)
             {
+                // A late UI update for an older transcript revision cannot replace newer state.
                 request = Task.FromResult(Status);
             }
             else if (_inFlight is not null && sameActiveRequest && !query.ForceRefresh)
             {
+                // Identical callers share the same network work instead of issuing duplicates.
                 request = _inFlight;
             }
             else if (_inFlight is not null && _source.IsAvailable && sameSessionSource)
             {
+                // While one topic is loading, keep only the newest pending request per topic;
+                // callers for that topic all wait on its shared completion.
                 var pending = _queued.FirstOrDefault(item => item.Query.TopicId == topicId);
                 if (pending is null)
                 {
@@ -105,6 +112,8 @@ public sealed class RelatedContextCoordinator : IDisposable
 
                 if (!_source.IsAvailable)
                 {
+                    // Source sign-in or availability can change while a request is in flight.
+                    // Publish an explicit unavailable state rather than an empty success.
                     _generation++;
                     _requestCancellation?.Cancel();
                     _requestCancellation?.Dispose();
@@ -121,11 +130,15 @@ public sealed class RelatedContextCoordinator : IDisposable
                 }
                 else if (_inFlight is not null && sameContext)
                 {
+                    // A forced refresh does not start a second request for a context already
+                    // being fetched; it joins the active request.
                     request = _inFlight;
                 }
                 else if (!query.ForceRefresh && _cached is not null && sameContext &&
                     Status.TranscriptRevision == query.TranscriptRevision)
                 {
+                    // Reuse a result only for the exact transcript revision; a newer revision
+                    // may change which sources are relevant even when the topic label is stable.
                     Status = Status with
                     {
                         State = RelatedContextState.Cached,
@@ -140,6 +153,7 @@ public sealed class RelatedContextCoordinator : IDisposable
                 }
                 else
                 {
+                    // A new generation makes any result from the canceled request stale.
                     _requestCancellation?.Cancel();
                     _requestCancellation?.Dispose();
                     _requestCancellation = new();
@@ -157,6 +171,8 @@ public sealed class RelatedContextCoordinator : IDisposable
             }
         }
         if (changed is not null) Publish(changed, changedVersion);
+        // Canceling this caller stops only its wait. The shared lookup remains alive for other
+        // callers unless the coordinator explicitly replaced or invalidated it.
         return request.WaitAsync(cancellationToken);
     }
 
@@ -168,6 +184,7 @@ public sealed class RelatedContextCoordinator : IDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            // ResetLocked cancels both active and queued work and removes cached context.
             ResetLocked(string.Empty, string.Empty, -1, _source.Revision, cancel: true);
             changed = Status;
             changedVersion = _statusVersion;
@@ -178,11 +195,13 @@ public sealed class RelatedContextCoordinator : IDisposable
     private async Task<RelatedContextStatus> FetchAsync(
         ContextQuery query, string topicId, long sourceRevision, long generation, CancellationToken cancellationToken)
     {
+        // Let RefreshAsync return before invoking a source that could complete synchronously.
         await Task.Yield();
         RelatedContextSnapshot? snapshot = null;
         string? failure = null;
         try
         {
+            // Normalize at the boundary so every source gets the same URL, text, and item limits.
             snapshot = RelatedContextNormalizer.Normalize(
                 await Task.Run(
                     () => _source.GetRelatedContextAsync(query, cancellationToken),
@@ -191,6 +210,7 @@ public sealed class RelatedContextCoordinator : IDisposable
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception ex)
         {
+            // Keep the UI message safe while diagnostics retain the failure category and type.
             MeetingCapture.Diagnostics.RelatedDiagnostics.Record("coordinator", _source.IsAvailable, ex);
             failure = ex is MeetingCapture.WorkIq.WorkIqException workIq
                 ? MeetingCapture.WorkIq.WorkIqService.RelatedContextUnavailableMessage(workIq)
@@ -206,6 +226,8 @@ public sealed class RelatedContextCoordinator : IDisposable
         TaskCompletionSource<RelatedContextStatus>? queuedCompletion = null;
         lock (_gate)
         {
+            // A source, topic, transcript, or session may have changed while awaiting I/O.
+            // Discard such results instead of allowing an old request to overwrite current state.
             if (_disposed || generation != _generation ||
                 _activeQuery is not { } active ||
                 active.SessionId != query.SessionId ||
@@ -220,6 +242,7 @@ public sealed class RelatedContextCoordinator : IDisposable
 
             if (_source.Revision != sourceRevision)
             {
+                // Even a successful response is unusable if sign-in state changed during the call.
                 ResetLocked(query.SessionId, query.Topic, _latestTranscriptRevision, _source.Revision, cancel: false);
                 status = Status;
                 publish = true;
@@ -261,6 +284,8 @@ public sealed class RelatedContextCoordinator : IDisposable
             publish = false;
             if (!_disposed && generation == _generation && _queued.Count > 0)
             {
+                // Start the next topic only after the current status has been published, so
+                // version checks do not hide the result from the completed topic.
                 var pending = _queued[0];
                 _queued.RemoveAt(0);
                 var queued = pending.Query;
@@ -311,6 +336,7 @@ public sealed class RelatedContextCoordinator : IDisposable
     {
         try
         {
+            // Complete all callers waiting on the queued topic with the same result or failure.
             completion.TrySetResult(await request.ConfigureAwait(false));
         }
         catch (OperationCanceledException)
@@ -326,6 +352,8 @@ public sealed class RelatedContextCoordinator : IDisposable
     private void ResetLocked(
         string sessionId, string topic, long transcriptRevision, long sourceRevision, bool cancel)
     {
+        // Queued callers are waiting on these task sources, so cancel them before clearing
+        // the queue; otherwise their waits would never complete.
         foreach (var pending in _queued)
             pending.Completion.TrySetCanceled();
         _queued.Clear();
@@ -375,6 +403,7 @@ public sealed class RelatedContextCoordinator : IDisposable
     {
         lock (_gate)
         {
+            // State changes can race with UI dispatch; publish only the newest version.
             if (_disposed || version != _statusVersion)
                 return;
             StatusChanged?.Invoke(this, status);
@@ -386,6 +415,7 @@ public sealed class RelatedContextCoordinator : IDisposable
         lock (_gate)
         {
             if (_disposed) return;
+            // Invalidate callbacks before canceling so their completion cannot publish afterward.
             _disposed = true;
             _generation++;
             _requestCancellation?.Cancel();

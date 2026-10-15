@@ -37,6 +37,8 @@ public sealed partial class WorkIqMcpClient
     /// <summary>Plain words only, so topic text can never inject search operators or syntax.</summary>
     public static IReadOnlyList<string> RelatedContextKeywords(string topic)
     {
+        // Treat topic text only as words. Dropping search operators keeps user or transcript
+        // content from changing the meaning of the provider's query.
         var words = SearchWord.Matches(RelatedContextSearchQuery(topic))
             .Select(match => match.Value)
             .Where(word => word.Length is > 1 and <= 40 && !SearchOperators.Contains(word))
@@ -50,6 +52,8 @@ public sealed partial class WorkIqMcpClient
 
     public static JsonObject SearchArguments(string entityType, IReadOnlyList<string> keywords, int size)
     {
+        // Build the provider request as JSON nodes rather than concatenated JSON text, and limit
+        // both the entity family and result count to the supported search surface.
         if (entityType is not ("event" or "chatMessage" or "driveItem") || size is < 1 or > MaxSearchHits ||
             keywords.Count == 0)
             throw new ArgumentException("Unsupported search request.", nameof(entityType));
@@ -78,6 +82,8 @@ public sealed partial class WorkIqMcpClient
     /// occurrences of a recurring series, so the calendar is read for the same subject.</summary>
     public static string MeetingSubjectLookupPath(string subject, DateTimeOffset now)
     {
+        // Search results can point to a recurring meeting's future instance, so later lookup
+        // uses the exact subject in a bounded past calendar window.
         if (subject.Length is 0 or > 300 || subject.Any(char.IsControl))
             throw new ArgumentException("Unsupported meeting subject.", nameof(subject));
         return "/me/calendarView?startDateTime=" +
@@ -91,6 +97,8 @@ public sealed partial class WorkIqMcpClient
 
     public static string? TeamsMembersPath(JsonElement resource)
     {
+        // Channel messages use a team and channel path; chats use their chat ID. If neither
+        // complete identity is present, avoid making an invalid membership request.
         if (resource.ValueKind != JsonValueKind.Object)
             return null;
         if (resource.TryGetProperty("channelIdentity", out var channel) &&
@@ -110,6 +118,8 @@ public sealed partial class WorkIqMcpClient
         string token, string topic, string capability, DateTimeOffset retrievedAt,
         WorkIqCurrentIdentity currentIdentity, CancellationToken ct)
     {
+        // Use plain bounded keywords, then route each source family through its own safe Graph
+        // fetch shape. The capability comes from the fixed list configured by WorkIqService.
         var keywords = RelatedContextKeywords(topic);
         switch (capability)
         {
@@ -122,6 +132,8 @@ public sealed partial class WorkIqMcpClient
                 if (!_searchAvailable)
                     throw new WorkIqException(WorkIqFailure.Unsupported, "shape:searchTool");
                 var hits = ParseSearchHits(await SearchAsync(token, "event", keywords, ct).ConfigureAwait(false));
+                // Search supplies meeting subjects, not trustworthy prior meeting instances.
+                // Resolve those subjects against the past calendar before showing anything.
                 var subjects = MeetingSubjects(hits);
                 if (subjects.Count == 0)
                     return new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
@@ -138,6 +150,8 @@ public sealed partial class WorkIqMcpClient
                 var hits = ParseSearchHits(await SearchAsync(token, "chatMessage", keywords, ct).ConfigureAwait(false));
                 if (hits.Count == 0)
                     return new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
+                // Membership lookups are optional and capped. They can prove involvement, but
+                // search results may still be shown without claiming the user took part.
                 var paths = hits.Select(hit => TeamsMembersPath(hit.Resource))
                     .OfType<string>()
                     .Distinct(StringComparer.Ordinal)
@@ -176,6 +190,8 @@ public sealed partial class WorkIqMcpClient
     {
         try
         {
+            // Work IQ wraps Graph search results in nested response/container arrays. Skip
+            // incomplete individual entries, but stop at the global cap.
             ThrowIfToolError(result);
             if (!result.TryGetProperty("structuredContent", out var structured) ||
                 structured.ValueKind != JsonValueKind.Object)
@@ -226,6 +242,7 @@ public sealed partial class WorkIqMcpClient
     /// <summary>Distinct exact subjects of meeting hits, in search rank order.</summary>
     public static IReadOnlyList<WorkIqMeetingSubject> MeetingSubjects(IReadOnlyList<WorkIqSearchHit> hits)
     {
+        // Keep exact subjects in provider rank order because meeting lookups are limited.
         var subjects = new List<WorkIqMeetingSubject>();
         foreach (var hit in hits)
         {
@@ -245,6 +262,8 @@ public sealed partial class WorkIqMcpClient
     public static RelatedContextSnapshot EmailSearchContext(
         JsonElement fetchResult, DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity)
     {
+        // Graph returns multiple mail messages from the same conversation. Preserve the first
+        // ranked one and copy only structured participation fields needed by the shared parser.
         var entry = ParseFetchEntries(fetchResult, 1)[0];
         EnsureStatus(entry.Status, includeHttpCode: true);
         var hits = new JsonArray();
@@ -275,6 +294,8 @@ public sealed partial class WorkIqMcpClient
         IReadOnlyList<WorkIqMeetingSubject> subjects, JsonElement fetchResult, DateTimeOffset now,
         DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity)
     {
+        // Search can find future or recurring series entries; only exact-subject meetings that
+        // ended before now qualify as historical context.
         var entries = ParseFetchEntries(fetchResult, subjects.Count);
         if (entries.Count > 0 && entries.All(entry => entry.Status is < 200 or >= 300))
             EnsureStatus(entries[0].Status, includeHttpCode: true);
@@ -306,6 +327,8 @@ public sealed partial class WorkIqMcpClient
                 if (end <= start || end > now || end - start > TimeSpan.FromDays(1) ||
                     found.Any(existing => existing.Uid == uid && existing.Start == start))
                     continue;
+                // The same recurring instance may appear under more than one search subject;
+                // deduplicate by its calendar ID and start time.
                 found.Add((item, uid, start, subjects[index].Summary));
             }
         }
@@ -328,6 +351,8 @@ public sealed partial class WorkIqMcpClient
         IReadOnlyList<WorkIqSearchHit> searchHits, IReadOnlyList<string> memberPaths,
         JsonElement? membersResult, DateTimeOffset retrievedAt, WorkIqCurrentIdentity currentIdentity)
     {
+        // Convert each Teams search row to the common retrieval shape. Membership details are
+        // attached only when a bounded lookup succeeded; the shared parser still verifies identity.
         var members = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
         if (membersResult is { } result && memberPaths.Count > 0)
         {
@@ -378,6 +403,8 @@ public sealed partial class WorkIqMcpClient
         IReadOnlyList<WorkIqSearchHit> searchHits, DateTimeOffset retrievedAt,
         WorkIqCurrentIdentity currentIdentity)
     {
+        // Search can return files the user may open without proving they authored or attended
+        // anything, so this shape deliberately carries no participation fields.
         var hits = new JsonArray();
         foreach (var hit in searchHits)
         {
@@ -397,6 +424,9 @@ public sealed partial class WorkIqMcpClient
     {
         if (hits.Count == 0)
             return new RelatedContextSnapshot(retrievedAt, [], RelatedContextAvailability.NoEvidence);
+        // Reuse retrieval parsing for URL, source-type, title, and citation checks. Search can
+        // return accessible results without proving participation, so the parser records that
+        // uncertainty instead of dropping those results.
         var envelope = new JsonObject
         {
             ["structuredContent"] = new JsonObject
@@ -413,6 +443,8 @@ public sealed partial class WorkIqMcpClient
         string? webUrl, string entityType, string? id, string? title, string? date, string? snippet,
         string section, JsonObject participation)
     {
+        // Adapt Graph's fields to the retrieval parser's expected metadata shape without adding
+        // any fields that could falsely prove user participation.
         var general = new JsonObject();
         if (title is not null) general["title"] = title;
         if (date is not null) general["date"] = date;
@@ -431,6 +463,7 @@ public sealed partial class WorkIqMcpClient
     {
         try
         {
+            // Batch fetch must return exactly one status entry per requested path, in order.
             ThrowIfToolError(result);
             var results = result.GetProperty("structuredContent").GetProperty("results");
             if (results.ValueKind != JsonValueKind.Array || results.GetArrayLength() != expected)
@@ -455,6 +488,8 @@ public sealed partial class WorkIqMcpClient
     {
         if (result.ValueKind != JsonValueKind.Object)
             throw new WorkIqException(WorkIqFailure.Malformed, "shape:result");
+        // An explicit provider error is different from a valid empty result and must reach the
+        // caller so the retrieve-to-search fallback can make its decision.
         if (!result.TryGetProperty("isError", out var isError))
             return;
         if (isError.ValueKind == JsonValueKind.True)

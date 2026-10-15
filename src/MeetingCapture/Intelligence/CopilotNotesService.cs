@@ -278,6 +278,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     public async Task<MeetingNotes> SynthesizeAsync(
         string meetingTitle, TranscriptionResult transcript, CancellationToken cancellationToken)
     {
+        // Use one settings snapshot for both the intermediate and final requests so a settings
+        // change cannot make one synthesis combine results from two different model choices.
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
         RequireTranscript(transcript.FullText, settings, true);
         var synthesis = await BuildHierarchicalSynthesisInputAsync(
@@ -285,6 +287,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             meetingTitle,
             async (chunk, ct) =>
             {
+                // Each chunk gets its own short deadline; the final synthesis still has its
+                // separate request timeout after all chunk summaries are collected.
                 using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 deadline.CancelAfter(TimeSpan.FromSeconds(45));
                 return await RequestAsync(settings, true, AiCapability.Synthesis, ChunkSummaryPrompt,
@@ -293,6 +297,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             cancellationToken).ConfigureAwait(false);
         if (synthesis.FellBack)
             _logger.LogWarning("Chunked note synthesis was unavailable; using bounded whole-transcript synthesis.");
+        // The final pass always produces the user-facing note shape; chunk replies are only
+        // evidence-preserving intermediate summaries.
         var response = await RequestAsync(settings, true, AiCapability.Synthesis,
             synthesis.UsedHierarchy ? HierarchicalSynthesisPrompt : SystemPrompt,
             synthesis.Message,
@@ -303,6 +309,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     /// <summary>Returns a short topic label for the recent transcript, repairing the model response if needed.</summary>
     public async Task<string> SummarizeRecentAsync(string recentTranscript, CancellationToken cancellationToken)
     {
+        // The live topic is used for orientation, not as a recap or answer to transcript text.
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
         RequireTranscript(recentTranscript, settings, false);
         var input = BuildMeetingContextMessage(recentTranscript);
@@ -314,6 +321,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         string recentTranscript,
         CancellationToken cancellationToken)
     {
+        // Catch-up has its own longer recap instructions and parser limit; it is not the
+        // short topic label returned by SummarizeRecentAsync.
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
         RequireTranscript(recentTranscript, settings, false);
         var response = await RequestAsync(settings, false, AiCapability.CatchUp, CatchUpPrompt,
@@ -334,6 +343,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         MeetingVisualizationDocument document, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(document);
+        // Snapshot settings once and send only the bounded window prepared for this document.
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
         RequireTranscript(string.Join(" ", document.Segments.Select(item => item.Text)), settings, false);
         var input = BuildVisualizationInput(document);
@@ -348,6 +358,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     private async Task<string> RequestTopicWithRepairAsync(
         IntelligenceSettings settings, string input, CancellationToken cancellationToken)
     {
+        // A malformed first topic reply gets one repair attempt with the same source input.
+        // Provider, timeout, and cancellation errors are not retried as formatting problems.
         var response = await RequestAsync(settings, false, AiCapability.Intelligence, CurrentTopicPrompt,
             input, cancellationToken).ConfigureAwait(false);
         try
@@ -368,6 +380,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     private async Task<MeetingVisualizationAnalysisResult> RequestVisualizationWithRepairAsync(
         IntelligenceSettings settings, string input, long transcriptRevision, CancellationToken cancellationToken)
     {
+        // A repair is limited to schema rejection. The same transcript revision is carried on
+        // both attempts so diagnostics can tie them to the same visualization update.
         var response = await RequestAsync(settings, false, AiCapability.Visualization, VisualizationPrompt,
             input, cancellationToken, transcriptRevision).ConfigureAwait(false);
         try
@@ -389,6 +403,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
 
     private async Task<List<string>> GetInsightsAsync(string transcript, string prompt, CancellationToken ct)
     {
+        // Questions and actions share the same request flow but keep their distinct system prompt.
         var settings = _settingsManager.GetIntelligenceSnapshot().Settings;
         RequireTranscript(transcript, settings, false);
         var response = await RequestAsync(
@@ -401,6 +416,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     public async Task<(bool ok, string detail)> ValidateModelAsync(
         bool isSynthesisModel, IntelligenceSettings? overrideSettings, CancellationToken cancellationToken)
     {
+        // Settings may pass unsaved form values; fill only a missing key from the effective
+        // saved settings, while preserving an explicitly entered test key.
         var effective = _settingsManager.GetIntelligenceSnapshot().Settings;
         var settings = overrideSettings is null ? effective : WithEffectiveKey(overrideSettings, effective.ApiKey);
         try
@@ -414,6 +431,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
+            // Model validation is a UI check, so return a safe failure message instead of
+            // letting provider exceptions escape into the settings window.
             var failure = IntelligenceErrors.FromException(ex, Provider(settings), Model(settings, isSynthesisModel));
             return (false, failure.Message);
         }
@@ -440,6 +459,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         CancellationToken ct,
         long? requestRevision = null)
     {
+        // The request count prevents disposal from tearing down the shared client while work is
+        // still using it.
         lock (_lifetimeGate)
         {
             ObjectDisposedException.ThrowIf(_disposing, this);
@@ -450,6 +471,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         var requestKind = synthesis ? "synthesis" : "live intelligence";
         var elapsed = System.Diagnostics.Stopwatch.StartNew();
         var observation = _usage.Begin(capability);
+        // Capture prompt text only when the user has enabled sensitive diagnostics; regular
+        // diagnostic events still record safe provider, model, timing, and outcome fields.
         var diagnostic = _diagnostics.Begin(
             capability,
             provider,
@@ -467,8 +490,12 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         try
         {
             ct.ThrowIfCancellationRequested();
+            // Every session gets the exact selected provider/model and a locked-down tool-free
+            // configuration; no silent model fallback or unrelated SDK tools are enabled.
             var config = BuildSessionConfig(settings, synthesis, systemPrompt);
             var client = await GetClientAsync(ct).ConfigureAwait(false);
+            // Session creation has its own deadline. If the SDK ignores cancellation, retain a
+            // cleanup task so the eventual session is still disposed.
             var createCancellation = CancellationTokenSource.CreateLinkedTokenSource(ct);
             createCancellation.CancelAfter(TimeSpan.FromSeconds(30));
             var createTask = client.CreateSessionAsync(config, createCancellation.Token);
@@ -486,6 +513,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             }
             try
             {
+                // SDK events may arrive on background threads; use a gate so the final response
+                // and any late error/retry metadata are read as one consistent set.
                 var responseGate = new object();
                 SessionErrorData? error = null;
                 long? retryAfterSeconds = null;
@@ -502,6 +531,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
                     var data = evt.Data;
                     if (data is null)
                         return;
+                    // Forward the same provider usage to both the summary counters and the
+                    // richer diagnostics stream.
                     var usage = CopilotUsageMapper.Map(data);
                     observation.ReportUsage(
                         usage.InputTokens,
@@ -526,6 +557,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
                 {
                     observation.CallStarted();
                     diagnostic.CallStarted();
+                    // SendAndWaitAsync can outlive the caller's wait. Track it for disposal and
+                    // explicitly abort on failure before closing the session.
                     var pendingResponse = session.SendAndWaitAsync(new MessageOptions { Prompt = prompt },
                         timeout: synthesis ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(60),
                         cancellationToken: ct);
@@ -533,6 +566,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
                     var response = await pendingResponse.WaitAsync(ct).ConfigureAwait(false);
                     lock (responseGate)
                     {
+                        // ReadResponse raises a safe structured failure when the SDK reported an
+                        // error, otherwise it extracts the assistant's content for parsing.
                         var content = ReadResponse(
                             response, error, provider, model, retryAfterSeconds);
                         _logger.LogInformation(
@@ -549,6 +584,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
                     // A send timeout only stops waiting. Ask the runtime to stop its message before disposal.
                     try { await session.AbortAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
                     catch (Exception) { _logger.LogWarning("Copilot message abort failed; closing its session."); }
+                    // Preserve user cancellation rather than replacing it with an SDK error.
                     ct.ThrowIfCancellationRequested();
                     lock (responseGate)
                         if (error is not null)
@@ -558,6 +594,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             }
             finally
             {
+                // Do not hold up the user's result indefinitely for runtime cleanup, but keep
+                // the disposal task tracked so DisposeAsync can wait for it later.
                 var cleanup = session.DisposeAsync().AsTask();
                 TrackCleanup(cleanup);
                 try { await cleanup.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); }
@@ -569,12 +607,14 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
+            // Cancellation is a separate outcome from a failed provider request.
             observation.Cancel();
             diagnostic.Cancel();
             throw;
         }
         catch (Exception ex)
         {
+            // Map raw SDK failures to fixed safe errors before logging or returning them.
             var failure = IntelligenceErrors.FromException(ex, provider, model);
             observation.Fail(Failure(failure.Failure.Kind), failure.Failure.RetryAfter);
             diagnostic.Fail(
@@ -593,6 +633,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         {
             lock (_lifetimeGate)
             {
+                // Wake disposal only after the last accepted request has left its finally block.
                 _requestCount--;
                 if (_disposing && _requestCount == 0) _requestsDrained.TrySetResult();
             }
@@ -621,6 +662,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     {
         if (error is not null)
         {
+            // Prefer known provider error codes, then HTTP status. Retry-after values can come
+            // from automatic model switching, so clamp them to a practical upper bound.
             var providerKind = IntelligenceErrors.ClassifyProviderError(
                 $"{error.ErrorCode} {error.ErrorType} {error.Message}");
             var kind = providerKind is IntelligenceFailureKind.RateLimited or
@@ -662,6 +705,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         var characters = 0;
         for (var index = 0; index < transcript.Segments.Count; index++)
         {
+            // Preserve original ordinals and speaker labels so the final pass can cite exact
+            // transcript evidence even though each model request receives only one chunk.
             var segment = transcript.Segments[index];
             var source = new SynthesisSourceSegment(
                 index + 1,
@@ -670,6 +715,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             var size = source.Text.Length + (source.Speaker?.Length ?? 0) + 32;
             if (segments.Count > 0 && characters + size > SynthesisChunkCharacterLimit)
             {
+                // Split only between segments; never cut a speaker's sentence in the middle.
                 chunks.Add(new(chunks.Count + 1, segments.ToArray()));
                 segments.Clear();
                 characters = 0;
@@ -704,6 +750,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         Func<SynthesisChunk, CancellationToken, Task<string>> summarizeChunk,
         CancellationToken ct)
     {
+        // Keep the complete transcript as the safe fallback in case chunking, validation, or any
+        // intermediate provider call fails.
         var fallback = BuildSynthesisMessage(transcript, meetingTitle);
         if (transcript.FullText.Length <= SynthesisChunkThreshold)
             return new(fallback, false, false);
@@ -712,6 +760,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             return new(fallback, false, chunks.Count > SynthesisChunkLimit);
         try
         {
+            // Limit parallel calls to protect the local runtime and service quota while still
+            // shortening synthesis time for long transcripts.
             using var concurrency = new SemaphoreSlim(SynthesisChunkConcurrency);
             var summaries = await Task.WhenAll(chunks.Select(async chunk =>
             {
@@ -724,6 +774,9 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
                 finally { concurrency.Release(); }
             })).ConfigureAwait(false);
             var citedOrdinals = summaries.SelectMany(summary => summary.SourceOrdinals).ToHashSet();
+            // Include only source segments cited by validated summaries. The final model can
+            // then check each derived claim against the original words, not just another model's
+            // summary.
             if (citedOrdinals.Count > SynthesisAggregateEvidenceLimit)
                 throw new InvalidOperationException("Chunk summaries cited too many source segments.");
             var evidence = chunks.SelectMany(chunk => chunk.Segments)
@@ -748,12 +801,15 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception)
         {
+            // Intermediate chunk failures should not discard the meeting; fall back to the
+            // bounded whole-transcript path and record the fallback in the caller.
             return new(fallback, false, true);
         }
     }
 
     private static ValidatedChunkSummary ValidateChunkSummary(string response, SynthesisChunk chunk)
     {
+        // Bound output before parsing and require the model to echo the exact chunk bounds.
         if (response.Length > SynthesisChunkSummaryCharacterLimit)
             throw new JsonException();
         using var document = JsonDocument.Parse(response);
@@ -765,6 +821,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             throw new JsonException();
         var allowed = chunk.Segments.Select(segment => segment.Ordinal).ToHashSet();
         var ordinals = new HashSet<int>();
+        // Validate every category against the chunk that produced it; citations outside this
+        // chunk would make later evidence checks unreliable.
         foreach (var property in new[]
                  {
                      "topics", "facts", "implications", "viewpointsOrUncertainty",
@@ -814,6 +872,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
 
     private string BuildMeetingContextMessage(string recentTranscript, string? meetingTitle = null)
     {
+        // Once the structured visualization is active, its stable topic/evidence state is more
+        // useful than sending only a raw transcript tail.
         if (_visualization.HasActiveSession)
             return BuildVisualizationMessage(_visualization.Snapshot());
         return BuildTranscriptMessage(
@@ -825,6 +885,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         IEnumerable<TranscriptionSegment> recentSegments,
         string? meetingTitle = null)
     {
+        // Bound live input before serializing it, while keeping the ordinals local to this
+        // prompt so the model cannot cite data it was not given.
         if (_visualization.HasActiveSession)
             return BuildVisualizationMessage(_visualization.Snapshot());
         var segments = recentSegments.TakeLast(VisualizationRecentSegmentLimit)
@@ -844,6 +906,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     private static VisualizationPromptInput BuildVisualizationInput(
         MeetingVisualizationDocument document)
     {
+        // Keep the current trail and a bounded set of recent canonical topics, then include only
+        // transcript-backed evidence associated with that context.
         var segments = SelectPromptSegments(document);
         var occurrences = document.TopicTrail.TakeLast(20).ToArray();
         var topicIds = occurrences.Select(item => item.TopicId)
@@ -878,6 +942,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             .ToArray();
         string Message(VisualizationSegment[] window)
         {
+            // Build a fresh payload for each candidate window; all content from the meeting is
+            // serialized as data and is framed by the system prompt as untrusted source text.
             var payload = new
             {
             meetingTitle = Compact(document.MeetingTitle, 160),
@@ -990,6 +1056,9 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         {
             var window = segments.TakeLast(count).ToArray();
             var candidate = Message(window);
+            // Trim optional recent transcript detail until the complete JSON fits the prompt
+            // budget. If even one segment cannot fit, fail explicitly instead of sending an
+            // unexpectedly oversized request.
             if (candidate.Length <= VisualizationPromptCharacterLimit)
                 return new(candidate, window.Select(item => item.Ordinal).ToArray());
         }
@@ -1003,6 +1072,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             corrected > Math.Max(0, document.Segments.Count - VisualizationRecentSegmentLimit))
             return document.Segments.TakeLast(VisualizationRecentSegmentLimit).ToArray();
 
+        // Include context before the corrected segment plus the latest tail. Re-analysis can
+        // then repair nearby references without dropping the current discussion.
         var correctionStart = Math.Max(1, corrected - VisualizationCorrectionSegmentLimit / 2);
         return document.Segments
             .Where(item => item.Ordinal >= correctionStart &&
@@ -1040,12 +1111,16 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     internal static SessionConfig BuildSessionConfig(
         IntelligenceSettings settings, bool synthesis, string prompt)
     {
+        // Resolve the exact selected model before constructing a session; invalid settings fail
+        // here rather than silently switching to another provider or deployment.
         var provider = Provider(settings);
         var model = Model(settings, synthesis);
         if (provider == "unknown" || string.IsNullOrWhiteSpace(model) || model.Contains('<') || model.Contains('>'))
             throw IntelligenceErrors.Create(IntelligenceFailureKind.Configuration, provider, model);
         var config = new SessionConfig
         {
+            // This app sends only the requested prompt and transcript data. Disable discovery,
+            // tools, memory, and SDK-side instructions to keep the request's inputs explicit.
             Model = model,
             AvailableTools = [],
             EnableConfigDiscovery = false,
@@ -1063,6 +1138,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         };
         if (provider == "azure")
         {
+            // Azure endpoints must be clean HTTPS base URLs; reject embedded credentials,
+            // query data, or placeholders before passing them to the SDK.
             if (!Uri.TryCreate(settings.Endpoint, UriKind.Absolute, out var endpoint) ||
                 endpoint.Scheme != Uri.UriSchemeHttps || !string.IsNullOrEmpty(endpoint.UserInfo) ||
                 !string.IsNullOrEmpty(endpoint.Query) || !string.IsNullOrEmpty(endpoint.Fragment) ||
@@ -1102,6 +1179,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
             }
             try
             {
+                // WaitAsync bounds the caller even if the runtime ignores its token; the
+                // background cleanup then waits for startup to settle before disposing it.
                 await startup.WaitAsync(TimeSpan.FromSeconds(30), ct).ConfigureAwait(false);
                 ct.ThrowIfCancellationRequested();
                 startupCancellation.Dispose();
@@ -1122,6 +1201,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
     {
         lock (_lifetimeGate)
         {
+            // Completed cleanups no longer need to be retained, but still-running tasks must be
+            // awaited before the shared client is disposed.
             _cleanupTasks.RemoveAll(task => task.IsCompletedSuccessfully);
             _cleanupTasks.Add(cleanup);
         }
@@ -1129,6 +1210,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
 
     private async Task CleanupStartupAsync(CopilotClient candidate, Task startup, CancellationTokenSource cancellation)
     {
+        // Startup may complete after its request timed out. Await it before disposing the client
+        // so the SDK is not torn down while its initialization is still running.
         try { await startup.ConfigureAwait(false); }
         catch (Exception) { _logger.LogWarning("Discarded Copilot runtime startup failed."); }
         finally { cancellation.Dispose(); }
@@ -1138,6 +1221,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
 
     private async Task CleanupSessionAsync(Task<CopilotSession> pending, CancellationTokenSource cancellation)
     {
+        // Session creation can finish after cancellation. Dispose that late session as soon as
+        // it arrives, then release the token source that bounded creation.
         try
         {
             var session = await pending.ConfigureAwait(false);
@@ -1167,6 +1252,8 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         lock (_lifetimeGate)
         {
             if (_disposeTask is not null) return new(_disposeTask);
+            // Prevent new requests, then let existing requests and late cleanup finish before
+            // disposing the runtime client.
             _disposing = true;
             if (_requestCount == 0) _requestsDrained.TrySetResult();
             _disposeTask = DisposeCoreAsync();
@@ -1181,6 +1268,7 @@ public sealed class CopilotNotesService : INotesIntelligence, IMeetingVisualizat
         lock (_lifetimeGate) cleanup = _cleanupTasks.ToArray();
         try
         {
+            // Wait for session/startup cleanup tasks before closing the parent SDK client.
             await Task.WhenAll(cleanup).ConfigureAwait(false);
         }
         finally

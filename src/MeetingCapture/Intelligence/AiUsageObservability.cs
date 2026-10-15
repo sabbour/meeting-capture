@@ -158,6 +158,8 @@ internal static class CopilotUsageMapper
     public static AiProviderUsage Map(AssistantUsageData data)
     {
 #pragma warning disable GHCP001
+        // Map stable SDK properties directly; quota details are handled separately because
+        // their public type is not exposed consistently by the SDK.
         return new(
             data.InputTokens,
             data.OutputTokens,
@@ -178,6 +180,8 @@ internal static class CopilotUsageMapper
         IDictionary? snapshots;
         try
         {
+            // Reflection lets usage reporting keep working across SDK versions that may omit
+            // or change the quota property without making the whole diagnostics feature fail.
             snapshots = QuotaSnapshotsProperty.GetValue(data) as IDictionary;
         }
         catch (Exception exception) when (
@@ -189,6 +193,7 @@ internal static class CopilotUsageMapper
         if (snapshots is null)
             return null;
 
+        // Treat the quota map as one report: a single unknown entry makes its shape unreliable.
         var result = new List<AiQuotaSnapshot>(snapshots.Count);
         foreach (DictionaryEntry entry in snapshots)
         {
@@ -208,6 +213,8 @@ internal static class CopilotUsageMapper
         snapshot = default!;
         try
         {
+            // Read every named field explicitly so a changed SDK shape is rejected instead of
+            // silently presenting a partial quota as a complete one.
             var type = value.GetType();
             snapshot = new(
                 quotaId,
@@ -231,6 +238,8 @@ internal static class CopilotUsageMapper
 
     private static T Read<T>(Type type, object value, string propertyName)
     {
+        // Missing or inaccessible fields are handled by TryMapQuotaSnapshot as an unsupported
+        // SDK shape rather than being converted into zero-valued quota data.
         var property = type.GetProperty(propertyName, InstanceMembers)
             ?? throw new MissingMemberException(type.FullName, propertyName);
         return (T)property.GetValue(value)!;
@@ -270,6 +279,8 @@ public sealed class AiUsageMonitor
             throw new ArgumentException("A recording session ID is required.", nameof(sessionId));
         lock (_gate)
         {
+            // A new generation prevents delayed callbacks from a previous recording from
+            // changing this recording's counters.
             _generation++;
             _sessionId = sessionId;
             _sessionStartedAt = _now();
@@ -286,6 +297,8 @@ public sealed class AiUsageMonitor
         lock (_gate)
         {
             var now = _now();
+            // Snapshots are ordered and copied while holding the lock, giving readers one
+            // consistent view even as SDK callbacks arrive on other threads.
             return new(
                 _sessionId,
                 _sessionStartedAt,
@@ -307,6 +320,7 @@ public sealed class AiUsageMonitor
         lock (_gate)
         {
             generation = _generation;
+            // Ignore work that starts before a recording or belongs to another recording.
             var accepted = _sessionId is not null &&
                 (expectedSessionId is null ||
                  string.Equals(expectedSessionId, _sessionId, StringComparison.Ordinal));
@@ -321,6 +335,8 @@ public sealed class AiUsageMonitor
                 _requests.Insert(0, request);
                 if (_requests.Count > MaxRequests)
                 {
+                    // Do not evict a request still running; the list can temporarily exceed
+                    // the display limit until a completed request becomes removable.
                     var removable = _requests.FindLastIndex(
                         item => item.State != AiRequestState.Running);
                     if (removable >= 0)
@@ -342,6 +358,8 @@ public sealed class AiUsageMonitor
         var changed = false;
         lock (_gate)
         {
+            // Remove this request's old contribution, update its totals, then add the revised
+            // contribution back. This keeps aggregate totals correct as reports arrive later.
             if (generation != _generation || !request.Accepted ||
                 (!allowCompleted && request.State != AiRequestState.Running))
                 return;
@@ -385,6 +403,8 @@ public sealed class AiUsageMonitor
             long? reasoningTokens = null)
             => owner.Update(generation, request, (current, aggregate) =>
             {
+                // Provider events can report only some metrics. Keep missing values unset and
+                // count reports separately so a missing report is not shown as a real zero.
                 current.InputTokens = Add(current.InputTokens, inputTokens);
                 current.OutputTokens = Add(current.OutputTokens, outputTokens);
                 current.ProviderCost = Add(current.ProviderCost, providerCost);
@@ -401,6 +421,8 @@ public sealed class AiUsageMonitor
                 if (reasoningTokens is not null) current.ReasoningTokenReports++;
                 if (quotaSnapshots is not null)
                 {
+                    // Keep the newest view per quota while counting provider calls that did and
+                    // did not include quota data.
                     current.QuotaSnapshotReports++;
                     foreach (var snapshot in quotaSnapshots)
                         current.QuotaSnapshots[snapshot.QuotaId] = snapshot;
@@ -428,6 +450,8 @@ public sealed class AiUsageMonitor
             TimeSpan? retryAfter)
             => owner.Update(generation, request, (current, aggregate) =>
             {
+                // The request and its capability total are updated together under the monitor's
+                // lock, so a snapshot never sees only one side of the completion.
                 current.State = state;
                 current.Failure = failure;
                 current.RetryAfter = retryAfter;
@@ -578,6 +602,8 @@ public sealed class AiUsageMonitor
 
         public void Add(long? value, int reports, int calls, int direction)
         {
+            // direction is +1 when adding the current request and -1 when replacing it; the
+            // report counts track provider coverage separately from the numeric total.
             if (value is { } reported)
             {
                 _total += direction * reported;
@@ -600,6 +626,7 @@ public sealed class AiUsageMonitor
 
         public void Add(double? value, int reports, int calls, int direction)
         {
+            // Match the integer metric so unset cost data is distinguishable from a reported zero.
             if (value is { } reported)
             {
                 _total += direction * reported;
