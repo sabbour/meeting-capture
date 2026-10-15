@@ -34,12 +34,15 @@ public sealed class MarkdownNotesStorage : INotesStorage
         cancellationToken.ThrowIfCancellationRequested();
         var folder = _settings.NotesPath;
         Directory.CreateDirectory(folder);
+        // Session identity, rather than the title, keeps retries and later speaker edits on one stable file.
         var identity = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(notes.SessionId)));
         var fullPath = ResolvePath(folder, notes, identity);
         var temporary = fullPath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         var markdown = BuildMarkdown(notes);
         try
         {
+            // Flush the complete temporary file before swapping it into place, so readers see either
+            // the previous notes or the full replacement.
             await using (var stream = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 4096, FileOptions.Asynchronous))
             {
@@ -64,6 +67,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
 
     private static string ResolvePath(string folder, MeetingNotes notes, string identity)
     {
+        // Reuse the existing session file even if its meeting title or generated topics later change.
         var existing = Directory.EnumerateFiles(folder, $"*_{identity}.md", SearchOption.TopDirectoryOnly)
             .Take(2).ToArray();
         if (existing.Length > 1)
@@ -81,6 +85,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         if (!IsGenericTitle(title))
             return SanitizeFilename(title);
 
+        // Generic detected titles are not useful filenames; prefer a generated topic, then transcript text.
         var grounded = notes.Topics.FirstOrDefault(topic => !string.IsNullOrWhiteSpace(topic))
             ?? notes.RawTranscript;
         return SanitizeFilename(grounded);
@@ -100,6 +105,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         safe = Regex.Replace(safe, @"\s+", " ").Trim(' ', '.');
         if (safe.Length > MaxFilenameLabelLength)
         {
+            // Avoid cutting a word in half when a shorter boundary is reasonably close to the limit.
             safe = safe[..MaxFilenameLabelLength].TrimEnd();
             var wordBoundary = safe.LastIndexOf(' ');
             if (wordBoundary >= MaxFilenameLabelLength / 2)
@@ -112,7 +118,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
     {
         var sb = new StringBuilder();
 
-        // YAML frontmatter for machine-queryability.
+        // YAML frontmatter lets tools index meeting metadata without parsing the full prose below.
         sb.AppendLine("---");
         sb.AppendLine($"session_id: {YamlString(notes.SessionId)}");
         sb.AppendLine($"title: {YamlString(MeetingNotesText.WithoutSegmentOrdinals(notes.MeetingTitle))}");
@@ -145,6 +151,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine();
         sb.AppendLine($"# {MeetingNotesText.WithoutSegmentOrdinals(notes.MeetingTitle).Replace("\r", " ").Replace("\n", " ")}");
         sb.AppendLine();
+        // Keep AI status explicit so a saved transcript is not mistaken for successfully generated notes.
         sb.AppendLine("## Intelligence Status");
         sb.AppendLine();
         if (notes.IntelligenceFailure is { } failure)
@@ -166,6 +173,8 @@ public sealed class MarkdownNotesStorage : INotesStorage
         sb.AppendLine(string.IsNullOrWhiteSpace(notes.Nuances) ? "_None noted._" : MeetingNotesText.WithoutSegmentOrdinals(notes.Nuances));
         sb.AppendLine();
 
+        // Topic summaries are grounded in the saved topic map; show an explicit placeholder when analysis
+        // has not produced usable bullets yet.
         sb.AppendLine("## Meeting Notes");
         sb.AppendLine();
         if (notes.TopicNotes.Count > 0)
@@ -186,6 +195,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
             sb.AppendLine("_No accepted topics were recorded._");
         sb.AppendLine();
 
+        // Separate the narrative title from its explanation when the generated text uses the expected delimiter.
         sb.AppendLine("## Topic-by-Topic Narrative");
         sb.AppendLine();
         if (notes.KeyDiscussionPoints.Count > 0)
@@ -257,6 +267,7 @@ public sealed class MarkdownNotesStorage : INotesStorage
 
         sb.AppendLine();
         sb.AppendLine();
+        // Choose a fence longer than any run of backticks in user speech so the Markdown remains valid.
         sb.AppendLine("## Raw Transcript");
         sb.AppendLine();
         var longestFence = Regex.Matches(notes.RawTranscript, "`+").Select(match => match.Length).DefaultIfEmpty(0).Max();

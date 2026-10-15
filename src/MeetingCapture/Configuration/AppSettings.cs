@@ -14,7 +14,7 @@ public sealed class AppSettings
 public sealed class TranscriptionSettings
 {
     /// <summary>
-    /// "azure" for Azure Speech SDK via Foundry, "npu" for local Windows ML / Whisper NPU path.
+    /// Speech-to-text settings for the Azure Speech SDK service used by this application.
     /// </summary>
     public string Provider { get; init; } = "azure";
 
@@ -105,10 +105,10 @@ public sealed class AudioSettings
 
     /// <summary>
     /// Capture loopback AND microphone simultaneously via <c>DualSourceCapture</c>.
-    /// This is what lets the user's own voice be transcribed during Teams/Zoom calls — the
-    /// loopback stream is echo-cancelled to exclude the local talker, so the mic supplies it.
-    /// When true (and both sources are enabled) the pipeline uses the dual source; otherwise it
-    /// falls back to whichever single source is available.
+    /// The playback stream carries meeting audio and the microphone carries local input,
+    /// allowing the pipeline to combine both. The exact playback mix depends on the meeting app
+    /// and Windows audio processing. When both are enabled, the pipeline uses dual capture;
+    /// otherwise it falls back to whichever single source is available.
     /// </summary>
     public bool DualCapture { get; init; } = true;
 

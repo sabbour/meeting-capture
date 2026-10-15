@@ -24,10 +24,12 @@ public static class CrashDiagnostics
     {
         try
         {
+            // Exclude exception messages, which may contain private content; keep only diagnostic metadata and stack names.
             var text = Format(source, error, DateTimeOffset.UtcNow);
             directory ??= DefaultDirectory;
             lock (Gate)
             {
+                // Serialize rotation and append so concurrent crashes cannot interleave file operations.
                 Directory.CreateDirectory(directory);
                 var path = Path.Combine(directory, FileName);
                 if (File.Exists(path) && new FileInfo(path).Length > MaxBytes)
@@ -46,6 +48,7 @@ public static class CrashDiagnostics
     public static string Format(string source, Exception? error, DateTimeOffset now)
     {
         var text = new StringBuilder();
+        // Keep enough context to locate the failing code without writing error payloads or input data.
         text.Append(now.ToString("O")).Append(" source=").Append(source)
             .Append(" pid=").Append(Environment.ProcessId).AppendLine();
         var depth = 0;
@@ -55,6 +58,7 @@ public static class CrashDiagnostics
                 .Append(" hresult=0x").Append(current.HResult.ToString("X8")).AppendLine();
             foreach (var frame in new StackTrace(current, fNeedFileInfo: false).GetFrames())
             {
+                // Exclude source paths and line data because they can expose local machine details.
                 var method = frame.GetMethod();
                 if (method is null) continue;
                 text.Append("    at ").Append(method.DeclaringType?.FullName).Append('.')

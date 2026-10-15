@@ -23,6 +23,8 @@ public sealed class MeetingSession
     {
         lock (_titleGate)
         {
+            // Only the live prompt may update a title, and confirmation freezes it so later calendar
+            // lookups cannot rename a recording that has already started.
             if (_titleFrozen || pendingSessionId != Id || !IsActive || string.IsNullOrWhiteSpace(title))
                 return false;
             _title = title;
@@ -35,6 +37,8 @@ public sealed class MeetingSession
     {
         lock (_titleGate)
         {
+            // Keep the attached event consistent with the same session and eligibility rules used
+            // when the title is resolved.
             if (_titleFrozen || pendingSessionId != Id || !IsActive ||
                 !MeetingTitleResolver.IsEligibleOnlineMeeting(meeting))
                 return false;
@@ -43,6 +47,7 @@ public sealed class MeetingSession
         }
     }
 
+    // Called when the user confirms this session or recording begins.
     internal void FreezeTitle() { lock (_titleGate) _titleFrozen = true; }
 
     /// <summary>Name of the process that triggered detection (e.g., "Teams").</summary>

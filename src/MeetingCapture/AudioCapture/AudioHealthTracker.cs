@@ -12,6 +12,7 @@ internal sealed class AudioHealthTracker(string source)
 
     public AudioSourceHealth Snapshot()
     {
+        // Copy every field under one lock so observers never see a mixture of old and new counters.
         lock (_gate) return new(source, _state, _bytes, _buffers, _drops, _lastAudio, _level, _error);
     }
 
@@ -31,6 +32,7 @@ internal sealed class AudioHealthTracker(string source)
     {
         lock (_gate)
         {
+            // A successful buffer moves a ready source to active, but does not erase earlier failures.
             _bytes += bytes;
             _buffers++;
             _lastAudio = DateTimeOffset.UtcNow;
@@ -41,6 +43,7 @@ internal sealed class AudioHealthTracker(string source)
     public void Level(byte[] pcm, int bytes)
     {
         if (bytes < 2) return;
+        // Calculate outside the state lock; only the small latest-level update needs synchronization.
         double sum = 0;
         for (var i = 0; i + 1 < bytes; i += 2)
         {
@@ -54,6 +57,7 @@ internal sealed class AudioHealthTracker(string source)
     {
         lock (_gate)
         {
+            // Keep the first useful explanation while counting every later loss.
             _drops++;
             if (_state != CaptureHealthState.Failed) _state = CaptureHealthState.Degraded;
             _error ??= "Audio buffers were dropped because processing could not keep up.";

@@ -14,6 +14,7 @@ internal static class AiFinalizationDiagnostics
 
     internal static string Format(string stage, string outcome, Exception? error, long elapsedMilliseconds)
     {
+        // Whitelist labels and record only safe failure metadata, never prompts, response text, or transcripts.
         var safeStage = stage is "final-visualization" or "final-notes" or "final-save" ? stage : "final";
         var safeOutcome = outcome is "kept-live-map" or "stale-skipped" or "retry-available" or "saved"
             ? outcome : "failed";
@@ -36,6 +37,7 @@ internal static class AiFinalizationDiagnostics
     {
         try
         {
+            // Finalization diagnostics are best-effort and must not replace the original save or AI result.
             directory ??= CrashDiagnostics.DefaultDirectory;
             var text = Format(stage, outcome, error, elapsedMilliseconds);
             lock (Gate)

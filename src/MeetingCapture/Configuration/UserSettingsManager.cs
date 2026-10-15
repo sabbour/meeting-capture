@@ -53,6 +53,7 @@ public sealed class UserSettingsManager
     }
 
     public Task<SettingsSavedEventArgs> SaveAsync(EditableSettings settings)
+        // Save performs synchronous file and configuration-provider work, so keep it off a UI caller.
         => Task.Run(() => Save(settings));
 
     public SettingsSavedEventArgs Save(EditableSettings s)
@@ -61,6 +62,7 @@ public sealed class UserSettingsManager
         SettingsSavedEventArgs result;
         lock (_gate)
         {
+            // Serialize edits, file replacement, configuration reload, and revision updates as one operation.
             // A matching JSON provider is required so reloading preserves all higher-priority overrides.
             var provider = _configuration.Providers.OfType<JsonConfigurationProvider>()
                 .FirstOrDefault(p => string.Equals(
@@ -72,6 +74,7 @@ public sealed class UserSettingsManager
             JsonObject root;
             try
             {
+                // Start from the existing object so settings this dialog does not edit remain intact.
                 root = File.Exists(_filePath)
                     ? JsonNode.Parse(File.ReadAllText(_filePath)) as JsonObject
                         ?? throw new JsonException()
@@ -86,6 +89,7 @@ public sealed class UserSettingsManager
             t["Endpoint"] = s.TranscriptionEndpoint;
             t["Region"] = s.TranscriptionRegion;
             t["Language"] = s.TranscriptionLanguage;
+            // An empty password field means "leave the stored key alone", not "erase it".
             if (!string.IsNullOrWhiteSpace(s.TranscriptionApiKey)) t["ApiKey"] = s.TranscriptionApiKey;
 
             var i = Section(root, "Intelligence");
@@ -108,6 +112,7 @@ public sealed class UserSettingsManager
             var temporary = _filePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {
+                // Replace atomically so a crash or disk error cannot leave a half-written settings file.
                 File.WriteAllText(temporary, root.ToJsonString(JsonOptions));
                 if (File.Exists(_filePath))
                     File.Replace(temporary, _filePath, null);
@@ -125,8 +130,10 @@ public sealed class UserSettingsManager
 
             try
             {
+                // Reload to read the same effective values the rest of the app will now use.
                 _configuration.Reload();
                 var effective = BindIntelligence();
+                // Only intelligence settings receive a live revision; audio and device changes need restart.
                 var changed = JsonSerializer.Serialize(effective) != JsonSerializer.Serialize(_intelligence.Settings);
                 var revision = _intelligence.Revision + (changed ? 1 : 0);
                 var restart = _startupSections
@@ -140,6 +147,7 @@ public sealed class UserSettingsManager
                 throw new InvalidOperationException("Settings were saved but could not be applied. Restart Meeting Capture before retrying.");
             }
         }
+        // Notify after releasing _gate so subscribers can safely read or save settings in response.
         SettingsSaved?.Invoke(this, result);
         return result;
     }
@@ -147,6 +155,7 @@ public sealed class UserSettingsManager
     private static JsonObject Section(JsonObject root, string name)
     {
         if (root[name] is JsonObject section) return section;
+        // Do not silently replace a user-edited value of the wrong shape with an empty section.
         if (root.ContainsKey(name))
             throw new InvalidOperationException("Existing settings contain an invalid section. No settings were saved.");
         var created = new JsonObject();
@@ -157,6 +166,7 @@ public sealed class UserSettingsManager
     private string SectionValue(string name)
         => name switch
         {
+            // Include environment-based secrets in startup comparisons, but never persist them here.
             "Audio" => JsonSerializer.Serialize(_configuration.GetSection(name).Get<AudioSettings>() ?? new()),
             "Transcription" => JsonSerializer.Serialize(new
             {
@@ -171,6 +181,7 @@ public sealed class UserSettingsManager
 
     private IntelligenceSettings BindIntelligence()
     {
+        // Bind the displayed non-secret settings, then resolve a key from configuration or environment.
         var settings = _configuration.GetSection("Intelligence").Get<IntelligenceSettings>() ?? new();
         return new IntelligenceSettings
         {
@@ -193,6 +204,7 @@ public sealed class UserSettingsManager
     {
         lock (_gate)
         {
+            // Return effective non-secret values only; callers cannot read secrets back into the dialog.
             var effective = _configuration.Get<AppSettings>() ?? new();
             var i = _intelligence.Settings;
             return new EditableSettings

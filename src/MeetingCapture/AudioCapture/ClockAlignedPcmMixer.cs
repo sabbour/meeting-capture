@@ -21,6 +21,8 @@ internal sealed class ClockAlignedPcmMixer
         if (frameMilliseconds <= 0 || maxBufferedMilliseconds < frameMilliseconds)
             throw new ArgumentOutOfRangeException(nameof(frameMilliseconds));
 
+        // PCM16 uses two bytes per sample. The defaults yield 640-byte 20 ms frames and
+        // a two-second ring for each source at 16 kHz mono.
         FrameBytes = sampleRate * channels * sizeof(short) * frameMilliseconds / 1000;
         var capacity = sampleRate * channels * sizeof(short) * maxBufferedMilliseconds / 1000;
         FrameBytes &= ~1;
@@ -36,6 +38,7 @@ internal sealed class ClockAlignedPcmMixer
         ArgumentNullException.ThrowIfNull(buffer);
         bytes = Math.Min(bytes, buffer.Length) & ~1;
         if (bytes <= 0) return 0;
+        // Mixing and producer writes share this lock so a frame cannot read half a packet update.
         lock (_gate) return Queue(source).Write(buffer, bytes);
     }
 
@@ -50,16 +53,20 @@ internal sealed class ClockAlignedPcmMixer
 
         lock (_gate)
         {
+            // During live capture, keep emitting fixed-size frames and fill any source that has not
+            // delivered enough samples with zero. After stop, omit frames once both queues are empty.
             if (!includeSilence && _loopback.Count == 0 && _microphone.Count == 0) return false;
 
             var peak = 0;
             for (var i = 0; i < _sums.Length; i++)
             {
+                // Missing samples from either source read as zero, so the two rings align by time.
                 var sum = _loopback.ReadSample() + _microphone.ReadSample();
                 _sums[i] = sum;
                 peak = Math.Max(peak, Math.Abs(sum));
             }
 
+            // Apply one frame-wide scale when needed, preserving the relative level of both sources.
             var scale = peak <= short.MaxValue ? 1.0 : (double)short.MaxValue / peak;
             for (var i = 0; i < _sums.Length; i++)
             {
@@ -87,6 +94,8 @@ internal sealed class ClockAlignedPcmMixer
 
         public int Write(byte[] source, int bytes)
         {
+            // Keep the newest audio when a source falls behind; discard whole 16-bit samples so
+            // the next read still starts on a sample boundary.
             var overflow = Math.Max(0, Count + bytes - _buffer.Length);
             overflow = (overflow + 1) & ~1;
             var discard = Math.Min(overflow, Count);
@@ -104,6 +113,7 @@ internal sealed class ClockAlignedPcmMixer
 
         public short ReadSample()
         {
+            // Return zero for a source without a complete sample; do not wait for more bytes to arrive.
             if (Count < sizeof(short)) return 0;
             var low = _buffer[_read];
             _read = (_read + 1) % _buffer.Length;

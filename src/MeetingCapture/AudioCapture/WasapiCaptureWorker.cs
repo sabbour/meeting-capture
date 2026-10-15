@@ -41,11 +41,14 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
     public async Task StartAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        // Keep device creation and startup off the caller's thread because WASAPI setup can block.
         await Task.Run(async () =>
         {
             Session session;
             lock (_gate)
             {
+                // A session is installed before the device starts so callbacks can verify that
+                // they still belong to the current owner.
                 if (_session is not null) throw new InvalidOperationException("The capture source is already owned.");
                 _health.Reset();
                 try { session = new Session(createCapture()); }
@@ -63,6 +66,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
                 {
                     lock (_gate)
                     {
+                        // NAudio reuses its callback buffer. Copy accepted bytes before returning,
+                        // then let the separate consumer thread do conversion and delivery.
                         if (!ReferenceEquals(_session, session) || !ReferenceEquals(sender, session.Capture) ||
                             !session.Accepting || args.BytesRecorded == 0) return;
                         _health.Received(args.BytesRecorded);
@@ -75,6 +80,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
                     if (!ReferenceEquals(sender, session.Capture)) return;
                     lock (_gate)
                     {
+                        // Stop accepting data and close the queue as one state change so the
+                        // consumer can drain every buffer that arrived before this callback.
                         if (!ReferenceEquals(_session, session) || session.Released) return;
                         if (args.Exception is not null)
                         {
@@ -98,6 +105,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
                 {
                     IsBackground = true, Name = $"MeetingCapture-{source}-consumer"
                 };
+                // Start the consumer before WASAPI so the bounded queue is ready for the first callback.
                 session.Worker.Start();
                 session.WorkerStarted = true;
                 ct.ThrowIfCancellationRequested();
@@ -113,6 +121,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             }
             catch
             {
+                // Startup can fail after either worker or device resources were created; use the
+                // normal stop path to drain and release whatever was successfully started.
                 _health.Failed("The configured audio device could not start.");
                 await StopAsync(CancellationToken.None).ConfigureAwait(false);
                 throw;
@@ -125,6 +135,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         try
         {
             var format = session.Capture.WaveFormat;
+            // WASAPI packets may not align with output reads. Buffer them so the resampler can
+            // produce continuous 16 kHz samples instead of treating each packet as a new stream.
             var buffered = new BufferedWaveProvider(format)
             {
                 ReadFully = false, DiscardOnBufferOverflow = false, BufferDuration = TimeSpan.FromSeconds(10)
@@ -135,8 +147,10 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             {
                 buffered.AddSamples(data, 0, bytes);
                 int read;
+                // Read all output currently available before taking the next device packet.
                 while ((read = pcm.Read(buffer, 0, buffer.Length)) > 0)
                 {
+                    // The read buffer is reused, so listeners receive their own stable copy.
                     var copy = buffer.AsSpan(0, read).ToArray();
                     _health.Level(copy, read);
                     output(copy, read);
@@ -145,6 +159,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         }
         catch (Exception ex)
         {
+            // Stop new callbacks and complete the queue; StopCoreAsync will still join this worker.
             lock (_gate)
             {
                 session.Failure = ex;
@@ -162,6 +177,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(inputSampleRate);
         // WDL changes fractional-rate samples with the read size, so preserve those reads.
+        // Exact multiples can use 20 ms reads: 16 kHz * 2 bytes / 50 reads per second.
         return inputSampleRate % OutputSampleRate == 0
             ? OutputSampleRate * sizeof(short) / 50
             : 8192;
@@ -170,6 +186,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
     /// <summary>Downmixes multichannel input when needed, then resamples it to 16 kHz PCM.</summary>
     internal static IWaveProvider CreatePcmProvider(BufferedWaveProvider input)
     {
+        // Convert through float samples so channels can be averaged before resampling.
         ISampleProvider samples = input.ToSampleProvider();
         if (input.WaveFormat.Channels > 1) samples = new MonoDownmixSampleProvider(samples);
         return new SampleToWaveProvider16(new WdlResamplingSampleProvider(samples, OutputSampleRate));
@@ -181,6 +198,7 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
         lock (_gate)
         {
             if (_session is not { } session) return Task.CompletedTask;
+            // Share one stop operation among concurrent callers so the device is released once.
             return session.StopTask ??= Task.Run(() => StopCoreAsync(session));
         }
     }
@@ -210,6 +228,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             catch (Exception ex) { stopFailure ??= ex; _health.Failed("Audio device disposal failed."); }
             lock (_gate)
             {
+                // No callback may enqueue after completion. The consumer exits only after it has
+                // processed all queued packets, and is joined before its queue is disposed.
                 session.Accepting = false;
                 session.Queue.CompleteAdding();
             }
@@ -222,6 +242,8 @@ internal sealed class WasapiCaptureWorker(string source, Func<WasapiCapture> cre
             {
                 session.Released = true;
                 session.Queue.Dispose();
+                // Keep ownership if disposal failed: a later start must not overlap a device
+                // whose native capture thread may still be alive.
                 if (disposed && ReferenceEquals(_session, session)) _session = null;
             }
             _health.Stopped();
@@ -247,10 +269,12 @@ internal sealed class MonoDownmixSampleProvider : ISampleProvider
         var channels = _source.WaveFormat.Channels;
         var requested = count * channels;
         if (_buffer.Length < requested) _buffer = new float[requested];
+        // ISampleProvider counts individual samples; divide by channel count to get complete frames.
         var frames = _source.Read(_buffer, 0, requested) / channels;
         for (var frame = 0; frame < frames; frame++)
         {
             float sum = 0;
+            // Averaging keeps one mono sample per time point without favoring a channel.
             for (var channel = 0; channel < channels; channel++) sum += _buffer[frame * channels + channel];
             buffer[offset + frame] = sum / channels;
         }

@@ -3,7 +3,8 @@ namespace MeetingCapture.AudioCapture;
 /// <summary>
 /// Fixed-capacity circular ring buffer for PCM audio. Retains at most
 /// <see cref="MaxWindowSeconds"/> of audio; older data is silently overwritten.
-/// All public members are thread-safe.
+/// Ring reads and writes use a private lock. Dispose drops the backing-array reference without taking that
+/// lock, so it must not run at the same time as another operation.
 /// </summary>
 public sealed class AudioBuffer : IDisposable
 {
@@ -43,6 +44,7 @@ public sealed class AudioBuffer : IDisposable
             EnsureRing();
             int remaining = count;
             int src = offset;
+            // Split large writes at the physical end of the array so a single append can wrap around.
             while (remaining > 0)
             {
                 int chunk = Math.Min(remaining, _capacity - _writePos);
@@ -61,6 +63,7 @@ public sealed class AudioBuffer : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         lock (_lock)
         {
+            // Copy before resetting indices so the caller gets the complete chronological transcript.
             var data = GetOrderedData();
             _writePos = 0;
             _totalWritten = 0;
@@ -79,6 +82,7 @@ public sealed class AudioBuffer : IDisposable
     private void EnsureRing()
     {
         if (_ring is not null) return;
+        // Capacity is duration * samples per second * channels * bytes per sample.
         _capacity = MaxWindowSeconds * SampleRate * Channels * (BitsPerSample / 8);
         _ring = new byte[_capacity];
     }
@@ -96,6 +100,7 @@ public sealed class AudioBuffer : IDisposable
         }
 
         // Buffer full and wrapped — oldest byte is at _writePos
+        // Copy the tail first, then the wrapped prefix, to restore chronological order.
         var result = new byte[_capacity];
         int tail = _capacity - _writePos;
         Buffer.BlockCopy(_ring, _writePos, result, 0, tail);
@@ -107,6 +112,7 @@ public sealed class AudioBuffer : IDisposable
     {
         if (_disposed) return;
         _disposed = true;
+        // Dropping the array releases the retained audio; callers must stop using the buffer first.
         _ring = null;
     }
 }

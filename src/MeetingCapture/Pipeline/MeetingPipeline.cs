@@ -84,12 +84,15 @@ public sealed class MeetingPipeline : IAsyncDisposable
         public CancellationTokenSource Cancellation { get; } = CancellationTokenSource.CreateLinkedTokenSource(ct);
         public List<TranscriptionSegment> Segments { get; } = [];
         public List<(IAudioCapture Device, EventHandler<AudioDataEventArgs> Handler)> Devices { get; } = [];
+        // Audio callbacks can arrive concurrently, so pushes form a task chain and are also tracked
+        // separately when shutdown must wait for them or defer the speech flush.
         public List<Task> PendingAudioPushes { get; } = [];
         public List<Task> PendingTranscriptionOperations { get; } = [];
         public HashSet<Task> TimedOutAudioPushes { get; } = [];
         public TaskCompletionSource TranscriptionOperationsSettled { get; set; } = CompletedSignal();
         public Task AudioPushTail = Task.CompletedTask;
         public object SegmentPublicationGate { get; } = new();
+        // SDK callbacks may finish out of order; ordinals let publication wait for earlier segments.
         public int NextSegmentPublicationOrdinal = 1;
         public EventHandler<TranscriptionSegment>? FinalHandler;
         public EventHandler<PartialTranscript>? PartialHandler;
@@ -273,6 +276,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     /// <summary>Stops the meeting detector and any operations the pipeline owns.</summary>
     public async Task StopDetectorAsync(CancellationToken ct)
     {
+        // Stop new detections before stopping operations already owned by the pipeline.
         await _detector.StopAsync(ct).ConfigureAwait(false);
         await StopOwnedOperationsAsync().ConfigureAwait(false);
     }
@@ -322,6 +326,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Reject new ownership before mutating the current run; all start checks share this lock.
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_preparingExit) throw new RecordingStartException(RecordingStartFailureKind.ExitInProgress);
             if (_pendingVisualizationPath is not null)
@@ -335,6 +340,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 throw new RecordingStartException(RecordingStartFailureKind.DetectionExpired);
             session.FreezeTitle();
             var stopPreview = _preview;
+            // Reserve the pipeline before launching background startup so a second caller cannot race it.
             _owned = true;
             _preview = false;
             _pendingSession = null;
@@ -360,10 +366,12 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // The review window is based on the injected clock so status and timeout behavior agree in tests.
             var review = new SaveReview(sessionId, _getUtcNow().Add(SaveReviewDuration));
             _saveReview = review;
             SetStatus(PipelineState.ReviewingSave,
                 "Recording stopped. Save now or discard before automatic save.", saveDeadline: review.Deadline);
+            // Exit cannot wait for user input; preserving the transcript is the safe default.
             if (_preparingExit) review.Decision.TrySetResult(SaveDecision.Save);
             return review;
         }
@@ -372,6 +380,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private async Task<SaveDecision> WaitForSaveDecisionAsync(SaveReview review)
     {
         using var timeoutCancellation = new CancellationTokenSource();
+        // Race the user's choice against the fixed review deadline, then cancel the unused delay task.
         var timeout = _delay(SaveReviewDuration, timeoutCancellation.Token);
         var winner = await Task.WhenAny(review.Decision.Task, timeout).ConfigureAwait(false);
         if (winner == timeout)
@@ -401,6 +410,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             if (_saveReview is not { } review || review.SessionId != sessionId)
                 return false;
+            // A late discard must not erase work after the automatic-save deadline has passed.
             if (decision == SaveDecision.Discard && _getUtcNow() >= review.Deadline)
             {
                 review.Decision.TrySetResult(SaveDecision.Save);
@@ -416,6 +426,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             CancellationToken token;
             lock (_gate) token = run.Cancellation.Token;
+            // A preview owns the same devices, so stop and fully drain it before starting the recording.
             if (stopPreview) await StopDevicesAsync().ConfigureAwait(false);
             if (stopPreview)
             {
@@ -428,6 +439,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (_devices.Any(d => d.SampleRate != 16000 || d.Channels != 1))
                 throw new RecordingStartException(RecordingStartFailureKind.UnsupportedAudioFormat);
             _speakerResolver.Reset();
+            // Local-user lookup is optional and must not delay capture startup.
             _ = Task.Run(() => ResolveLocalUserAsync(run));
             var transcription = _transcription;
             run.FinalHandler = (sender, segment) =>
@@ -446,6 +458,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             transcription.SegmentRecognized += run.FinalHandler;
             transcription.PartialResultReceived += run.PartialHandler;
             run.TranscriptionAttempted = true;
+            // Start Speech before subscribing to capture, so no audio can arrive before the stream is ready.
             await transcription.StartAsync(run.Cancellation.Token).ConfigureAwait(false);
             foreach (var device in _devices)
             {
@@ -456,6 +469,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     Task push;
                     lock (_gate)
                     {
+                        // Reject late device callbacks and copy the NAudio buffer before its producer reuses it.
                         if (!ReferenceEquals(sender, device) || !ReferenceEquals(_run, run) || !run.AcceptCallbacks || !run.AcceptAudio)
                             return;
                         offerStop = NoteAudioActivity(run, args);
@@ -466,6 +480,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
                         Publish(MeetingEndedWhileRecording, run.Session);
                     try
                     {
+                        // Bound how long a capture callback can wait for Speech; a stalled SDK must not
+                        // block the device consumer forever.
                         push.WaitAsync(_transcriptionTimeout).GetAwaiter().GetResult();
                     }
                     catch (TimeoutException)
@@ -481,6 +497,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
                         {
                             if (!ReferenceEquals(_run, run) || run.Closed) return;
                             run.TimedOutAudioPushes.Add(push);
+                            // Stop accepting new buffers now; the pending operation is observed later
+                            // so its eventual failure is not lost.
                             run.AcceptAudio = false;
                             run.AudioDeliveryFailed = true;
                             if (run.CaptureError is null)
@@ -503,6 +521,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 };
                 run.Devices.Add((device, handler));
                 device.DataAvailable += handler;
+                // Start devices one at a time so cancellation or a later failure can clean up only
+                // those that were actually attached and started.
                 await device.StartAsync(run.Cancellation.Token).ConfigureAwait(false);
                 lock (_gate)
                     if (run.AutomaticStopRequested) return;
@@ -529,6 +549,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             RecordingStartFailure failure;
             lock (_gate)
             {
+                // Keep the pipeline owned if cleanup could not release a native or Speech resource.
                 _owned = ResourcesStillOwned();
                 failure = DescribeStartFailureCore(ex, _owned);
                 SetStatus(PipelineState.Failed,
@@ -554,6 +575,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             }
             var name = await _getLocalUserDisplayName(token).ConfigureAwait(false);
             lock (_gate)
+                // Apply the optional result only to the still-active run; a slow lookup must not rename a later one.
                 if (ReferenceEquals(_run, run) && !run.Closed && !run.Cancellation.IsCancellationRequested && name is not null)
                     _speakerResolver.SetLocalUser(name);
         }
@@ -569,6 +591,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         var previous = run.AudioPushTail;
         var push = Task.Run(async () =>
         {
+            // Preserve capture order even if several source callbacks arrive before Speech finishes a write.
             await previous.ConfigureAwait(false);
             lock (_gate)
                 if (run.AudioDeliveryFailed) return;
@@ -585,6 +608,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         });
         run.AudioPushTail = push;
         run.PendingAudioPushes.Add(push);
+        // Observe completion immediately so the pending-operation count and stalled-write state stay current.
         TrackPendingTranscriptionOperation(run, push, "audio push", completed =>
         {
             run.PendingAudioPushes.Remove(push);
@@ -609,6 +633,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (!ReferenceEquals(_run, run) || run.Closed || run.AudioDeliveryFailed) return;
             run.AcceptAudio = false;
             run.AudioDeliveryFailed = true;
+            // Prefer the service's sanitized explanation when available; otherwise report a generic delivery failure.
             run.CaptureError = string.IsNullOrWhiteSpace(error)
                 ? "Audio could not be delivered to transcription."
                 : error;
@@ -626,6 +651,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private bool RequestAutomaticStopLocked(SessionRun run)
     {
+        // Multiple callbacks can report the same failure; schedule only one fail-fast stop.
         if (run.AutomaticStopRequested || _stopTask is not null ||
             _status.State is not (PipelineState.Starting or PipelineState.Recording))
             return false;
@@ -642,6 +668,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (_run is null || _run.Closed || !_owned || _preview) return Task.CompletedTask;
             var run = _run;
             var startup = _startTask;
+            // If Speech failed during startup, do not cancel before rollback can preserve its partial transcript.
             var preservePartialDuringStartup = run.AutomaticStopRequested &&
                 _status.State == PipelineState.Starting;
             _stopTask = Task.Run(() => StopCoreAsync(run, startup));
@@ -660,6 +687,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         string? path = null;
         try
         {
+            // Startup may still own callbacks or devices; wait for it before beginning the final drain.
             await CloseCaptureAsync(run, startupFailed: false).ConfigureAwait(false);
             _detector.Complete(run.Session.Id);
             var snapshot = LastCompletedTranscript!;
@@ -688,11 +716,13 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     _pendingVisualizationDocument = null;
                     _visualization.Clear();
                 }
+                // Discard removes the in-memory transcript and map, but does not run final AI work.
                 Finish(PipelineState.Discarded, "Recording discarded.");
                 return;
             }
             lock (_gate) if (ReferenceEquals(_saveReview, review)) _saveReview = null;
             SetStatus(PipelineState.Finalizing, "Saving transcript...");
+            // Persist the transcript before optional AI so recognized speech survives any later failure.
             path = await PersistNotesAsync(snapshot, CreateNotes(snapshot), CancellationToken.None).ConfigureAwait(false);
             Publish(NotesSaved, new NotesSavedInfo(snapshot.SessionId, path));
             if (run.CaptureError is not null && ResourcesStillOwned())
@@ -718,6 +748,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             }
             catch (OperationCanceledException) when (_exitCancellation.IsCancellationRequested)
             {
+                // Exit cancellation does not undo the durable transcript or notes already saved.
                 Finish(PipelineState.Saved, "Transcript saved.", path,
                     run.TranscriptionFlushWarning ?? run.CaptureError);
             }
@@ -743,6 +774,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         try
         {
+            // Stop devices first so their callbacks finish before the handlers and audio-push queue are closed.
             await Task.WhenAll(run.Devices.Select(async entry =>
                 await entry.Device.StopAsync(CancellationToken.None).ConfigureAwait(false))).ConfigureAwait(false);
         }
@@ -780,6 +812,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             {
                 try
                 {
+                    // Allow already queued writes a bounded chance to finish before closing the Speech stream.
                     await Task.WhenAll(pendingPushes).WaitAsync(_transcriptionTimeout).ConfigureAwait(false);
                 }
                 catch (TimeoutException)
@@ -803,6 +836,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     run.CaptureError ??= run.TranscriptionFlushWarning;
                 }
                 DeferTranscriptionStop(run, pendingPushes);
+                // Closing the stream while a write is still running can race the SDK; defer it until that write settles.
                 _logger.LogWarning("Speech finalization was deferred because an audio push is still active.");
             }
             else
@@ -823,6 +857,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
                         }
                     }
                     if (finalSegments is not null)
+                        // Refresh the map from the final service result, which can include speech recognized
+                        // while StopAsync flushed its internal buffers.
                         for (var index = 0; index < finalSegments.Length; index++)
                             _visualization.AppendOrUpdateSegment(index + 1, finalSegments[index]);
                     flushed = true;
@@ -847,6 +883,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
         lock (_gate)
         {
+            // Close callback acceptance only after the flush decision, then freeze one final snapshot.
             _transcription.SegmentRecognized -= run.FinalHandler;
             _transcription.PartialResultReceived -= run.PartialHandler;
             run.AcceptCallbacks = false;
@@ -866,6 +903,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // The caller has already hit the timeout; preserve recognized text and stop queuing audio.
             run.AcceptAudio = false;
             run.AudioDeliveryFailed = true;
             run.CaptureError ??=
@@ -881,6 +919,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private Task<TranscriptionResult> StartTranscriptionStop(SessionRun run)
     {
         lock (_gate) run.TranscriptionStopRequested = true;
+        // Speech shutdown may outlive the capture callback thread, so run and track it as owned work.
         var stopTask = Task.Run(() => _transcription.StopAsync(CancellationToken.None));
         TrackPendingTranscriptionOperation(run, stopTask, "speech shutdown");
         return stopTask;
@@ -895,6 +934,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             run.TranscriptionStopRequested = true;
             deferredStop = Task.Run(async () =>
             {
+                // Wait for all captured writes to settle before closing the push stream.
                 try { await Task.WhenAll(pendingPushes).ConfigureAwait(false); }
                 catch (Exception ex)
                 {
@@ -928,6 +968,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Replace the completed signal when the first operation is added; shutdown can await
+            // this signal without polling the list.
             if (run.PendingTranscriptionOperations.Count == 0)
                 run.TranscriptionOperationsSettled =
                     new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -949,6 +991,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
             lock (_gate)
             {
+                // Remove before signaling so a waiter that wakes sees the settled collection.
                 run.PendingTranscriptionOperations.Remove(operation);
                 onCompleted?.Invoke(completed);
                 if (run.PendingTranscriptionOperations.Count == 0)
@@ -976,12 +1019,14 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 if (_run is not { PendingTranscriptionOperations.Count: > 0 } run) return;
                 settled = run.TranscriptionOperationsSettled.Task;
             }
+            // A new operation can be registered after one signal; recheck under the lock each time.
             await settled.ConfigureAwait(false);
         }
     }
 
     internal static string? DescribeCaptureCompletionWarning(IEnumerable<AudioSourceHealth> health)
     {
+        // Only surface failures or actual buffer loss; a clean stopped source is not a warning.
         var affected = health
             .Where(source => source.State == CaptureHealthState.Failed || source.DroppedBuffers > 0)
             .ToArray();
@@ -999,6 +1044,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             })
             .Distinct(StringComparer.Ordinal)
             .ToArray();
+        // Report all dropped buffers as one count while keeping device failures human-readable.
         var dropped = affected.Sum(source => source.DroppedBuffers);
         var problems = failed.ToList();
         if (dropped > 0)
@@ -1023,6 +1069,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 throw new InvalidOperationException("Retry is available only after capture and finalization finish.");
             if (_lastCompleted is not { } snapshot || snapshot.SessionId != sessionId)
                 throw new InvalidOperationException("The requested completed transcript is not available.");
+            // Reserve the pipeline while it rewrites notes and retries AI for this exact saved transcript.
             _owned = true;
             _retryTask = Task.Run(async () =>
             {
@@ -1033,6 +1080,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 try
                 {
                     lock (_gate) token.ThrowIfCancellationRequested();
+                    // Save the current transcript first so a retry never relies only on in-memory state.
                     path = await PersistNotesAsync(snapshot, PreservedNotes(snapshot), token).ConfigureAwait(false);
                     Publish(NotesSaved, new NotesSavedInfo(sessionId, path));
                     return await GenerateAndSaveAsync(snapshot, path, token).ConfigureAwait(false);
@@ -1061,6 +1109,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (_preparingExit || _run is not { Closed: false } run)
                 throw new InvalidOperationException("Visualization analysis requires an active recording.");
             var document = _visualization.Snapshot();
+            // Skip duplicate analysis when neither transcript nor topic trail changed.
             if (_visualizationAnalysisTask is { IsCompletedSuccessfully: true } &&
                 _visualizationAnalysisSessionId == document.SessionId &&
                 _visualizationAnalysisTranscriptRevision == document.TranscriptRevision &&
@@ -1068,6 +1117,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 return Task.CompletedTask;
             if (_visualizationAnalysisTask is { IsCompleted: false })
             {
+                // Coalesce rapid transcript updates into one follow-up pass rather than starting parallel model calls.
                 if (_visualizationAnalysisSessionId == document.SessionId &&
                     (_visualizationAnalysisTranscriptRevision < document.TranscriptRevision ||
                      _visualizationAnalysisTopicCount < document.TopicTrail.Count))
@@ -1083,6 +1133,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 var analyzed = document;
                 while (true)
                 {
+                    // Analyze outside the pipeline lock; apply only while this recording is still current.
                     var result = await _visualizationIntelligence.AnalyzeVisualizationAsync(
                         analyzed, run.Cancellation.Token).ConfigureAwait(false);
                     lock (_gate)
@@ -1093,6 +1144,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     {
                         if (_run != run || run.Closed || !_visualizationAnalysisRefreshPending)
                             return;
+                        // Use the newest transcript for the one coalesced refresh, not the snapshot
+                        // that started the earlier request.
                         _visualizationAnalysisRefreshPending = false;
                         analyzed = _visualization.Snapshot();
                         _visualizationAnalysisSessionId = analyzed.SessionId;
@@ -1111,6 +1164,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         if (snapshot.WordCount == 0)
         {
+            // There is no speech to summarize; the transcript file still contains the completed session.
             Finish(PipelineState.Saved,
                 WithVisualizationStatus("Transcript saved; no speech was recognized.", path), path,
                 completionWarning);
@@ -1130,6 +1184,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 .WaitAsync(ct).ConfigureAwait(false);
             bool stale;
             lock (_gate)
+                // Avoid applying a slow result to a newer session or transcript revision.
                 stale = _lastCompleted?.SessionId != snapshot.SessionId ||
                     _lastCompleted.Revision != snapshot.Revision;
             if (stale)
@@ -1141,6 +1196,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
+            // A failed optional map refinement does not prevent final notes from using the live map.
             AiFinalizationDiagnostics.Record("final-visualization", "kept-live-map", ex,
                 elapsed.ElapsedMilliseconds, _aiFinalizationLogDirectory);
             _logger.LogWarning("Final topic map update failed ({ErrorType}); keeping the live topic map.",
@@ -1156,6 +1212,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
+            // Preserve the transcript and any prior notes so the user can retry intelligence later.
             failure ??= FailureFrom(ex, "Note generation failed. Check settings and retry.");
             AiFinalizationDiagnostics.Record("final-notes", "retry-available", ex,
                 elapsed.ElapsedMilliseconds, _aiFinalizationLogDirectory);
@@ -1178,6 +1235,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     AiDiagnosticRetryOutcome.RetryFailed);
                 throw;
             }
+            // During normal finalization, keep the already-durable transcript if the generated rewrite fails.
             _logger.LogWarning(
                 "Generated notes could not be saved ({ErrorType}); preserving the durable transcript for retry.",
                 ex.GetType().Name);
@@ -1208,6 +1266,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private string WithVisualizationStatus(string message, string path)
     {
+        // Sidecar failure is separate from Markdown success; explain that retry remains pending.
         lock (_gate)
             return _pendingVisualizationPath == path
                 ? message + " Visualization data is pending retry when the app exits."
@@ -1216,6 +1275,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private MeetingNotes PreservedNotes(TranscriptSnapshot snapshot)
     {
+        // Rebuild transcript-owned fields while retaining the last saved generated sections.
         lock (_gate)
             return CreateNotes(snapshot, _lastSavedNotes, _lastSavedNotes?.IntelligenceFailure);
     }
@@ -1223,11 +1283,13 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private async Task<string> PersistNotesAsync(
         TranscriptSnapshot snapshot, MeetingNotes notes, CancellationToken ct)
     {
+        // Snapshot the map once so the Markdown topic notes and companion JSON describe the same revision.
         var document = _visualization.Snapshot();
         var persistedNotes = CreateNotes(snapshot, notes, notes.IntelligenceFailure);
         persistedNotes.TopicNotes.Clear();
         persistedNotes.TopicNotes.AddRange(MeetingTopicNotesBuilder.Build(document));
         var cachedNotes = CreateNotes(snapshot, persistedNotes, persistedNotes.IntelligenceFailure);
+        // Save Markdown first: it is the required durable record; the sidecar is optional and retryable.
         var path = await _storage.SaveAsync(persistedNotes, ct).ConfigureAwait(false);
         var retryingPendingVisualization = false;
         lock (_gate)
@@ -1260,6 +1322,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             InvalidOperationException or ArgumentException or NotSupportedException or
             System.Text.Json.JsonException or System.Security.SecurityException or OperationCanceledException)
         {
+            // Keep the document and stable path in memory so exit or a later save can retry the sidecar.
             _logger.LogWarning("Visualization data could not be saved ({ErrorType}); it remains pending for exit retry.",
                 ex.GetBaseException().GetType().Name);
             _diagnostics.RecordPersistence(
@@ -1276,6 +1339,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private static MeetingNotes CreateNotes(TranscriptSnapshot snapshot, MeetingNotes? generated = null, IntelligenceFailure? failure = null)
     {
+        // Always take identity and raw transcript from the immutable snapshot; copy generated lists
+        // so later model or UI edits do not mutate another saved result.
         var notes = new MeetingNotes
         {
             SessionId = snapshot.SessionId, MeetingTitle = snapshot.Title, CreatedAt = snapshot.StartedAt,
@@ -1323,6 +1388,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                     foreach (var device in _devices)
                     {
                         previewToken.ThrowIfCancellationRequested();
+                        // Preview starts devices only; no transcript service or session run is created.
                         await device.StartAsync(previewToken).ConfigureAwait(false);
                     }
                     previewToken.ThrowIfCancellationRequested();
@@ -1330,6 +1396,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
                 }
                 catch
                 {
+                    // A partially started preview still owns some devices, so always stop all configured sources.
                     try { await StopDevicesAsync().ConfigureAwait(false); }
                     finally
                     {
@@ -1357,6 +1424,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             var startup = _previewTask ?? Task.CompletedTask;
             _previewStopTask = Task.Run(async () =>
             {
+                // Wait for startup rollback before issuing stop, avoiding start/stop races on the devices.
                 try { await startup.ConfigureAwait(false); }
                 catch (Exception) when (!_preview) { return; }
                 try
@@ -1391,6 +1459,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         lock (_gate)
         {
             if (!ReferenceEquals(_run, run) || !run.AcceptCallbacks) return;
+            // Reserve a position under the state lock; publication can then wait for earlier SDK callbacks.
             run.LastTranscriptProgressAt = _getUtcNow();
             segment = CanonicalSpeaker(segment);
             enriched = segment;
@@ -1400,6 +1469,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
         lock (run.SegmentPublicationGate)
         {
+            // Speech callbacks may run concurrently. Preserve transcript order while keeping the main
+            // pipeline lock free during event publication.
             while (ordinal != run.NextSegmentPublicationOrdinal)
                 Monitor.Wait(run.SegmentPublicationGate);
             try
@@ -1438,6 +1509,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         if (string.IsNullOrWhiteSpace(partial.Text)) return;
         var hash = StringComparer.Ordinal.GetHashCode(partial.Text);
+        // Repeated identical partials are not progress; only changed recognized text resets inactivity timing.
         if (!run.HasPartialTranscript || run.LastPartialTranscriptHash != hash)
         {
             run.HasPartialTranscript = true;
@@ -1455,6 +1527,8 @@ public sealed class MeetingPipeline : IAsyncDisposable
             return false;
         }
 
+        // Offer a manual stop only for confirmed detections after both audible audio and transcript
+        // progress have been quiet for the full inactivity window.
         if (!run.ConfirmedDetection || run.EndPromptShown ||
             now - run.LastAudibleAudioAt < MeetingEndInactivityWindow ||
             now - run.LastTranscriptProgressAt < MeetingEndInactivityWindow)
@@ -1475,6 +1549,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             var sample = (short)(audio.Buffer[offset] | (audio.Buffer[offset + 1] << 8));
             squares += (long)sample * sample;
         }
+        // Compare mean squared sample amplitude with the 500-RMS threshold without a square root.
         return squares >= AudibleRmsSquared * samples;
     }
 
@@ -1484,6 +1559,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             if (_run is { Closed: false } run)
             {
+                // Refresh stored segments after a user assigns a display name; the transcript uses IDs as identity.
                 for (var index = 0; index < run.Segments.Count; index++)
                     if (string.Equals(run.Segments[index].SpeakerId, args.SpeakerId,
                             StringComparison.OrdinalIgnoreCase))
@@ -1526,6 +1602,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (state != PipelineState.Recording && !IsResting(state))
                 throw new InvalidOperationException("Speakers can be combined while recording or after the meeting is saved.");
 
+            // Update IDs and display names as one pipeline operation, then persist finished notes if needed.
             _speakerResolver.Merge(plan);
             keptName = _speakerResolver.GetDisplayName(plan.KeptId);
             if (_run is { } run)
@@ -1546,6 +1623,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
         try
         {
+            // The saved map is separate from transcript identity, so merge its speaker references too.
             _visualization.MergeSpeakers(plan, keptName);
         }
         catch (InvalidOperationException) { }
@@ -1572,6 +1650,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Leave the detected call pending when recording, preview, exit, or disposal already owns the app.
             if (_owned || _disposed || _preparingExit) return;
             _pendingSession = session;
         }
@@ -1585,6 +1664,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         SessionRun? matched = null;
         lock (_gate)
         {
+            // Withdraw an unconfirmed prompt immediately when its detected process ends.
             if (_pendingSession?.Id == session.Id)
             {
                 _pendingSession = null;
@@ -1607,6 +1687,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         var sourceProcess = run.Session.SourceProcess;
         var resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // Watch the same process name for a new detector session during the grace period.
         void OnResume(object? _, MeetingSession resumedSession)
         {
             if (string.Equals(resumedSession.SourceProcess, sourceProcess, StringComparison.Ordinal))
@@ -1615,6 +1696,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         _detector.MeetingStarted += OnResume;
         try
         {
+            // Do not stop automatically: a call can briefly report no active capture while reconnecting.
             var graceTask = _delay(MeetingEndPromptGrace, CancellationToken.None);
             var completed = await Task.WhenAny(graceTask, resumed.Task).ConfigureAwait(false);
             if (completed == resumed.Task) return; // The call resumed before the grace elapsed; withdraw.
@@ -1644,6 +1726,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Recheck live ownership at the final state transition; a timed-out operation may still be running.
             _owned = ResourcesStillOwned();
             if (_owned)
             {
@@ -1655,6 +1738,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     }
 
     private bool ResourcesStillOwned() =>
+        // Capture devices, Speech, and tracked background pushes all count as ownership.
         _devices.Any(d => d.IsCapturing) || _transcription.HasActiveResources ||
         (_run?.PendingTranscriptionOperations.Any(operation => !operation.IsCompleted) ?? false);
 
@@ -1664,6 +1748,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Sequence numbers let consumers ignore delayed notifications from background work.
             _status = new(_status.Sequence + 1, sessionId ?? (_preview ? null : _run?.Session.Id),
                 state, message, path, error, intelligenceFailure, saveDeadline);
             Publish(StateChanged, _status);
@@ -1674,6 +1759,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     private void Publish<T>(EventHandler<T>? handlers, T value)
     {
         if (handlers is null) return;
+        // Isolate subscribers so one view throwing cannot prevent other listeners from seeing the update.
         foreach (EventHandler<T> handler in handlers.GetInvocationList())
             try { handler(this, value); }
             catch (Exception ex) { _logger.LogError("Pipeline event subscriber failed ({ErrorType}).", ex.GetType().Name); }
@@ -1683,6 +1769,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         lock (_gate)
         {
+            // Observe earlier failures during shutdown, then join the active stop, preview, and retry work.
             foreach (var operation in new[]
                 { _startTask, _stopTask, _previewTask, _previewStopTask, _retryTask, _visualizationAnalysisTask })
                 if (operation is { IsFaulted: true })
@@ -1708,6 +1795,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             if (_exitTask is not null) return _exitTask;
+            // Make exit preparation single-flight before starting the asynchronous cleanup.
             _preparingExit = true;
             return _exitTask = Task.Run(PrepareForExitCoreAsync);
         }
@@ -1717,6 +1805,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
     {
         try
         {
+            // Cancel AI work first; the current save review is forced to save so the transcript becomes durable.
             await _exitCancellation.CancelAsync().ConfigureAwait(false);
             lock (_gate)
                 if (_saveReview is { } review)
@@ -1730,12 +1819,14 @@ public sealed class MeetingPipeline : IAsyncDisposable
             TranscriptSnapshot? recovery;
             lock (_gate)
             {
+                // Never close while a device, Speech object, or audio push is still owned.
                 if (_owned || ResourcesStillOwned())
                     throw new InvalidOperationException("Capture resources are still owned. Exit was not completed.");
                 recovery = _lastSavedPath is null ? _lastCompleted : null;
             }
             if (recovery is not null)
             {
+                // Recover a transcript that was recognized but not yet written before attempting optional sidecars.
                 var path = await PersistNotesAsync(
                     recovery, PreservedNotes(recovery), CancellationToken.None).ConfigureAwait(false);
                 Publish(NotesSaved, new NotesSavedInfo(recovery.SessionId, path));
@@ -1751,6 +1842,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
             if (pendingPath is null || pendingDocument is null) return ExitReadiness.Clean;
             try
             {
+                // Retry optional visualization data once without holding capture resources or keeping the app open.
                 await _visualizationStorage.SaveAsync(
                     pendingPath, pendingDocument, CancellationToken.None).ConfigureAwait(false);
                 lock (_gate)
@@ -1775,6 +1867,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             lock (_gate)
             {
+                // Permit a later exit attempt after a required cleanup or transcript save failed.
                 _preparingExit = false;
                 _exitTask = null;
                 _exitCancellation.Dispose();
@@ -1793,6 +1886,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         var errorType = failure.GetBaseException().GetType().Name;
         if (_pendingVisualizationJournal is null)
         {
+            // Report the lost retry plainly; the transcript itself is already saved and remains usable.
             _diagnostics.RecordPersistence(
                 AiDiagnosticStage.VisualizationJournal,
                 failure,
@@ -1804,6 +1898,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         }
         try
         {
+            // Persist a sidecar retry record so a later launch can recover it without reopening this session.
             await _pendingVisualizationJournal
                 .RecordAsync(pendingPath, pendingDocument, CancellationToken.None).ConfigureAwait(false);
             lock (_gate)
@@ -1840,6 +1935,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             if (_disposeTask is { IsCompleted: false } pending) return new(pending);
             if (_disposed) return ValueTask.CompletedTask;
+            // Mark disposed before cleanup so new public operations fail instead of racing resource release.
             _disposed = true;
             _disposeTask = DisposeCoreAsync();
             return new(_disposeTask);
@@ -1848,6 +1944,7 @@ public sealed class MeetingPipeline : IAsyncDisposable
 
     private async Task DisposeCoreAsync()
     {
+        // Detach event sources first so disposal cannot start new pipeline work.
         _detector.MeetingStarted -= OnMeetingStarted;
         _detector.MeetingEnded -= OnMeetingEnded;
         _speakerResolver.SpeakerResolved -= OnSpeakerResolved;
@@ -1860,12 +1957,14 @@ public sealed class MeetingPipeline : IAsyncDisposable
         {
             stopFailure = ex;
         }
+        // Even if stop reported a failure, wait for every tracked Speech operation before disposing its service.
         await WaitForTranscriptionOperationsAsync().ConfigureAwait(false);
         _diagnostics.Clear();
         List<Exception> errors = [];
         if (stopFailure is not null) errors.Add(stopFailure);
         try { await _transcription.DisposeAsync().ConfigureAwait(false); }
         catch (Exception ex) { errors.Add(ex); }
+        // Dispose every device independently so one failure does not leak the remaining sources.
         foreach (var device in _devices)
             try { device.Dispose(); }
             catch (Exception ex) { errors.Add(ex); }

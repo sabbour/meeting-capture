@@ -42,6 +42,8 @@ public sealed class MicrophoneCapture : IAudioCapture, IMicActivitySource
 
     private void OnPcm(byte[] bytes, int count)
     {
+        // Measure the same normalized PCM stream that listeners receive. Only sufficiently loud
+        // audio updates the activity timestamp, which is later used to identify the local speaker.
         _rms.Add(bytes, count);
         if (_rms.Rms >= 500)
             Interlocked.Exchange(ref _micActivityTicks, DateTime.UtcNow.Ticks);
@@ -52,6 +54,7 @@ public sealed class MicrophoneCapture : IAudioCapture, IMicActivitySource
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (IsCapturing) throw new InvalidOperationException("The microphone is already owned.");
+        // These are the exact format and activity threshold expected by the transcription path.
         if (SampleRate != 16000 || Channels != 1)
             throw new InvalidOperationException("Microphone capture supports 16000 Hz mono PCM.");
         _rms = new RollingRms(SampleRate, 500);
@@ -63,6 +66,7 @@ public sealed class MicrophoneCapture : IAudioCapture, IMicActivitySource
     {
         if (_disposed) return;
         _disposed = true;
+        // Dispose is synchronous by contract, so wait for the worker to finish draining and release WASAPI.
         _worker.StopAsync(CancellationToken.None).GetAwaiter().GetResult();
     }
 }

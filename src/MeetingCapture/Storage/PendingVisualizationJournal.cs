@@ -50,11 +50,13 @@ public sealed class FilePendingVisualizationJournal : IPendingVisualizationJourn
         ArgumentNullException.ThrowIfNull(document);
         Directory.CreateDirectory(_root);
         var path = EntryPath(markdownPath);
+        // Write beside the destination, then replace it so a crash cannot leave a half-written journal entry.
         var temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             var bytes = JsonSerializer.SerializeToUtf8Bytes(
                 new Entry(CurrentEntryVersion, markdownPath, DateTimeOffset.UtcNow, document), Json);
+            // A bounded journal prevents optional recovery data from consuming unbounded disk space.
             if (bytes.LongLength > MaxEntryBytes)
                 throw new IOException("Visualization retry data is too large to keep for recovery.");
             await File.WriteAllBytesAsync(temporary, bytes, cancellationToken).ConfigureAwait(false);
@@ -83,6 +85,8 @@ public sealed class FilePendingVisualizationJournal : IPendingVisualizationJourn
             Entry? entry;
             try
             {
+                // Check the file size before allocating its contents; malformed entries stay on disk
+                // for inspection rather than blocking recovery of other entries.
                 var info = new FileInfo(file);
                 if (info.Length <= 0 || info.Length > MaxEntryBytes) continue;
                 entry = JsonSerializer.Deserialize<Entry>(
@@ -98,6 +102,7 @@ public sealed class FilePendingVisualizationJournal : IPendingVisualizationJourn
                 continue;
             if (!File.Exists(entry.MarkdownPath))
             {
+                // The transcript is the durable record. Without it, its optional visualization cannot be used.
                 TryDelete(file);
                 continue;
             }
@@ -125,11 +130,14 @@ public sealed class FilePendingVisualizationJournal : IPendingVisualizationJourn
     }
 
     private string EntryPath(string markdownPath) =>
+        // Hash the canonical notes path so each transcript maps to one journal file without exposing
+        // the user's folder names in the journal directory.
         Path.Combine(_root, Convert.ToHexString(SHA256.HashData(
             Encoding.UTF8.GetBytes(Path.GetFullPath(markdownPath).ToLowerInvariant()))) + ".json");
 
     private static void TryDelete(string path)
     {
+        // Cleanup is best-effort; a locked journal file must not hide a successful sidecar save.
         try { File.Delete(path); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
