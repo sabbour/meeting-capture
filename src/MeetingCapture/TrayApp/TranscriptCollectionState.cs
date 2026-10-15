@@ -31,6 +31,7 @@ internal sealed class TranscriptCollectionState<T>(int capacity)
         Func<T> create,
         Func<T, bool> update)
     {
+        // A partial belongs to one speaker; replace it when diarization changes instead of relabeling old words.
         if (Partial is not null &&
             !string.Equals(Partial.SpeakerId, speakerId, StringComparison.OrdinalIgnoreCase))
             RemovePartial();
@@ -51,12 +52,14 @@ internal sealed class TranscriptCollectionState<T>(int capacity)
         Func<T> create,
         Func<T, bool> update)
     {
+        // Update an existing revision first so replayed snapshots do not append duplicate transcript rows.
         var existing = Rows.FirstOrDefault(row => row.Revision == revision);
         if (existing is not null)
             return new(existing, false, update(existing), false);
 
         if (Partial is not null && Rows.Count > 0 && ReferenceEquals(Rows[^1], Partial))
         {
+            // Promote the live row in place so the list does not animate or lay out a duplicate final line.
             var row = Partial;
             Partial = null;
             row.Revision = revision;
@@ -77,6 +80,7 @@ internal sealed class TranscriptCollectionState<T>(int capacity)
         Func<TValue, T> create,
         Func<T, TValue, bool> update)
     {
+        // Reuse rows by revision, move them to the incoming order, and remove only rows no longer in the snapshot.
         var changed = Partial is not null;
         RemovePartial();
         for (var index = 0; index < values.Count; index++)
@@ -134,6 +138,7 @@ internal sealed class TranscriptCollectionState<T>(int capacity)
 
     private void TrimForAppend()
     {
+        // The collection is a moving window; discard the oldest visible row before adding past capacity.
         if (Rows.Count >= capacity)
             Rows.RemoveAt(0);
     }

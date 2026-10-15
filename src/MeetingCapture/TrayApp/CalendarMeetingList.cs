@@ -13,6 +13,7 @@ public static class CalendarMeetingList
     /// <summary>Keeps eligible online meetings: those around now first (current ones first), then later ones, then earlier ones (newest first).</summary>
     public static List<MeetingTitleCandidate> Select(IEnumerable<MeetingTitleCandidate> meetings, DateTimeOffset now)
     {
+        // Filter once, then group the candidates by the order that is most useful when recording starts.
         var timed = meetings.Where(MeetingTitleResolver.IsEligibleOnlineMeeting).ToArray();
         return timed.Where(m => IsAroundNow(m, now))
             .OrderBy(m => m.Start <= now && now < m.End ? 0 : 1).ThenBy(m => m.Start)
@@ -37,6 +38,7 @@ public static class MeetingPromptPresentation
     {
         var meeting = session.CalendarMeeting;
         var participants = session.InviteParticipants;
+        // Keep the prompt compact: show at most two names while still reporting the full invitee count.
         var organizer = !string.IsNullOrWhiteSpace(meeting?.Organizer?.Name)
             ? $"Organizer: {meeting.Organizer.Name.Trim()}"
             : null;

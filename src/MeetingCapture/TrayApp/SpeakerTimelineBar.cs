@@ -52,12 +52,14 @@ public sealed class SpeakerTimelineBar : Grid
 
     private void Render()
     {
+        // Rebuild only the small overlay of talk intervals; the background track remains in place.
         _segments.Children.Clear();
         var width = ActualWidth;
         if (width <= 0 || Spans is not IEnumerable<SpeakerTimelineSpan> spans) return;
 
         foreach (var span in spans)
         {
+            // Clamp model fractions to the track and keep very short intervals visible at this scale.
             var left = Math.Clamp(span.Start, 0, 1) * width;
             var right = Math.Clamp(span.End, 0, 1) * width;
             var segmentWidth = Math.Min(Math.Max(right - left, MinSegmentWidth), width - left);

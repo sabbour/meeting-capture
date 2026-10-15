@@ -126,6 +126,7 @@ public sealed class MeetingRow
     {
         var start = meeting.Start.ToLocalTime();
         var end = meeting.End.ToLocalTime();
+        // Scheduled time determines the label and color; it does not claim that the user joined the call.
         var isNow = meeting.Start <= now && now < meeting.End;
         var isUpcoming = meeting.Start > now;
         // MDL2 glyphs: E9D9 = Record (filled circle), E823 = Timer, E81C = History
@@ -142,6 +143,7 @@ public sealed class MeetingRow
             details.Add($"Organizer: {meeting.Organizer.Name.Trim()}");
         if (participants.Count > 0)
         {
+            // Show a short preview and keep the total count so the flyout stays compact.
             var preview = participants.Select(person => person.Name?.Trim())
                 .Where(name => !string.IsNullOrWhiteSpace(name))
                 .Take(2)
@@ -152,6 +154,7 @@ public sealed class MeetingRow
         }
         var timeText = $"{(isNow ? "Ongoing" : isUpcoming ? "Upcoming" : "Ended")}: {start:h:mm tt} - {end:h:mm tt}";
         var detailsText = string.Join(" | ", details);
+        // The accessible name includes the action because the row's visible button only says "Record".
         return new MeetingRow
         {
             Subject       = subject,
@@ -222,6 +225,7 @@ public sealed class ContextEvidenceSourceViewModel
         string itemSummary,
         bool includeDetail)
     {
+        // A source can lack its own title, so fall back to the suggestion title before using a generic label.
         var sourceTitle = ContextTitlePresentation.Clean(source.Title);
         var suggestionTitle = ContextTitlePresentation.Clean(itemTitle);
         Title = sourceTitle.Length > 0
@@ -243,6 +247,7 @@ public sealed class ContextEvidenceSourceViewModel
             _ => "Source",
         };
         Date = source.ActualSourceDate?.ToLocalTime().ToString("g") ?? "Date unavailable";
+        // Repeat the suggestion detail only for the first source to avoid redundant text in a multi-source result.
         Detail = includeDetail
             ? ContextTitlePresentation.UniqueDetail(itemSummary, itemTitle, source.Title)
             : string.Empty;

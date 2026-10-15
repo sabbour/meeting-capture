@@ -28,6 +28,7 @@ internal static class AiUsagePresentation
     internal static AiUsageUiPresentation Create(AiUsageSnapshot snapshot)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
+        // Prefer a running request; otherwise the first snapshot entry is the latest known activity.
         var active = snapshot.Requests.FirstOrDefault(request =>
             request.State == AiRequestState.Running);
         var latest = active ?? snapshot.Requests.FirstOrDefault();
@@ -54,6 +55,7 @@ internal static class AiUsagePresentation
         var values = metrics.ToArray();
         if (!values.Any(value => value.IsReported))
             return "Not reported";
+        // Report a subtotal when only some providers returned usage, rather than implying completeness.
         var total = values.Sum(value => value.Total).ToString("N0", CultureInfo.CurrentCulture);
         return values.Any(value => value.UnreportedCalls > 0)
             ? $"{total} (partial; some calls did not report usage)"
@@ -64,6 +66,7 @@ internal static class AiUsagePresentation
         AiUsageSnapshot snapshot,
         AiRequestUsage? latest)
     {
+        // A missing session means there is no trustworthy usage snapshot to display.
         if (snapshot.SessionId is null)
             return AiActivityVisualState.Unavailable;
         if (latest is null)
@@ -73,6 +76,7 @@ internal static class AiUsagePresentation
         if (latest.State == AiRequestState.RateLimited)
             return AiActivityVisualState.RateLimited;
         if (latest.State == AiRequestState.Failed)
+            // Configuration, account, model, quota, and support failures mean this capability cannot currently be used.
             return latest.Failure is
                 AiRequestFailure.Configuration or
                 AiRequestFailure.Authentication or
@@ -129,6 +133,7 @@ internal static class AiUsagePresentation
         const decimal nanoAiusPerAic = 1_000_000_000m;
         const decimal usdPerAic = 0.01m;
         var rawNanoAius = value.ToString("G", CultureInfo.CurrentCulture);
+        // Keep the provider total and show the documented AIC conversion separately as an equivalent, not a charge.
         var aic = (decimal)value / nanoAiusPerAic;
         var usd = aic * usdPerAic;
         return $"Total Nano AIUs: {rawNanoAius} · AIC equivalent: " +

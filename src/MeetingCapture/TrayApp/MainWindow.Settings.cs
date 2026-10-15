@@ -74,6 +74,7 @@ public sealed partial class MainWindow
 
     private void InitializeSettingsEditor()
     {
+        // Edits invalidate prior validation results so a displayed success always matches the current form.
         foreach (var field in new[]
                  {
                      IEndpoint, IApiVersion, ISynthesisDeployment, IIntelligenceDeployment,
@@ -99,6 +100,7 @@ public sealed partial class MainWindow
 
     private void OpenSettingsEditor()
     {
+        // A fresh lifetime cancels model-list loads or tests started by a previous opening of Settings.
         CancelSettingsEditorLifetime();
         _settingsEditorLifetime = new CancellationTokenSource();
         SaveButton.IsEnabled = true;
@@ -106,6 +108,7 @@ public sealed partial class MainWindow
 
         try
         {
+            // Suppress change handlers while saved values are copied into controls.
             _loadingSettingsValues = true;
             LoadSettingsValues();
             _loadingSettingsValues = false;
@@ -128,6 +131,7 @@ public sealed partial class MainWindow
 
     private void OnAiDiagnosticsChanged(object? sender, EventArgs e)
     {
+        // Diagnostic events can arrive from background requests; queue at most one UI refresh at a time.
         if (Interlocked.Exchange(ref _aiDiagnosticsRenderQueued, 1) != 0)
             return;
         if (!_dispatcherQueue.TryEnqueue(() =>
@@ -145,6 +149,7 @@ public sealed partial class MainWindow
     {
         if (_loadingAiDiagnostics)
             return;
+        // The diagnostics stream owns the session-only capture setting and clears prior payloads when disabled.
         var enabled = AiDiagnosticsSensitiveToggle.IsOn;
         _pipeline.AiDiagnostics.SetSensitiveContentCapture(enabled);
         AiDiagnosticsAnnouncementText.Text = enabled
@@ -162,6 +167,7 @@ public sealed partial class MainWindow
     {
         try
         {
+            // Render one consistent snapshot and reconcile by sequence to keep expanded rows stable.
             var snapshot = _pipeline.AiDiagnostics.GetSnapshot();
             _loadingAiDiagnostics = true;
             AiDiagnosticsSensitiveToggle.IsOn = snapshot.SensitiveContentCaptureEnabled;
@@ -228,6 +234,7 @@ public sealed partial class MainWindow
 
     private void CancelSettingsEditorLifetime()
     {
+        // Cancel first so any continuation can see that this form instance is no longer current.
         var lifetime = Interlocked.Exchange(ref _settingsEditorLifetime, null);
         lifetime?.Cancel();
         lifetime?.Dispose();
@@ -239,6 +246,7 @@ public sealed partial class MainWindow
     {
         var saved = _settingsManager.ReadSaved();
 
+        // Secret fields intentionally stay blank; placeholders confirm whether a saved key already exists.
         TEndpoint.Text = saved?.TranscriptionEndpoint ?? _settings.Transcription.Endpoint;
         TRegion.Text = saved?.TranscriptionRegion ?? _settings.Transcription.Region;
         TLanguage.Text = saved?.TranscriptionLanguage ?? _settings.Transcription.Language;
@@ -248,6 +256,7 @@ public sealed partial class MainWindow
             : "Optional - enter to enable transcription";
 
         var active = _settingsManager.GetIntelligenceSnapshot().Settings;
+        // The active snapshot includes the effective provider settings, including higher-precedence overrides.
         var isGitHub = string.Equals(active.Provider, "github", StringComparison.OrdinalIgnoreCase);
         IProvider.SelectedIndex = isGitHub ? 0 : 1;
         ApplyProviderVisibility(isGitHub);
@@ -295,6 +304,7 @@ public sealed partial class MainWindow
         if (_copilotModelLoadLifetime == lifetime)
             return;
 
+        // Save the visible selections before replacing ItemsSource so the refresh does not lose configured ids.
         var synthesis = CurrentCopilotModel(ISynthesisModel, _synthesisModelSelection);
         var intelligence = CurrentCopilotModel(IIntelligenceModel, _intelligenceModelSelection);
         _copilotModelLoadLifetime = lifetime;
@@ -304,6 +314,7 @@ public sealed partial class MainWindow
         CopilotModelCatalogStatus.Text = "Loading available GitHub Copilot models...";
         try
         {
+            // The catalog call may take time; after it returns, only update controls if this editor is still open.
             var snapshot = await _copilotModelCatalog.GetModelsAsync(forceRefresh, lifetime.Token);
             if (_settingsEditorLifetime != lifetime || lifetime.IsCancellationRequested)
                 return;
@@ -336,6 +347,7 @@ public sealed partial class MainWindow
         }
         finally
         {
+            // A closed editor must not have its controls re-enabled by an older refresh.
             if (_copilotModelLoadLifetime == lifetime)
             {
                 _copilotModelLoadLifetime = null;
@@ -400,6 +412,7 @@ public sealed partial class MainWindow
             };
             picker.FileTypeFilter.Add("*");
 
+            // WinUI's folder picker needs the owning HWND to attach its native dialog to this window.
             var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
             WinRT.Interop.InitializeWithWindow.Initialize(picker, hwnd);
 
@@ -447,6 +460,7 @@ public sealed partial class MainWindow
             _testingIntelligence = true;
 
         var revision = _settingsFormRevision;
+        // Run network validation away from the UI thread and ignore its result if the form changed meanwhile.
         button.IsEnabled = false;
         resultText.Text = "Testing...";
         resultText.Visibility = Visibility.Visible;
@@ -455,6 +469,7 @@ public sealed partial class MainWindow
         {
             var formSettings = BuildIntelligenceSettingsFromForm();
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
+            // Bound the test even when the provider call does not return promptly.
             cts.CancelAfter(TimeSpan.FromSeconds(75));
             var (ok, detail) = await Task.Run(
                 () => _intelligence.ValidateModelAsync(isSynthesis, formSettings, cts.Token),
@@ -490,6 +505,7 @@ public sealed partial class MainWindow
     private Configuration.IntelligenceSettings BuildIntelligenceSettingsFromForm()
     {
         var savedApiKey = _settingsManager.GetIntelligenceSnapshot().Settings.ApiKey;
+        // A blank password means "keep the configured key"; a typed value replaces it for this test/save.
         return new Configuration.IntelligenceSettings
         {
             Provider = IProvider.SelectedIndex == 0 ? "github" : "azure",
@@ -508,9 +524,11 @@ public sealed partial class MainWindow
         SaveButton.IsEnabled = false;
         try
         {
+            // Reject a settings combination that would leave the app with no audio source at all.
             if (!CaptureMic.IsOn && !CaptureLoopback.IsOn)
                 throw new InvalidOperationException("Select at least one audio source.");
 
+            // Pass form values to the settings manager; it reports which changes affect only future requests or require restart.
             var result = await _settingsManager.SaveAsync(new EditableSettings
             {
                 TranscriptionEndpoint = TEndpoint.Text.Trim(),
@@ -541,6 +559,7 @@ public sealed partial class MainWindow
                 "Saved. Intelligence and synthesis changes apply to new requests." + restart +
                 " Higher-precedence environment or user-secret overrides remain effective.",
                 InfoBarSeverity.Success);
+            // Do not leave typed credentials visible after the settings manager has accepted the save.
             TApiKey.Password = string.Empty;
             IApiKey.Password = string.Empty;
         }

@@ -11,6 +11,7 @@ internal static class AboutDialog
 
     internal static async Task ShowAsync(XamlRoot xamlRoot)
     {
+        // Prevent overlapping dialogs when the user triggers About more than once.
         if (_open) return;
         _open = true;
         try
@@ -25,11 +26,13 @@ internal static class AboutDialog
             };
             await dialog.ShowAsync();
         }
+        // Reset the guard even if dialog creation or display fails.
         finally { _open = false; }
     }
 
     private static UIElement BuildContent()
     {
+        // Build this as a small tree of WinUI controls so links and long license lists remain usable.
         var panel = new StackPanel { Spacing = 10, MaxWidth = 420 };
         panel.Children.Add(new TextBlock { Text = AboutInfo.Description, TextWrapping = TextWrapping.Wrap });
         panel.Children.Add(new TextBlock

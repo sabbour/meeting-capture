@@ -42,6 +42,7 @@ internal sealed class TrayContextMenuHost : IDisposable
         _root = new Grid { Background = new SolidColorBrush(Colors.Transparent) };
         _window = new Window { Content = _root };
         _hwnd = WinRT.Interop.WindowNative.GetWindowHandle(_window);
+        // This is a borderless popup owned by the tray, not a second app window for Alt+Tab or taskbar switching.
         DesktopWindowsManagerMethods.SetRoundedCorners(_hwnd);
         WindowUtilities.MakeTransparent(_hwnd);
         HwndUtilities.SetWindowStyleAsPopupWindow(_hwnd);
@@ -67,6 +68,7 @@ internal sealed class TrayContextMenuHost : IDisposable
         if (_disposed || !Native.GetCursorPos(out var cursor))
             return;
 
+        // Use the monitor under the pointer on every open, since the tray can move between displays.
         var monitor = Native.MonitorFromPoint(cursor, Native.MonitorDefaultToNearest);
         var workArea = Native.WorkAreaOf(monitor);
         var dpi = Native.DpiOf(monitor);
@@ -113,6 +115,7 @@ internal sealed class TrayContextMenuHost : IDisposable
             if (item.Visibility != Visibility.Visible)
                 continue;
 
+            // Give normal items a known width before measuring; the default is used if WinUI cannot measure yet.
             var separator = item is MenuFlyoutSeparator;
             if (!separator)
             {
@@ -145,6 +148,7 @@ internal sealed class TrayContextMenuHost : IDisposable
         for (var attempt = 0; attempt < MaxResizeAttempts; attempt++)
         {
             _appWindow.MoveAndResize(rect);
+            // Windows can rescale after a monitor change; verify the actual HWND size before opening the menu.
             if (!NativeMethods.GetWindowRect(_hwnd, out var actual) ||
                 TrayMenuLayout.SizeMatches(bounds, actual.Right - actual.Left, actual.Bottom - actual.Top))
                 return;
@@ -155,6 +159,7 @@ internal sealed class TrayContextMenuHost : IDisposable
     {
         try
         {
+            // Show only after the host window has content, so the popup has a valid XamlRoot.
             _menu.ShowAt(_root, new FlyoutShowOptions { ShowMode = FlyoutShowMode.Transient });
         }
         catch (Exception)
@@ -180,6 +185,7 @@ internal sealed class TrayContextMenuHost : IDisposable
     private void OnRootLoaded(object sender, RoutedEventArgs e)
     {
         _contentLoaded = true;
+        // Root loading may finish after the first click; reopen only if that click is still active.
         HwndUtilities.SetWindowStyleAsPopupWindow(_hwnd);
         if (_open && !_menu.IsOpen)
             ShowFlyout();
@@ -189,6 +195,7 @@ internal sealed class TrayContextMenuHost : IDisposable
     {
         if (args.WindowActivationState == WindowActivationState.Deactivated)
         {
+            // Losing focus closes this transient menu just like a normal shell context menu.
             if (_open)
                 Close();
             return;
@@ -254,6 +261,7 @@ internal sealed class TrayContextMenuHost : IDisposable
             var info = new MonitorInfo { cbSize = Marshal.SizeOf<MonitorInfo>() };
             if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info))
             {
+                // The work area excludes the taskbar; use it so the menu never covers that reserved strip.
                 var work = info.rcWork;
                 return new WindowBounds(work.Left, work.Top, work.Right - work.Left, work.Bottom - work.Top);
             }
@@ -263,6 +271,7 @@ internal sealed class TrayContextMenuHost : IDisposable
 
         internal static int DpiOf(IntPtr monitor)
         {
+            // Prefer the effective DPI of the selected monitor; use the system value if that API is unavailable.
             if (monitor != IntPtr.Zero &&
                 GetDpiForMonitor(monitor, MonitorDpiTypeEffective, out var dpiX, out _) == 0 &&
                 dpiX > 0)

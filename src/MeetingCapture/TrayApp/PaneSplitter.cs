@@ -29,6 +29,7 @@ internal sealed partial class PaneSplitter : Grid
 
     private void OnPointerPressed(object sender, PointerRoutedEventArgs e)
     {
+        // Capture only a left-button drag and remember the point inside the handle to avoid a jump on first move.
         if (!e.GetCurrentPoint(this).Properties.IsLeftButtonPressed || !CapturePointer(e.Pointer))
             return;
         _dragging = true;
@@ -40,6 +41,7 @@ internal sealed partial class PaneSplitter : Grid
     {
         if (!_dragging || Parent is not UIElement parent)
             return;
+        // Report the requested edge in the parent's coordinate space, matching the grid layout calculation.
         LeftEdgeRequested?.Invoke(this, e.GetCurrentPoint(parent).Position.X - _grabOffset);
         e.Handled = true;
     }
@@ -55,6 +57,7 @@ internal sealed partial class PaneSplitter : Grid
 
     private void OnKeyDown(object sender, KeyRoutedEventArgs e)
     {
+        // Keyboard arrows provide the same resize operation for users who cannot drag the handle.
         var direction = e.Key switch
         {
             VirtualKey.Left => -1,

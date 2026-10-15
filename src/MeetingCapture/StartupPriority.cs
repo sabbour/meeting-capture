@@ -41,6 +41,7 @@ internal static class StartupPriority
     /// <summary>Turns off Efficiency mode's slow-execution request for this process.</summary>
     internal static bool DisableEfficiencyMode()
     {
+        // Clear only the execution-speed bit; leave unrelated process power-throttling settings untouched.
         var state = new PowerThrottlingState
         {
             Version = PowerThrottlingCurrentVersion,
@@ -55,6 +56,7 @@ internal static class StartupPriority
     internal static bool IsEfficiencyModeOn()
     {
         var state = new PowerThrottlingState { Version = PowerThrottlingCurrentVersion };
+        // Windows reports both whether the bit is controlled and whether it is enabled.
         return GetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, ref state,
                    (uint)Marshal.SizeOf<PowerThrottlingState>())
                && (state.ControlMask & PowerThrottlingExecutionSpeed) != 0
@@ -66,6 +68,7 @@ internal static class StartupPriority
     {
         try
         {
+            // Read the error immediately after a failed native call before another call can replace it.
             var priority = GetPriorityClass(GetCurrentProcess());
             var priorityError = priority == 0 ? Marshal.GetLastPInvokeError() : 0;
             var efficiencyOn = IsEfficiencyModeOn();
@@ -88,6 +91,7 @@ internal static class StartupPriority
             }
 
             if (changes.Count == 0 && failures.Count == 0) return;
+            // Record only actual repairs and failures; a normal process needs no diagnostic entry.
             Log($"found priorityClass=0x{priority:x} efficiencyMode={(efficiencyOn ? "on" : "off")}; " +
                 (changes.Count > 0 ? "changed: " + string.Join(", ", changes) : "changed: nothing") +
                 (failures.Count > 0 ? "; failed: " + string.Join(", ", failures) : string.Empty));
@@ -109,6 +113,7 @@ internal static class StartupPriority
         try
         {
             if (s_watchdog is not null) return;
+            // Recheck quickly during startup, then less often; the dedicated thread can still run if the app is demoted.
             var started = Stopwatch.StartNew();
             var watchdog = new Thread(() =>
             {
@@ -153,6 +158,7 @@ internal static class StartupPriority
             var path = LogPath();
             lock (s_logGate)
             {
+                // Serialize appends and create the folder only when a diagnostic is actually needed.
                 Directory.CreateDirectory(Path.GetDirectoryName(path)!);
                 File.AppendAllText(path,
                     DateTimeOffset.Now.ToString("o", CultureInfo.InvariantCulture) +
@@ -209,6 +215,7 @@ internal static class StartupPriority
 
     internal static bool EnableEfficiencyModeForTest()
     {
+        // Test hook mirrors the two bits Windows uses to request reduced execution speed.
         var state = new PowerThrottlingState
         {
             Version = PowerThrottlingCurrentVersion,

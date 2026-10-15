@@ -16,6 +16,7 @@ internal static class VisualizationCollectionState
         Func<T, string> id,
         Func<T, string> fingerprint)
     {
+        // Remove vanished ids first; later passes can then move or replace only entries still needed.
         var incomingIds = incoming.Select(id).ToHashSet(StringComparer.Ordinal);
         for (var index = current.Count - 1; index >= 0; index--)
         {
@@ -40,6 +41,7 @@ internal static class VisualizationCollectionState
 
             if (existingIndex < 0)
             {
+                // New items are inserted at their final position, preserving the incoming order.
                 current.Insert(targetIndex, target);
                 added.Add(target);
                 continue;
@@ -50,6 +52,7 @@ internal static class VisualizationCollectionState
 
             if (!StringComparer.Ordinal.Equals(fingerprint(current[targetIndex]), fingerprint(target)))
             {
+                // Keep unchanged view models alive; replace only when the displayed data actually differs.
                 current[targetIndex] = target;
                 changed.Add(target);
             }

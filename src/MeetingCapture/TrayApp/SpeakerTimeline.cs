@@ -42,6 +42,7 @@ public static class SpeakerTimeline
         ArgumentNullException.ThrowIfNull(segments);
         if (segments.Count == 0) return SpeakerTimelineModel.Empty;
 
+        // While recording, extend the shared axis to the latest transcript timestamp or current time.
         var end = endedAt ?? Max(now, segments.Max(segment => segment.Timestamp));
         var duration = end - startedAt;
         var order = new List<string>();
@@ -52,6 +53,7 @@ public static class SpeakerTimeline
         var previousEnd = startedAt;
         foreach (var segment in segments)
         {
+            // Recognition supplies an end timestamp only; estimate a bounded start and prevent overlap with earlier speech.
             var id = string.IsNullOrWhiteSpace(segment.SpeakerId) ? UnknownSpeakerId : segment.SpeakerId;
             if (!intervals.TryGetValue(id, out var list))
             {
@@ -65,6 +67,7 @@ public static class SpeakerTimeline
             previousEnd = Max(previousEnd, spanEnd);
             if (spanEnd <= spanStart) continue;
 
+            // Join nearby spans from the same speaker to keep the display readable.
             if (list.Count > 0 && spanStart - list[^1].End <= CoalesceGap)
                 list[^1] = (list[^1].Start, Max(list[^1].End, spanEnd));
             else
@@ -74,6 +77,7 @@ public static class SpeakerTimeline
         var rows = order.Select(id =>
         {
             var talk = intervals[id].Aggregate(TimeSpan.Zero, (sum, item) => sum + (item.End - item.Start));
+            // Store positions as fractions so every speaker row uses the same width when drawn.
             var spans = duration <= TimeSpan.Zero
                 ? []
                 : intervals[id].Select(item => new SpeakerTimelineSpan(

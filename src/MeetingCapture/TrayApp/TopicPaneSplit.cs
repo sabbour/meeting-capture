@@ -14,6 +14,7 @@ internal static class TopicPaneSplit
     // Returns the fraction of the non-splitter width given to the topic map.
     internal static double MainShare(double requestedMainWidth, double bodyWidth, double splitterWidth)
     {
+        // Exclude the handle from available content width, then clamp both panes to their minimums.
         var available = Math.Max(1, bodyWidth - Math.Max(0, splitterWidth));
         var minimum = Math.Min(MinimumMainWidth, available / 2);
         var maximum = Math.Max(minimum, available - MinimumNotesWidth);

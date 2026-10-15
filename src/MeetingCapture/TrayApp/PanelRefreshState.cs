@@ -31,6 +31,7 @@ public sealed class PanelRefreshState
     /// <summary>Resets the panel to pending for a new session or settings revision, and drops results from earlier refreshes.</summary>
     public void Invalidate(string sessionId, long configurationRevision)
     {
+        // Every in-flight result carries the old generation, so it cannot repopulate the new session or settings.
         _generation++;
         Status = new(PanelState.Pending, sessionId, -1, configurationRevision, null, null, null);
         // Cancellation does not prove the underlying operation finished. Keep its guard.
@@ -39,6 +40,7 @@ public sealed class PanelRefreshState
     /// <summary>Starts a refresh. Returns its generation, or null if one is already running or the transcript has not advanced (unless forced).</summary>
     public long? TryBegin(string sessionId, long revision, long configurationRevision, bool force)
     {
+        // Require the current session/settings; unless forced, also require newer transcript data.
         if (_busy || Status.SessionId != sessionId || Status.ConfigurationRevision != configurationRevision ||
             (!force && Status.TranscriptRevision >= revision))
             return null;
@@ -50,6 +52,7 @@ public sealed class PanelRefreshState
     /// <summary>Records a refresh result. Returns false and ignores it if it is stale.</summary>
     public bool Complete(long generation, long revision, bool hasResults, IntelligenceFailure? failure)
     {
+        // Reject work started before invalidation and snapshots older than the result already shown.
         if (generation != _generation || revision < Status.TranscriptRevision)
             return false;
         var state = failure is null
@@ -70,6 +73,7 @@ public sealed class PanelRefreshState
     public void End(long generation)
     {
         _busy = false;
+        // A refresh can end without a result when it was cancelled; allow the next eligible request to run.
         if (generation == _generation && Status.State == PanelState.Refreshing)
             Status = Status with { State = PanelState.Pending };
     }
@@ -81,6 +85,7 @@ public static class InsightRetention
     /// <summary>Returns trimmed snapshot items that are not already in <paramref name="existing"/> (case-insensitive, no repeats).</summary>
     public static IReadOnlyList<string> NewItems(IEnumerable<string> existing, IEnumerable<string> snapshot)
     {
+        // Add each trimmed value to the same set used for old entries, so duplicates in either list are removed.
         var seen = existing.ToHashSet(StringComparer.OrdinalIgnoreCase);
         return snapshot.Select(item => item.Trim()).Where(item => item.Length > 0 && seen.Add(item)).ToArray();
     }

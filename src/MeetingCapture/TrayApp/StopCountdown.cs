@@ -26,6 +26,7 @@ internal sealed class StopCountdown
     /// <summary>Starts the countdown, or cancels it if it is already running. Returns true when started.</summary>
     public bool Toggle(object? recording, DateTimeOffset now)
     {
+        // A second click is the cancel action; otherwise bind this countdown to the current recording.
         if (IsActive)
         {
             Clear();
@@ -52,6 +53,7 @@ internal sealed class StopCountdown
     /// <summary>Clears the countdown if the recording it was started for has ended or changed.</summary>
     public bool ClearIfRecordingEnded(bool canStop, object? currentRecording)
     {
+        // Do not let an old countdown stop a replacement session or a session that has already ended.
         if (!IsActive || (canStop && ReferenceEquals(currentRecording, _recording))) return false;
         Clear();
         return true;
@@ -61,6 +63,7 @@ internal sealed class StopCountdown
     public bool Tick(DateTimeOffset now)
     {
         if (_deadline is not { } deadline || now < deadline) return false;
+        // Clearing before returning makes the deadline event true only once.
         Clear();
         return true;
     }
@@ -71,6 +74,7 @@ internal sealed class StopCountdown
             return new(false, 0, 0, "Stop", "Stop Recording", "Stop recording");
 
         var remaining = deadline - now;
+        // Round up so the displayed seconds never reach zero before the actual deadline.
         var seconds = Math.Clamp((int)Math.Ceiling(remaining.TotalSeconds), 1, (int)Duration.TotalSeconds);
         var progress = Math.Clamp(1 - remaining.TotalMilliseconds / Duration.TotalMilliseconds, 0, 1);
         var text = $"Stopping in {seconds}… (click to cancel)";

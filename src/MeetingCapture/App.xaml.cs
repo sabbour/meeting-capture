@@ -71,6 +71,7 @@ public partial class App : Application
     protected override void OnLaunched(LaunchActivatedEventArgs args)
     {
         using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.Startup);
+        // Keep the queue created by WinUI's startup thread; all window and tray control updates return to it.
         _dispatcherQueue = DispatcherQueue.GetForCurrentThread();
 
         _services = BuildServiceProvider();
@@ -128,6 +129,7 @@ public partial class App : Application
     {
         var journal = _services.GetRequiredService<IPendingVisualizationJournal>();
         var storage = _services.GetRequiredService<IMeetingVisualizationStorage>();
+        // Recovery touches files and can take time, so it must not delay the first usable window.
         _ = Task.Run(async () =>
         {
             using var phase = _responsiveness.BeginBackgroundPhase(ResponsivenessPhase.VisualizationRecovery);
@@ -153,6 +155,7 @@ public partial class App : Application
 
     private void StartDetectorInBackground()
     {
+        // Meeting detection can query other processes; start it away from the UI thread.
         _ = Task.Run(async () =>
         {
             using var phase = _responsiveness.BeginBackgroundPhase(ResponsivenessPhase.DetectorStart);
@@ -175,6 +178,7 @@ public partial class App : Application
         using (_responsiveness.BeginUiPhase(ResponsivenessPhase.ConfigurationRead))
         {
             var userSettingsPath = UserSettingsManager.SettingsFilePath;
+            // Later sources override earlier ones: user settings, user secrets, then environment variables.
             config = new ConfigurationBuilder()
                 .SetBasePath(AppContext.BaseDirectory)
                 .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
@@ -201,6 +205,7 @@ public partial class App : Application
         services.AddSingleton<IMeetingDetector, ProcessMeetingDetector>();
 
         var audioSettings = config.GetSection("Audio").Get<AudioSettings>() ?? new AudioSettings();
+        // Use one mixed capture service only when both inputs and dual capture are enabled; otherwise register selected sources.
         if (audioSettings.DualCapture && audioSettings.CaptureLoopback && audioSettings.CaptureMicrophone)
         {
             // Dual capture: a single IAudioCapture that owns both child sources and mixes
@@ -263,6 +268,7 @@ public partial class App : Application
     private void BuildTrayIcon()
     {
         using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.TrayCreate);
+        // Tray callbacks may arrive outside the UI thread, so route each command through the app dispatcher.
         System.Windows.Input.ICommand Command(Action action) => new RelayCommand(() => InvokeOnUi(action));
         _statusItem = new MenuFlyoutItem { Text = "Watching for meetings...", IsEnabled = false };
 
@@ -331,6 +337,7 @@ public partial class App : Application
         _contextMenu.Items.Add(new MenuFlyoutSeparator());
         _contextMenu.Items.Add(exitItem);
 
+        // Left/double click opens the transient tray window; right click uses its separately sized popup host.
         var openMainWindowCommand = new TrayApp.RelayCommand(() => ShowMainWindow(fromTray: true));
         _trayMenuHost = new TrayContextMenuHost(_contextMenu);
         _trayIcon = new TaskbarIcon
@@ -388,6 +395,7 @@ public partial class App : Application
         if (_mainWindow is null || _mainWindow.IsClosing) return;
         void Show()
         {
+            // Tray opens use the compact auto-hiding path; other callers activate the regular app window.
             if (fromTray)
                 _mainWindow.ShowFromTray();
             else
@@ -451,6 +459,7 @@ public partial class App : Application
     {
         InvokeOnUi(() =>
         {
+            // Pipeline callbacks can arrive out of order; sequence numbers prevent old status from replacing new status.
             if (status.Sequence <= _statusSequence) return;
             _statusSequence = status.Sequence;
             UpdateStatus(status.Message);
@@ -499,6 +508,7 @@ public partial class App : Application
 
             _mainWindow?.ShowMeetingPrompt(session);
 
+            // Let the user act on the initial prompt immediately while bounded title/calendar lookup continues.
             _dismissTimer?.Stop();
             _dismissTimer = _dispatcherQueue.CreateTimer();
             _dismissTimer.Interval = TimeSpan.FromSeconds(60);
@@ -521,6 +531,7 @@ public partial class App : Application
         string? unavailable = null;
         if (MeetingTitleResolver.AppLabel(session.SourceProcess) == "Microsoft Teams")
         {
+            // Prefer a verified live-call identity, then use the calendar as a separate source of schedule details.
             var identity = await _meetingIdentity.GetSnapshotAsync(ct).ConfigureAwait(false);
             if (identity.IsVerified)
             {
@@ -560,6 +571,7 @@ public partial class App : Application
                 return;
             if (revision != window.CalendarRevision)
             {
+                // Discard calendar matches from an older sign-in/refresh; a verified live-call title can still stand.
                 if (!titleFromActiveCall) title = null;
                 calendarMeeting = null;
                 unavailable = "Calendar connection changed; meeting name unavailable.";
@@ -628,6 +640,7 @@ public partial class App : Application
     {
         InvokeOnUi(() =>
         {
+            // Clear all prompt-owned work together so late lookups cannot restore a dismissed suggestion.
             CancelPendingTitleLookup();
             _pendingSession = null;
             _mainWindow?.HideMeetingPrompt();
@@ -689,6 +702,7 @@ public partial class App : Application
     private void OnExit()
     {
         if (_exiting) return;
+        // Block new actions first, then let the pipeline save or explain why it cannot close safely.
         _exiting = true;
         _startManualItem.IsEnabled = _stopManualItem.IsEnabled = false;
         HidePendingPrompt();
@@ -741,6 +755,7 @@ public partial class App : Application
             }
             try
             {
+                // Stop detection and dispose services only after the pipeline has made the capture safe to close.
                 await ShutdownCleanup.RunAsync(async () =>
                 {
                     await _pipeline.StopDetectorAsync(CancellationToken.None);
@@ -766,6 +781,7 @@ public partial class App : Application
         if (window is null || !_pipeline.CanForceCloseAfterSavedPartial)
             return Task.FromResult(false);
         var decision = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // ContentDialog must run on the UI thread even though shutdown coordination is running in the background.
         if (!_dispatcherQueue.TryEnqueue(DispatcherQueuePriority.High, async () =>
             {
                 try { decision.TrySetResult(await window.ConfirmCloseAfterSavedPartialAsync()); }
@@ -789,6 +805,7 @@ public partial class App : Application
 
     private void CloseApplication()
     {
+        // Unsubscribe and dispose shell objects before releasing the window and exiting WinUI.
         _pipeline.StateChanged -= OnPipelineStatusChanged;
         _pipeline.NotesSaved -= OnNotesSaved;
         _pipeline.MeetingDetected -= OnMeetingDetected;
@@ -839,6 +856,7 @@ public partial class App : Application
 
     private void ValidateAndWarnSettings(AppSettings settings, ILogger logger)
     {
+        // Missing service credentials are logged as configuration warnings; manual recording remains available.
         if (string.IsNullOrWhiteSpace(settings.Transcription.ApiKey)
             && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("AZURE_SPEECH_KEY")))
         {
@@ -871,6 +889,7 @@ public partial class App : Application
         }
 
         using var phase = _responsiveness.BeginUiPhase(ResponsivenessPhase.NotesDirectoryCheck);
+        // Create the notes folder during startup so a later save does not fail on a missing directory.
         if (!Directory.Exists(settings.Storage.NotesPath))
         {
             try

@@ -29,6 +29,7 @@ internal static class AiDiagnosticsPresentation
     {
         if (value.Stage is { } stage)
         {
+            // Persistence stages are not model requests, so show their failure details without request-only fields.
             var persistenceStatus = string.Join(" · ", new[]
             {
                 stage.ToString(),
@@ -55,6 +56,7 @@ internal static class AiDiagnosticsPresentation
                 persistenceStatus);
         }
 
+        // Convert internal capability names to labels suitable for the settings timeline.
         var capability = value.Capability switch
         {
             AiCapability.Synthesis => "Notes synthesis",
@@ -72,9 +74,11 @@ internal static class AiDiagnosticsPresentation
             status += $" · {value.Failure}";
         if (value.RetryAfter is { } retry)
             status += $" · retry after {Duration(retry)}";
+        // Keep both request and correlation ids visible so related diagnostics can be matched.
         var requestIdentity = $"Request {value.RequestId} · Correlation {value.CorrelationId}";
         if (value.RequestRevision is { } revision)
             requestIdentity += $" · Revision {revision}";
+        // Each absent metric is called out instead of treating missing provider data as zero.
         var usage = string.Join(" · ",
             $"Calls {value.CallsStarted}",
             Metric("Input tokens", value.InputTokens),
@@ -95,6 +99,7 @@ internal static class AiDiagnosticsPresentation
             value.SensitivePromptPayload is not null ||
             value.SensitiveRequestPayload is not null ||
             value.SensitiveResponsePayload is not null;
+        // Display local time for the person reading the log; the original event retains its timestamp.
         var time = value.Timestamp.ToLocalTime().ToString("HH:mm:ss.fff", CultureInfo.CurrentCulture);
         return new(
             value.Sequence,

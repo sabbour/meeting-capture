@@ -55,6 +55,7 @@ internal static class NativeMethods
         if (hWnd == IntPtr.Zero || string.IsNullOrWhiteSpace(iconPath))
             return;
 
+        // Load the ICO from disk, then set both sizes Windows asks for in the title bar and task switcher.
         var hIcon = LoadImage(IntPtr.Zero, iconPath, ImageIcon, 0, 0, LrLoadFromFile | LrDefaultSize);
         if (hIcon == IntPtr.Zero)
             return;
@@ -98,6 +99,7 @@ internal static class NativeMethods
     {
         if (minMaxInfo == IntPtr.Zero)
             return;
+        // Maximize against the monitor containing this window, not the primary display.
         var monitor = MonitorFromWindow(hWnd, MonitorDefaultToNearest);
         if (monitor == IntPtr.Zero)
             return;
@@ -105,6 +107,7 @@ internal static class NativeMethods
         if (!GetMonitorInfo(monitor, ref info))
             return;
 
+        // WM_GETMINMAXINFO is an in/out structure; preserve its other fields and replace only the max position and size.
         var mmi = Marshal.PtrToStructure<MINMAXINFO>(minMaxInfo);
         var bounds = WindowPlacement.MaximizedBounds(
             ToBounds(info.rcMonitor),
